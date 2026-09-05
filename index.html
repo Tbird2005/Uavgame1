@@ -259,8 +259,13 @@ let spectatorCameraPose=null;
 
 const HEARTBEAT_INTERVAL_MS=5000;
 const HEARTBEAT_TIMEOUT_MS=5000;
+const ROUND_RESET_DELAY_SEC=10.0;
 let heartbeatSweepTimer=0;
 const connectionHealth=new Map();
+
+let spectatorOrbitYaw=0;
+let spectatorOrbitPitch=0.30;
+let spectatorOrbitDistance=5.6;
 
 const PLAYER_COLORS=[
   {rgb:[1.00,0.22,0.52],css:'#ff3885'},
@@ -392,40 +397,43 @@ function getSpectatorCameraPose(){
   const target=spectatorResolveTarget();
   if(!target)return null;
 
-  let center,desired,label=target.label,kind=target.kind;
+  let center,label=target.label,kind=target.kind;
 
   if(target.key.startsWith('player:')){
     const p=netPlayers.get(target.playerId);
     if(!p)return null;
-
     const ground=mapSurfaceYAt(p.x,p.z);
-    const heading=(p.alive===false?(p.deathYaw||p.yaw||0):(p.yaw||0));
-    center=[p.x,ground+(p.alive===false?0.64:1.05),p.z];
-
-    // Player forward = +sin(yaw), -cos(yaw). Camera sits behind it.
-    desired=[
-      p.x-Math.sin(heading)*4.6,
-      ground+2.55,
-      p.z+Math.cos(heading)*4.6
-    ];
-
-    desired=spectatorSafeEye(center,desired);
+    center=[p.x,ground+(p.alive===false?0.62:1.02),p.z];
   }else if(target.key==='follower'){
     center=[followerX,followerBaseY+FOLLOWER_HEIGHT*.58,followerZ];
-    desired=spectatorSafeEye(center,[followerX+3.8,followerBaseY+2.4,followerZ+3.8]);
   }else if(target.key.startsWith('uav:')){
     const d=uavDrones[target.uavIndex];
     if(!d)return null;
-
     center=[d.x,d.y,d.z];
-    desired=[
-      d.x-Math.cos(d.yaw)*7.2,
-      d.y+3.0,
-      d.z-Math.sin(d.yaw)*7.2
-    ];
   }else{
     return null;
   }
+
+  // Real orbit camera: mouse controls azimuth/elevation independently of the
+  // target's own yaw. The chosen orbit angle stays exactly where the spectator
+  // put it while the camera follows the moving target.
+  const targetDistance=kind==='UAV'
+    ? Math.max(6.0,spectatorOrbitDistance*1.35)
+    : spectatorOrbitDistance;
+
+  const horizontal=Math.cos(spectatorOrbitPitch)*targetDistance;
+  const vertical=Math.sin(spectatorOrbitPitch)*targetDistance;
+
+  let desired=[
+    center[0]+Math.sin(spectatorOrbitYaw)*horizontal,
+    center[1]+vertical,
+    center[2]+Math.cos(spectatorOrbitYaw)*horizontal
+  ];
+
+  // Player/follower spectator cameras still stop at architecture instead of
+  // freely orbiting through walls. UAV cameras are above the building and can
+  // orbit freely in the sky.
+  if(kind!=='UAV')desired=spectatorSafeEye(center,desired);
 
   const dx=center[0]-desired[0],dz=center[2]-desired[2];
   const cameraYaw=Math.atan2(dx,-dz);
@@ -447,7 +455,8 @@ function updateSpectatorHud(){
 
   spectatorHud.innerHTML=
     '<b>SPECTATING '+pose.label+'</b> · '+pose.kind+
-    '<br>Q / E cycle · V exit'+(playerDead?' · M tactical map':' · M map');
+    '<br>Mouse orbit · Left/Right click target · Wheel zoom · V exit'+
+    (playerDead?' · Q normal map view':' · M map');
   spectatorHud.style.display='block';
 }
 function startSpectating(force=false){
@@ -457,8 +466,10 @@ function startSpectating(force=false){
   if(!targets.length)return false;
 
   if(mapOpen)setMapVisible(false);
-  if(document.pointerLockElement)document.exitPointerLock();
 
+  // Keep pointer lock if gameplay already had it. That gives an unrestricted
+  // orbit immediately after the death camera finishes. If it is not locked,
+  // the first spectator click can acquire it.
   spectatorActive=true;
 
   if(!spectatorTargetKey||!targets.some(t=>t.key===spectatorTargetKey)){
@@ -1275,8 +1286,11 @@ const uavBodyVerts=[],uavBeamVerts=[];
 
 // ---------- multiplayer capsule players ----------
 const netPlayerBuffer=gl.createBuffer();
+const targetedPlayerGlowBuffer=gl.createBuffer();
 let netPlayerRemoteVertexCount=0,netPlayerAllVertexCount=0;
+let targetedPlayerGlowVertexCount=0;
 const netPlayerVerts=[];
+const targetedPlayerGlowVerts=[];
 function NPV(x,y,z,nx,ny,nz,r,g,b){netPlayerVerts.push(x,y,z,nx,ny,nz,r,g,b);}
 function netPlayerTransform(p,lx,ly,lz){
   const fall=(p.alive===false)?(-Math.PI*.5*smooth01(p.deathT==null?1:p.deathT)):0;
@@ -1318,6 +1332,103 @@ function addNetCapsule(p){
     }
   }
 }
+
+function TPGV(x,y,z){targetedPlayerGlowVerts.push(x,y,z);}
+function addTargetedGlowCapsule(p,scale=1.18){
+  const seg=18;
+  const rings=[
+    {y:-0.035,r:.03*scale},
+    {y:.055,r:.23*scale},
+    {y:.28,r:.32*scale},
+    {y:1.40,r:.32*scale},
+    {y:1.645,r:.23*scale},
+    {y:1.735,r:.03*scale}
+  ];
+
+  for(let ri=0;ri<rings.length-1;ri++){
+    const a=rings[ri],b=rings[ri+1];
+
+    for(let i=0;i<seg;i++){
+      const a0=i/seg*Math.PI*2;
+      const a1=(i+1)/seg*Math.PI*2;
+
+      const A0=netPlayerTransform(p,Math.cos(a0)*a.r,a.y,Math.sin(a0)*a.r);
+      const A1=netPlayerTransform(p,Math.cos(a1)*a.r,a.y,Math.sin(a1)*a.r);
+      const B0=netPlayerTransform(p,Math.cos(a0)*b.r,b.y,Math.sin(a0)*b.r);
+      const B1=netPlayerTransform(p,Math.cos(a1)*b.r,b.y,Math.sin(a1)*b.r);
+
+      // Same outward winding as the corrected capsule model.
+      TPGV(...A0);TPGV(...B1);TPGV(...B0);
+      TPGV(...A0);TPGV(...A1);TPGV(...B1);
+    }
+  }
+}
+function rebuildTargetedPlayerGlowMesh(mapCamera){
+  targetedPlayerGlowVerts.length=0;
+
+  if(!multiplayer||!worldGeometryReady){
+    targetedPlayerGlowVertexCount=0;
+  }else{
+    const targetedEntityIds=new Set();
+
+    for(const d of uavDrones){
+      if(d.targetId!=null)targetedEntityIds.add(Number(d.targetId));
+    }
+
+    for(const p of netPlayers.values()){
+      if(p.alive===false)continue;
+      if(!targetedEntityIds.has(Number(p.entityId)))continue;
+
+      // First-person never renders your own capsule; keep its glow consistent
+      // with that rule. Tactical map renders every capsule including yourself.
+      if(!mapCamera&&p.id===localPeerId)continue;
+
+      addTargetedGlowCapsule(p,1.20);
+    }
+
+    targetedPlayerGlowVertexCount=targetedPlayerGlowVerts.length/3;
+  }
+
+  gl.bindBuffer(gl.ARRAY_BUFFER,targetedPlayerGlowBuffer);
+  gl.bufferData(
+    gl.ARRAY_BUFFER,
+    new Float32Array(targetedPlayerGlowVerts),
+    gl.DYNAMIC_DRAW
+  );
+}
+function renderTargetedPlayerGlow(mapCamera){
+  rebuildTargetedPlayerGlowMesh(mapCamera);
+  if(!targetedPlayerGlowVertexCount)return;
+
+  // Render the enlarged red shell BEFORE normal capsules. Depth testing is
+  // deliberately disabled, so a UAV-targeted player remains visible through
+  // walls. The normal opaque capsule then covers the shell's center wherever
+  // the player is actually visible, leaving a neon-red outline around them.
+  gl.useProgram(uavFxProg);
+  gl.uniformMatrix4fv(uavFxProjLoc,false,proj);
+  gl.uniformMatrix4fv(uavFxViewLoc,false,view);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER,targetedPlayerGlowBuffer);
+  gl.enableVertexAttribArray(uavFxPosLoc);
+  gl.vertexAttribPointer(uavFxPosLoc,3,gl.FLOAT,false,3*4,0);
+
+  gl.disable(gl.DEPTH_TEST);
+  gl.depthMask(false);
+  gl.disable(gl.CULL_FACE);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA,gl.ONE);
+
+  gl.uniform4f(uavFxColorLoc,1.0,0.005,0.005,0.16);
+  gl.drawArrays(gl.TRIANGLES,0,targetedPlayerGlowVertexCount);
+  gl.uniform4f(uavFxColorLoc,1.0,0.015,0.01,0.24);
+  gl.drawArrays(gl.TRIANGLES,0,targetedPlayerGlowVertexCount);
+
+  gl.disable(gl.BLEND);
+  gl.depthMask(true);
+  gl.enable(gl.DEPTH_TEST);
+  gl.enable(gl.CULL_FACE);
+}
+
 function rebuildNetPlayerMesh(){
   netPlayerVerts.length=0;
 
@@ -1340,6 +1451,9 @@ function rebuildNetPlayerMesh(){
 }
 function renderNetPlayers(mapCamera){
   if(!multiplayer||!netPlayerAllVertexCount)return;
+
+  renderTargetedPlayerGlow(mapCamera);
+
   gl.useProgram(uavProg);
   gl.uniformMatrix4fv(uavProjLoc,false,proj);gl.uniformMatrix4fv(uavViewLoc,false,view);
   gl.bindBuffer(gl.ARRAY_BUFFER,netPlayerBuffer);
@@ -3702,7 +3816,14 @@ function hideMainMenu(){
   if(document.activeElement&&typeof document.activeElement.blur==='function'){
     document.activeElement.blur();
   }
+
   clearAllGameKeys();
+
+  // Rapid menu->game transitions used to occasionally leave keyboard focus on
+  // a menu control. Force keyboard focus back onto the actual game canvas.
+  canvas.tabIndex=-1;
+  try{canvas.focus({preventScroll:true});}catch(_){try{canvas.focus();}catch(__){}}
+
   gameStarted=true;
   document.body.classList.remove('menu-open');
   mainMenu.classList.add('hidden');
@@ -3732,10 +3853,10 @@ function teardownPeer(){
 function updateNetworkInfo(){
   if(gameMode==='host'){
     networkInfoEl.innerHTML='HOST <b>'+displayName+'</b><br>JOIN CODE <b style="font-size:16px;letter-spacing:2px">'+joinCode+'</b><br>PLAYERS <b>'+netPlayers.size+'</b><br>';
-    tipEl.textContent='WASD move · mouse look · Shift sprint · M map · V spectate · Q/E cycle · N host-new-map · your drawings yellow · other players red';
+    tipEl.textContent='WASD move · mouse look · Shift sprint · M map · V spectate · mouse orbit · L/R click targets · N host-new-map · your drawings yellow · other players red';
   }else if(gameMode==='client'){
     networkInfoEl.innerHTML='MULTIPLAYER <b>'+displayName+'</b><br>CODE <b>'+joinCode+'</b><br>PLAYERS <b>'+netPlayers.size+'</b><br>';
-    tipEl.textContent='WASD move · mouse look · Shift sprint · M map · V spectate · Q/E cycle · your drawings yellow · other players red';
+    tipEl.textContent='WASD move · mouse look · Shift sprint · M map · V spectate · mouse orbit · L/R click targets · your drawings yellow · other players red';
   }else{
     networkInfoEl.innerHTML='SINGLE PLAYER<br>';
     tipEl.textContent='WASD move · mouse look · Shift sprint · M map · N new building';
@@ -3914,7 +4035,7 @@ function hostKillNetworkPlayer(peerId,killerId){
   addDeathMarker({peerId:p.id,x:p.x,z:p.z,yaw:p.yaw,name:p.name});addDeathFeed(p.name,killerId);
   if(peerId===localPeerId)beginPlayerDeath(killerId);
   broadcastHost({type:'death',peerId:p.id,name:p.name,killer:killerId,x:p.x,z:p.z,yaw:p.yaw});
-  if(hostAllPlayersDead())multiplayerNextMapTimer=2.4;
+  if(hostAllPlayersDead())multiplayerNextMapTimer=ROUND_RESET_DELAY_SEC;
 }
 function applyRemoteDeath(msg){
   const p=netPlayers.get(String(msg.peerId));
@@ -3937,7 +4058,7 @@ function hostRemovePlayer(peerId){
   updateNetworkInfo();
   rebuildNetPlayerMesh();
 
-  if(netPlayers.size&&hostAllPlayersDead())multiplayerNextMapTimer=1.6;
+  if(netPlayers.size&&hostAllPlayersDead())multiplayerNextMapTimer=ROUND_RESET_DELAY_SEC;
 }
 function assignNextSlot(){const used=new Set([...netPlayers.values()].map(p=>p.slot));let slot=0;while(used.has(slot))slot++;nextPlayerSlot=Math.max(nextPlayerSlot,slot+1);return slot;}
 
@@ -3980,6 +4101,7 @@ function hostEnsurePlayerForConnection(conn,requestedName){
 
   netPlayers.set(conn.peer,p);
   peerConnections.set(conn.peer,conn);
+  multiplayerNextMapTimer=-1;
   updateNetworkInfo();
   resetUavEntityRegistryForMode();
   rebuildNetPlayerMesh();
@@ -4387,7 +4509,16 @@ function updateMultiplayerFrame(dt){
   const me=netPlayers.get(localPeerId);if(me){if(me.alive!==false){me.x=px;me.z=pz;me.yaw=yaw;}me.alive=!playerDead;}
   rebuildNetPlayerMesh();
   if(isHost){
-    if(multiplayerNextMapTimer>=0){multiplayerNextMapTimer-=dt;if(multiplayerNextMapTimer<=0)hostStartNewMap();}
+    if(multiplayerNextMapTimer>=0){
+      // A new/live player joining during the 10-second post-wipe period cancels
+      // the pending reset. The countdown only runs while everybody is still dead.
+      if(!hostAllPlayersDead()){
+        multiplayerNextMapTimer=-1;
+      }else{
+        multiplayerNextMapTimer-=dt;
+        if(multiplayerNextMapTimer<=0)hostStartNewMap();
+      }
+    }
 
     heartbeatSweepTimer-=dt;
     if(heartbeatSweepTimer<=0){
@@ -5020,7 +5151,24 @@ function beginPlayerDeath(killerId){
   playerDead=true;
   if(multiplayer){
     const me=netPlayers.get(localPeerId);
-    if(me){me.alive=false;me.deathYaw=yaw;me.deathX=px;me.deathZ=pz;me.deathT=0;}
+    if(me){
+      me.alive=false;
+      me.deathYaw=yaw;
+      me.deathX=px;
+      me.deathZ=pz;
+      me.deathT=0;
+    }
+
+    // Guaranteed local death mark. Host death events and client death messages
+    // also call addDeathMarker(), but peerId de-duplication makes this safe and
+    // ensures you can always see YOUR OWN red X when you switch to map view.
+    addDeathMarker({
+      peerId:localPeerId,
+      x:px,
+      z:pz,
+      yaw,
+      name:displayName
+    });
   }
   deathPhase='fall';
   deathTimer=0;
@@ -5030,7 +5178,7 @@ function beginPlayerDeath(killerId){
   deadMapActive=false;
   deathFade.style.opacity='0';
   deadHud.innerHTML=multiplayer
-    ? '<b>DEAD</b><br>Q / E spectate · M tactical map'
+    ? '<b>DEAD</b><br>10s after team wipe · Q normal map view'
     : '<b>DEAD</b><br>Waiting for the next map · Press N';
   deadHud.style.display='none';
   for(const k in keys)keys[k]=false;
@@ -5663,7 +5811,7 @@ function frame(now){
     }
   }
 
-  if(locked&&!playerDead&&!spectatorActive){
+  if(!playerDead&&!spectatorActive){
     let forwardInput=(keys.KeyW?1:0)-(keys.KeyS?1:0);
     let rightInput=(keys.KeyD?1:0)-(keys.KeyA?1:0);
     const len=Math.hypot(forwardInput,rightInput)||1;forwardInput/=len;rightInput/=len;
@@ -5701,6 +5849,22 @@ addEventListener('keydown',e=>{
   // Text typed into menu fields must NEVER leak into M/N/WASD/Space shortcuts.
   if(isMenuOrTextInputActive(e.target))return;
 
+  // While dead, Q explicitly switches between third-person spectator and
+  // the normal tactical map. Target cycling is handled by mouse clicks now.
+  if(playerDead&&e.code==='KeyQ'){
+    e.preventDefault();
+
+    if(mapOpen){
+      setMapVisible(false);
+      startSpectating(true);
+    }else{
+      if(spectatorActive)stopSpectating(false);
+      mapViewMode='MAP';
+      setMapVisible(true);
+    }
+    return;
+  }
+
   if(e.code==='KeyV'){
     e.preventDefault();
 
@@ -5731,13 +5895,7 @@ addEventListener('keydown',e=>{
   }
 
   if(spectatorActive){
-    if(e.code==='KeyQ'){
-      e.preventDefault();
-      spectatorCycle(-1);
-    }else if(e.code==='KeyE'){
-      e.preventDefault();
-      spectatorCycle(1);
-    }
+    // Spectator target switching is intentionally mouse-driven.
     return;
   }
 
@@ -5775,13 +5933,16 @@ addEventListener('keyup',e=>{
   if(e.code in mapKeys)mapKeys[e.code]=false;
 });
 
-canvas.addEventListener('contextmenu',e=>{if(gameStarted&&mapOpen)e.preventDefault();});
+canvas.addEventListener('contextmenu',e=>{if(gameStarted&&(mapOpen||spectatorActive))e.preventDefault();});
 canvas.addEventListener('wheel',e=>{
   if(!gameStarted||isMenuOrTextInputActive(e.target))return;
 
   if(spectatorActive&&!mapOpen){
     e.preventDefault();
-    spectatorCycle(e.deltaY>0?1:-1);
+    spectatorOrbitDistance=Math.max(
+      2.0,
+      Math.min(22.0,spectatorOrbitDistance+Math.sign(e.deltaY)*0.8)
+    );
     return;
   }
 
@@ -5795,7 +5956,25 @@ canvas.addEventListener('wheel',e=>{
 },{passive:false});
 
 canvas.addEventListener('mousedown',e=>{
-  if(!gameStarted||isMenuOrTextInputActive(e.target)||!mapOpen)return;
+  if(!gameStarted||isMenuOrTextInputActive(e.target))return;
+
+  if(spectatorActive&&!mapOpen){
+    if(e.button===0||e.button===2){
+      e.preventDefault();
+
+      // Left = next, right = previous.
+      spectatorCycle(e.button===0?1:-1);
+
+      // If spectator was entered without an existing gameplay pointer-lock
+      // gesture, the click itself is allowed to acquire it.
+      if(document.pointerLockElement!==canvas){
+        try{canvas.requestPointerLock();}catch(_){}
+      }
+    }
+    return;
+  }
+
+  if(!mapOpen)return;
   e.preventDefault();
 
   if(e.button===1){
@@ -5815,6 +5994,13 @@ document.addEventListener('mouseup',e=>{
 });
 document.addEventListener('mousemove',e=>{
   if(!gameStarted||isMenuOrTextInputActive(e.target))return;
+
+  if(spectatorActive&&!mapOpen){
+    spectatorOrbitYaw-=e.movementX*0.0038;
+    spectatorOrbitPitch-=e.movementY*0.0032;
+    spectatorOrbitPitch=Math.max(-1.18,Math.min(1.32,spectatorOrbitPitch));
+    return;
+  }
 
   if(mapOpen){
     if(mapMiddlePanning){
@@ -5849,6 +6035,11 @@ document.addEventListener('pointerlockchange',()=>{
   locked=document.pointerLockElement===canvas;
   overlay.style.display='none';
   if(locked)resumeUavAudio();
+});
+
+window.addEventListener('blur',clearAllGameKeys);
+document.addEventListener('visibilitychange',()=>{
+  if(document.hidden)clearAllGameKeys();
 });
 
 singlePlayerBtn.addEventListener('click',startSinglePlayer);
