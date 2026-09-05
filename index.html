@@ -1725,28 +1725,47 @@ function uavQuad(a,b,c,d,n,col){
   UV(...a,...n,...col);UV(...b,...n,...col);UV(...c,...n,...col);
   UV(...a,...n,...col);UV(...c,...n,...col);UV(...d,...n,...col);
 }
-function uavRotatePoint(cx,cz,x,z,yaw){
+function uavTransformVector(x,y,z,yaw,bank){
+  // Bank around local +X (aircraft forward axis), then yaw around world +Y.
+  // Positive bank lowers local +Z. For this clockwise orbit, local +Z points
+  // inward toward the building, so +25deg produces a realistic inward turn.
+  const cb=Math.cos(bank),sb=Math.sin(bank);
+  const yb=y*cb-z*sb;
+  const zb=y*sb+z*cb;
+
   const c=Math.cos(yaw),s=Math.sin(yaw);
-  return [cx+x*c-z*s,cz+x*s+z*c];
+  return [
+    x*c-zb*s,
+    yb,
+    x*s+zb*c
+  ];
 }
-function addUavBox(cx,cy,cz,sx,sy,sz,yaw,col){
+function uavLocalToWorld(d,lx,ly,lz,bank){
+  const q=uavTransformVector(lx,ly,lz,d.yaw,bank);
+  return [d.x+q[0],d.y+q[1],d.z+q[2]];
+}
+function addUavBox(cx,cy,cz,sx,sy,sz,yaw,col,bank=0){
   const hx=sx/2,hy=sy/2,hz=sz/2;
+
   const p=(x,y,z)=>{
-    const rz=uavRotatePoint(cx,cz,x,z,yaw);
-    return [rz[0],cy+y,rz[1]];
+    const q=uavTransformVector(x,y,z,yaw,bank);
+    return [cx+q[0],cy+q[1],cz+q[2]];
   };
-  const nrot=(x,z)=>{
-    const c=Math.cos(yaw),s=Math.sin(yaw);
-    return [x*c-z*s,0,x*s+z*c];
+  const n=(x,y,z)=>{
+    const q=uavTransformVector(x,y,z,yaw,bank);
+    const L=Math.hypot(q[0],q[1],q[2])||1;
+    return [q[0]/L,q[1]/L,q[2]/L];
   };
+
   const p000=p(-hx,-hy,-hz),p100=p(hx,-hy,-hz),p110=p(hx,hy,-hz),p010=p(-hx,hy,-hz);
   const p001=p(-hx,-hy,hz), p101=p(hx,-hy,hz), p111=p(hx,hy,hz), p011=p(-hx,hy,hz);
-  uavQuad(p001,p101,p111,p011,nrot(0,1),col);
-  uavQuad(p100,p000,p010,p110,nrot(0,-1),col);
-  uavQuad(p000,p001,p011,p010,nrot(-1,0),col);
-  uavQuad(p101,p100,p110,p111,nrot(1,0),col);
-  uavQuad(p010,p011,p111,p110,[0,1,0],col);
-  uavQuad(p000,p100,p101,p001,[0,-1,0],col);
+
+  uavQuad(p001,p101,p111,p011,n(0,0,1),col);
+  uavQuad(p100,p000,p010,p110,n(0,0,-1),col);
+  uavQuad(p000,p001,p011,p010,n(-1,0,0),col);
+  uavQuad(p101,p100,p110,p111,n(1,0,0),col);
+  uavQuad(p010,p011,p111,p110,n(0,1,0),col);
+  uavQuad(p000,p100,p101,p001,n(0,-1,0),col);
 }
 function addUavBeam(a,b){
   UBV(a.x,a.y,a.z,1.0,0.05,0.03);
@@ -1766,40 +1785,50 @@ function rebuildUavDynamicMeshes(){
     const dark=[0.14,0.15,0.18];
     const red=[0.98,0.08,0.05];
 
-    // Fixed-wing UAV silhouette: long fuselage, broad wing, tailplane, twin fins, and nose sensor.
-    addUavBox(d.x,d.y,d.z,2.55,0.30,0.30,d.yaw,body);             // fuselage
-    addUavBox(d.x+0.88*Math.cos(d.yaw),d.y,d.z+0.88*Math.sin(d.yaw),0.55,0.24,0.24,d.yaw,[0.77,0.80,0.84]); // nose
-    addUavBox(d.x-0.98*Math.cos(d.yaw),d.y+0.02,d.z-0.98*Math.sin(d.yaw),0.72,0.20,0.24,d.yaw,dark);         // tail boom section
+    // Constant inward bank during the clockwise orbit.
+    // local +Z points toward the orbit center, so positive bank lowers the
+    // inside wing just like an aircraft leaning into a real turn.
+    const bank=25*Math.PI/180;
 
-    addUavBox(d.x,d.y+0.02,d.z,0.18,0.08,4.95,d.yaw,wing);        // main wings
-    addUavBox(d.x-1.12*Math.cos(d.yaw),d.y+0.13,d.z-1.12*Math.sin(d.yaw),0.16,0.06,1.92,d.yaw,wing);         // tailplane
+    const addLocalBox=(lx,ly,lz,sx,sy,sz,col)=>{
+      const center=uavLocalToWorld(d,lx,ly,lz,bank);
+      addUavBox(center[0],center[1],center[2],sx,sy,sz,d.yaw,col,bank);
+    };
+
+    // Fixed-wing UAV silhouette, all built in ONE banked aircraft frame.
+    addLocalBox(0,0,0,2.55,0.30,0.30,body);               // fuselage
+    addLocalBox(0.88,0,0,0.55,0.24,0.24,[0.77,0.80,0.84]); // nose
+    addLocalBox(-0.98,0.02,0,0.72,0.20,0.24,dark);          // tail boom
+
+    addLocalBox(0,0.02,0,0.18,0.08,4.95,wing);              // main wing
+    addLocalBox(-1.12,0.13,0,0.16,0.06,1.92,wing);          // tailplane
 
     // Twin vertical tail fins.
-    const finOffset=0.74;
-    const c=Math.cos(d.yaw),s=Math.sin(d.yaw);
-    addUavBox(d.x-1.18*c-finOffset*s,d.y+0.32,d.z-1.18*s+finOffset*c,0.22,0.42,0.10,d.yaw,dark);
-    addUavBox(d.x-1.18*c+finOffset*s,d.y+0.32,d.z-1.18*s-finOffset*c,0.22,0.42,0.10,d.yaw,dark);
+    addLocalBox(-1.18,0.32, 0.74,0.22,0.42,0.10,dark);
+    addLocalBox(-1.18,0.32,-0.74,0.22,0.42,0.10,dark);
 
     // Rear pusher prop silhouette.
-    addUavBox(d.x-1.44*c,d.y,d.z-1.44*s,0.08,0.95,0.06,d.yaw,dark);
-    addUavBox(d.x-1.44*c,d.y,d.z-1.44*s,0.08,0.06,0.95,d.yaw,dark);
+    addLocalBox(-1.44,0,0,0.08,0.95,0.06,dark);
+    addLocalBox(-1.44,0,0,0.08,0.06,0.95,dark);
 
     // Belly sensor / gimbal and active eye.
     const eyePulse=Math.max(0,Math.min(1,d.glare||0));
-    addUavBox(d.x+0.72*c,d.y-0.20,d.z+0.72*s,0.26,0.26,0.26,d.yaw,[0.10,0.10,0.12]);
-    const sensorSize=0.10+0.20*eyePulse;
-    addUavBox(d.x+0.84*c,d.y-0.22,d.z+0.84*s,sensorSize,sensorSize,sensorSize,d.yaw,red);
+    addLocalBox(0.72,-0.20,0,0.26,0.26,0.26,[0.10,0.10,0.12]);
 
-    // Wingtip pods for extra UAV feel.
-    addUavBox(d.x-0.05*s,d.y-0.02,d.z+2.34*c,0.22,0.10,0.30,d.yaw,[0.26,0.28,0.33]);
-    addUavBox(d.x+0.05*s,d.y-0.02,d.z-2.34*c,0.22,0.10,0.30,d.yaw,[0.26,0.28,0.33]);
+    const sensorSize=0.10+0.20*eyePulse;
+    addLocalBox(0.84,-0.22,0,sensorSize,sensorSize,sensorSize,red);
+
+    // The two old wingtip pod cubes were intentionally removed. They used an
+    // incorrect world-space offset and appeared as detached dark squares
+    // orbiting independently from the aircraft.
 
     if(d.targetId!=null){
       const ent=uavEntities.get(d.targetId);
       if(ent&&ent.isAlive()){
         const p=ent.getPoint();
         if(p){
-          const origin={x:d.x+0.84*c,y:d.y-0.22,z:d.z+0.84*s};
+          const eyeWorld=uavLocalToWorld(d,0.84,-0.22,0,bank);
+          const origin={x:eyeWorld[0],y:eyeWorld[1],z:eyeWorld[2]};
           addUavBeam(origin,p);
 
           // Ground spotlight follows the active target.
@@ -3874,6 +3903,7 @@ function showMainMenu(){
   gameStarted=false;gameMode='menu';
   worldGeometryReady=false;
   clearAllGameKeys();
+  clearPhysicalGameplayKeys();
   document.body.classList.add('menu-open');
   mainMenu.classList.remove('hidden');
   menuFormArea.style.display='none';
@@ -3899,6 +3929,10 @@ function hideMainMenu(){
   gameStarted=true;
   document.body.classList.remove('menu-open');
   mainMenu.classList.add('hidden');
+
+  // If the user started holding W/A/S/D while Create/Join was still finishing,
+  // immediately adopt the REAL physical keyboard state. No second keydown needed.
+  syncGameplayKeysFromPhysicalState();
 }
 function openMenuForm(kind){
   menuFormArea.style.display='block';
@@ -4301,7 +4335,19 @@ function handleHostMessage(conn,msg){
   const p=netPlayers.get(peerId);
   if(msg.type==='playerState'&&p&&p.alive!==false){
     const nx=Number(msg.x),nz=Number(msg.z),nyaw=Number(msg.yaw);
-    if(Number.isFinite(nx)&&Number.isFinite(nz)&&!circleHitsWall(nx,nz)){p.x=nx;p.z=nz;}
+
+    if(Number.isFinite(nx)&&Number.isFinite(nz)){
+      const packetMove=Math.hypot(nx-p.x,nz-p.z);
+
+      // Normal client reports arrive ~20 Hz. Allow a generous gap for dropped
+      // packets, but reject the multi-unit/frame teleport produced by the old
+      // broken build.
+      if(packetMove<=2.25&&!circleHitsWall(nx,nz)){
+        p.x=nx;
+        p.z=nz;
+      }
+    }
+
     if(Number.isFinite(nyaw))p.yaw=nyaw;
 
     p.crouch=Math.max(0,Math.min(1,Number(msg.crouch)||0));
@@ -4656,9 +4702,119 @@ function updateMultiplayerFrame(dt){
 let px=0,pz=0,yaw=0,pitch=0,locked=false,last=performance.now();
 const keys={};
 
+// Raw physical movement-key state is captured in the CAPTURE phase, before
+// menu text fields call stopPropagation(). This fixes the rapid menu->game race
+// where W/A/S/D could be pressed while the menu was still technically active
+// and therefore never generated a second keydown after gameplay began.
+const physicalGameplayKeys=new Set();
+const PHYSICAL_GAMEPLAY_CODES=new Set([
+  'KeyW','KeyA','KeyS','KeyD',
+  'ShiftLeft','ShiftRight',
+  'KeyC'
+]);
+
+function capturePhysicalGameplayKeyDown(e){
+  if(PHYSICAL_GAMEPLAY_CODES.has(e.code))physicalGameplayKeys.add(e.code);
+}
+function capturePhysicalGameplayKeyUp(e){
+  if(PHYSICAL_GAMEPLAY_CODES.has(e.code))physicalGameplayKeys.delete(e.code);
+}
+function clearPhysicalGameplayKeys(){
+  physicalGameplayKeys.clear();
+}
+function syncGameplayKeysFromPhysicalState(){
+  const gameplayOwnsKeyboard=
+    gameStarted &&
+    mainMenu.classList.contains('hidden') &&
+    !mapOpen &&
+    !spectatorActive &&
+    !playerDead &&
+    !isMenuOrTextInputActive(document.activeElement);
+
+  for(const code of PHYSICAL_GAMEPLAY_CODES){
+    keys[code]=gameplayOwnsKeyboard && physicalGameplayKeys.has(code);
+  }
+}
+
+// Capture phase is intentional: input/textarea key handlers later stop bubbling.
+window.addEventListener('keydown',capturePhysicalGameplayKeyDown,true);
+window.addEventListener('keyup',capturePhysicalGameplayKeyUp,true);
+
 let playerCrouchAmount=0;
 let playerVerticalOffset=0;
 let playerVerticalVelocity=0;
+
+function localPlayerCapsuleHeight(){
+  return PLAYER_CAPSULE_HEIGHT+
+    (PLAYER_CROUCH_CAPSULE_HEIGHT-PLAYER_CAPSULE_HEIGHT)*playerCrouchAmount;
+}
+function doorwayLintelHeightAt(x,z){
+  // Return the lowest framed doorway header currently overlapping the player's
+  // horizontal capsule footprint. "open" connectors have no header at all.
+  let limit=Infinity;
+  const radius=PLAYER_RADIUS+0.035;
+
+  for(const [k,kind] of doorways){
+    if(kind==='open')continue;
+
+    const [ax,az,bx,bz]=parseEdge(k);
+    const {opening,offset}=openingProfile(kind);
+    const half=opening*.5;
+
+    if(ax!==bx){
+      // Wall plane lies on X; opening runs along Z.
+      const wallX=Math.max(ax,bx)*TILE;
+      const centerZ=(az+.5)*TILE+offset;
+
+      const across=Math.abs(x-wallX);
+      const along=Math.abs(z-centerZ);
+
+      if(
+        across<=radius+DOOR_FRAME_DEPTH*.5 &&
+        along<=half+radius
+      ){
+        limit=Math.min(limit,DOORWAY_HEIGHT-0.035);
+      }
+    }else{
+      // Wall plane lies on Z; opening runs along X.
+      const wallZ=Math.max(az,bz)*TILE;
+      const centerX=(ax+.5)*TILE+offset;
+
+      const across=Math.abs(z-wallZ);
+      const along=Math.abs(x-centerX);
+
+      if(
+        across<=radius+DOOR_FRAME_DEPTH*.5 &&
+        along<=half+radius
+      ){
+        limit=Math.min(limit,DOORWAY_HEIGHT-0.035);
+      }
+    }
+  }
+
+  return limit;
+}
+function clampPlayerAgainstOverhead(){
+  const overhead=doorwayLintelHeightAt(px,pz);
+  if(!Number.isFinite(overhead))return false;
+
+  const floorY=mapSurfaceYAt(px,pz);
+  const capsuleTop=floorY+playerVerticalOffset+localPlayerCapsuleHeight();
+
+  if(capsuleTop<=overhead)return false;
+
+  // Push the vertical offset down just enough that the capsule crown sits
+  // immediately beneath the lintel, then kill upward velocity.
+  const maxOffset=Math.max(
+    0,
+    overhead-floorY-localPlayerCapsuleHeight()
+  );
+
+  playerVerticalOffset=Math.min(playerVerticalOffset,maxOffset);
+
+  if(playerVerticalVelocity>0)playerVerticalVelocity=0;
+  return true;
+}
 
 function localPlayerEyeHeight(){
   return PLAYER_EYE+(PLAYER_CROUCH_EYE-PLAYER_EYE)*playerCrouchAmount;
@@ -4695,10 +4851,16 @@ function updatePlayerVerticalAndCrouch(dt){
     playerVerticalVelocity-=PLAYER_GRAVITY*dt;
     playerVerticalOffset+=playerVerticalVelocity*dt;
 
+    // Head collision against doorway headers/lintels.
+    clampPlayerAgainstOverhead();
+
     if(playerVerticalOffset<=0){
       playerVerticalOffset=0;
       playerVerticalVelocity=0;
     }
+  }else{
+    // Also catches walking/jumping sideways under a lintel on the same frame.
+    clampPlayerAgainstOverhead();
   }
 }
 function circleHitsWall(x,z){
@@ -4709,7 +4871,20 @@ function circleHitsWall(x,z){
   }
   return false;
 }
-function movePlayer(dx,dz){if(!circleHitsWall(px+dx,pz))px+=dx;if(!circleHitsWall(px,pz+dz))pz+=dz;}
+function movePlayer(dx,dz){
+  // dx/dz are FRAME DISPLACEMENTS, never raw units-per-second velocities.
+  // Break larger moves into short collision-tested pieces so a lag spike cannot
+  // tunnel the player across a thin wall/doorframe collider.
+  const dist=Math.hypot(dx,dz);
+  const maxStep=0.10;
+  const steps=Math.max(1,Math.ceil(dist/maxStep));
+  const sx=dx/steps,sz=dz/steps;
+
+  for(let i=0;i<steps;i++){
+    if(!circleHitsWall(px+sx,pz))px+=sx;
+    if(!circleHitsWall(px,pz+sz))pz+=sz;
+  }
+}
 
 // ---------- blue cylinder A* follower ----------
 let followerX=NaN,followerZ=NaN,followerBaseY=FLOOR_TOP;
@@ -5958,6 +6133,11 @@ function frame(now){
     return;
   }
 
+  // Reconcile logical gameplay movement with the keyboard's real physical state.
+  // This runs every frame, so text-field propagation timing cannot permanently
+  // poison WASD/Shift/C state.
+  syncGameplayKeysFromPhysicalState();
+
   updatePlayerVerticalAndCrouch(dt);
   updateMultiplayerFrame(dt);
   updateUavs(dt);
@@ -6012,10 +6192,18 @@ function frame(now){
     let forwardInput=(keys.KeyW?1:0)-(keys.KeyS?1:0);
     let rightInput=(keys.KeyD?1:0)-(keys.KeyA?1:0);
     const len=Math.hypot(forwardInput,rightInput)||1;forwardInput/=len;rightInput/=len;
-    const speed=(keys.ShiftLeft||keys.ShiftRight?9.0:5.4)*dt;
+    const speed=/* crouch always overrides sprint */ playerCrouchAmount>0.15?2.25:((keys.ShiftLeft||keys.ShiftRight)?7.4:4.5);
     const fx=Math.sin(yaw),fz=-Math.cos(yaw);
     const rx=Math.cos(yaw),rz=Math.sin(yaw);
-    movePlayer((fx*forwardInput+rx*rightInput)*speed,(fz*forwardInput+rz*rightInput)*speed);
+    // `speed` is units/second. Convert it to this frame's displacement.
+    movePlayer(
+      (fx*forwardInput+rx*rightInput)*speed*dt,
+      (fz*forwardInput+rz*rightInput)*speed*dt
+    );
+
+    // If horizontal movement carried the airborne player beneath a doorway
+    // header, resolve the head collision immediately.
+    clampPlayerAgainstOverhead();
   }
 
   perspective(proj,75*Math.PI/180,canvas.width/canvas.height,0.04,180);
@@ -6133,12 +6321,16 @@ addEventListener('keydown',e=>{
     return;
   }
 
-  keys[e.code]=true;
+  // Movement/stance keys are reconciled from capture-phase physical state.
+  // Keep this assignment for other future held-action keys only.
+  if(!PHYSICAL_GAMEPLAY_CODES.has(e.code))keys[e.code]=true;
+
   if(e.code==='KeyN'){if(!multiplayer)newBuilding();else if(isHost)hostStartNewMap();}
 });
 addEventListener('keyup',e=>{
-  if(isMenuOrTextInputActive(e.target))return;
-  keys[e.code]=false;
+  // Never let a focused text field prevent release cleanup for normal logical
+  // action keys. Physical movement releases are handled by capture-phase above.
+  if(!PHYSICAL_GAMEPLAY_CODES.has(e.code))keys[e.code]=false;
   if(e.code in mapKeys)mapKeys[e.code]=false;
 });
 
@@ -6246,15 +6438,29 @@ document.addEventListener('pointerlockchange',()=>{
   if(locked)resumeUavAudio();
 });
 
-window.addEventListener('blur',clearAllGameKeys);
+window.addEventListener('blur',()=>{
+  clearPhysicalGameplayKeys();
+  clearAllGameKeys();
+});
 document.addEventListener('visibilitychange',()=>{
-  if(document.hidden)clearAllGameKeys();
+  if(document.hidden){
+    clearPhysicalGameplayKeys();
+    clearAllGameKeys();
+  }
 });
 
 singlePlayerBtn.addEventListener('click',startSinglePlayer);
 hostGameBtn.addEventListener('click',()=>openMenuForm('host'));
 joinGameBtn.addEventListener('click',()=>openMenuForm('join'));
 menuCancelBtn.addEventListener('click',()=>{menuFormArea.style.display='none';showMenuStatus('');});
+menuConfirmBtn.addEventListener('pointerdown',()=>{
+  // End text-edit focus at the START of the click rather than waiting for the
+  // asynchronous host/join path to eventually hide the menu.
+  if(document.activeElement===displayNameInput||document.activeElement===joinCodeInput){
+    try{document.activeElement.blur();}catch(_){}
+  }
+});
+
 menuConfirmBtn.addEventListener('click',()=>{
   const kind=menuConfirmBtn.dataset.kind,name=safeName(displayNameInput.value);
   if(!displayNameInput.value.trim()){showMenuStatus('Enter a display name.');return;}
