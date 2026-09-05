@@ -57,6 +57,10 @@ body.map-open #eyeIndicator{display:none!important}
 #playerNameLayer{position:fixed;inset:0;z-index:17;pointer-events:none;overflow:hidden}
 .playerNameTag{position:absolute;transform:translate(-50%,-100%);padding:3px 6px;border:1px solid #fff8;border-radius:3px;background:#080b0ecc;color:#fff;font:700 11px/1 Arial,sans-serif;text-shadow:0 1px 2px #000;white-space:nowrap;box-shadow:0 2px 7px #0008}
 body.menu-open #hud,body.menu-open #tip,body.menu-open #dot,body.menu-open #uavStatusHud,body.menu-open #eyeIndicator,body.menu-open #deathFeed,body.menu-open #playerNameLayer{display:none!important}
+
+#spectatorHud{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:31;display:none;min-width:330px;max-width:calc(100vw - 36px);padding:8px 12px;background:#071018df;border:1px solid #8cd8ff99;color:#fff;font:700 12px/1.35 Consolas,monospace;text-align:center;text-shadow:0 1px 2px #000;pointer-events:none;box-shadow:0 5px 20px #0008}
+#spectatorHud b{color:#8cddff}
+body.map-open #spectatorHud,body.menu-open #spectatorHud{display:none!important}
 </style>
 </head>
 <body>
@@ -66,13 +70,14 @@ body.menu-open #hud,body.menu-open #tip,body.menu-open #dot,body.menu-open #uavS
   <div id="mapOperation">OPERATION<br><span id="mapOperationName">PROCEDURAL BUILDING</span></div>
 </div>
 <div id="roomLabelLayer"></div>
-<div id="mapInfo">LIVING MAP &nbsp; Press M to close &nbsp; N new building &nbsp; Space toggle SAT or MAP &nbsp; W A S D or middle drag move 3D camera &nbsp; Mouse wheel camera height &nbsp; Left click draw &nbsp; Right click erase</div>
+<div id="mapInfo">LIVING MAP &nbsp; Press M to close &nbsp; N new building &nbsp; Space toggle SAT or MAP &nbsp; W A S D or middle drag move 3D camera &nbsp; Mouse wheel camera height &nbsp; Left click draw &nbsp; Right click erase any drawing</div>
 <div id="dot"></div>
 <div id="uavStatusHud"></div>
 <div id="eyeIndicator"><span class="eye">👁</span><span class="label"><span id="eyeIndicatorTitle">OBSERVED</span><span id="eyeIndicatorText" class="small">UAV LOCK</span></span></div>
 <div id="deathFade"></div>
 <div id="uavKillFlash"></div>
 <div id="deadHud"><b>DEAD</b><br>Waiting for the next map · Press N</div>
+<div id="spectatorHud"></div>
 <div id="hud"><span id="networkInfo"></span>SEED <b id="seed"></b><br>ROOMS <b id="roomCount"></b><br>WINDOWS <b id="windowCount"></b><br>EXITS <b id="exitCount"></b><br>SINGLE OPENINGS <b id="smallDoorCount"></b><br>DOUBLE OPENINGS <b id="bigDoorCount"></b><br>OPEN WALLS <b id="openWallCount"></b></div>
 <div id="tip">WASD move · mouse look · Shift sprint · M map · N new building · Outside or in an exit-connected room: UAV whirring fades in · deeper rooms fade it out · lock tones stay separate</div>
 <div id="overlay"></div>
@@ -206,6 +211,7 @@ const eyeIndicatorText=document.getElementById('eyeIndicatorText');
 const deathFade=document.getElementById('deathFade');
 const uavKillFlash=document.getElementById('uavKillFlash');
 const deadHud=document.getElementById('deadHud');
+const spectatorHud=document.getElementById('spectatorHud');
 
 const networkInfoEl=document.getElementById('networkInfo');
 const tipEl=document.getElementById('tip');
@@ -245,6 +251,16 @@ let currentDrawStrokeId='';
 let clientHandshakeTimer=null;
 let clientHandshakeComplete=false;
 let worldGeometryReady=false;
+
+let spectatorActive=false;
+let spectatorTargetKey='';
+let spectatorIndex=0;
+let spectatorCameraPose=null;
+
+const HEARTBEAT_INTERVAL_MS=5000;
+const HEARTBEAT_TIMEOUT_MS=5000;
+let heartbeatSweepTimer=0;
+const connectionHealth=new Map();
 
 const PLAYER_COLORS=[
   {rgb:[1.00,0.22,0.52],css:'#ff3885'},
@@ -289,6 +305,180 @@ function clearAllGameKeys(){
   mapDrawing=false;
   mapErasing=false;
   mapMiddlePanning=false;
+}
+
+
+// ---------- third-person spectator system ----------
+function buildSpectatorTargets(){
+  const out=[];
+
+  if(multiplayer){
+    for(const p of netPlayers.values()){
+      if(p.id===localPeerId)continue;
+      out.push({
+        key:'player:'+p.id,
+        kind:'PLAYER',
+        label:p.name+(p.alive===false?' (DEAD)':''),
+        playerId:p.id
+      });
+    }
+  }else if(followerAlive&&Number.isFinite(followerX)&&Number.isFinite(followerZ)){
+    out.push({key:'follower',kind:'PLAYER',label:'BLUE MAN'});
+  }
+
+  for(let i=0;i<uavDrones.length;i++){
+    const d=uavDrones[i];
+    out.push({key:'uav:'+i,kind:'UAV',label:d.id||('UAV '+(i+1)),uavIndex:i});
+  }
+
+  return out;
+}
+function spectatorResolveTarget(){
+  const targets=buildSpectatorTargets();
+  if(!targets.length)return null;
+
+  let idx=targets.findIndex(t=>t.key===spectatorTargetKey);
+  if(idx<0){
+    spectatorIndex=Math.max(0,Math.min(targets.length-1,spectatorIndex%targets.length));
+    idx=spectatorIndex;
+    spectatorTargetKey=targets[idx].key;
+  }else{
+    spectatorIndex=idx;
+  }
+
+  return targets[idx];
+}
+function spectatorCycle(dir){
+  const targets=buildSpectatorTargets();
+  if(!targets.length)return;
+
+  let idx=targets.findIndex(t=>t.key===spectatorTargetKey);
+  if(idx<0)idx=0;
+  idx=(idx+dir+targets.length)%targets.length;
+
+  spectatorIndex=idx;
+  spectatorTargetKey=targets[idx].key;
+  updateSpectatorHud();
+}
+function spectatorPointBlocked(x,y,z){
+  if(y<WALL_BASE-0.15||y>WALL_HEIGHT+0.20)return false;
+
+  for(const c of colliders){
+    if(x>=c.x0-0.10&&x<=c.x1+0.10&&z>=c.z0-0.10&&z<=c.z1+0.10)return true;
+  }
+  return false;
+}
+function spectatorSafeEye(center,desired){
+  let safe=[center[0],center[1]+0.22,center[2]];
+  const steps=28;
+
+  for(let i=1;i<=steps;i++){
+    const t=i/steps;
+    const p=[
+      center[0]+(desired[0]-center[0])*t,
+      center[1]+(desired[1]-center[1])*t,
+      center[2]+(desired[2]-center[2])*t
+    ];
+
+    if(spectatorPointBlocked(p[0],p[1],p[2]))break;
+    safe=p;
+  }
+
+  return safe;
+}
+function getSpectatorCameraPose(){
+  if(!spectatorActive)return null;
+
+  const target=spectatorResolveTarget();
+  if(!target)return null;
+
+  let center,desired,label=target.label,kind=target.kind;
+
+  if(target.key.startsWith('player:')){
+    const p=netPlayers.get(target.playerId);
+    if(!p)return null;
+
+    const ground=mapSurfaceYAt(p.x,p.z);
+    const heading=(p.alive===false?(p.deathYaw||p.yaw||0):(p.yaw||0));
+    center=[p.x,ground+(p.alive===false?0.64:1.05),p.z];
+
+    // Player forward = +sin(yaw), -cos(yaw). Camera sits behind it.
+    desired=[
+      p.x-Math.sin(heading)*4.6,
+      ground+2.55,
+      p.z+Math.cos(heading)*4.6
+    ];
+
+    desired=spectatorSafeEye(center,desired);
+  }else if(target.key==='follower'){
+    center=[followerX,followerBaseY+FOLLOWER_HEIGHT*.58,followerZ];
+    desired=spectatorSafeEye(center,[followerX+3.8,followerBaseY+2.4,followerZ+3.8]);
+  }else if(target.key.startsWith('uav:')){
+    const d=uavDrones[target.uavIndex];
+    if(!d)return null;
+
+    center=[d.x,d.y,d.z];
+    desired=[
+      d.x-Math.cos(d.yaw)*7.2,
+      d.y+3.0,
+      d.z-Math.sin(d.yaw)*7.2
+    ];
+  }else{
+    return null;
+  }
+
+  const dx=center[0]-desired[0],dz=center[2]-desired[2];
+  const cameraYaw=Math.atan2(dx,-dz);
+
+  return {target,center,eye:desired,cameraYaw,label,kind};
+}
+function updateSpectatorHud(){
+  if(!spectatorActive){
+    spectatorHud.style.display='none';
+    return;
+  }
+
+  const pose=getSpectatorCameraPose();
+  if(!pose){
+    spectatorHud.innerHTML='<b>SPECTATOR</b><br>No available targets';
+    spectatorHud.style.display='block';
+    return;
+  }
+
+  spectatorHud.innerHTML=
+    '<b>SPECTATING '+pose.label+'</b> · '+pose.kind+
+    '<br>Q / E cycle · V exit'+(playerDead?' · M tactical map':' · M map');
+  spectatorHud.style.display='block';
+}
+function startSpectating(force=false){
+  if(!gameStarted)return false;
+
+  const targets=buildSpectatorTargets();
+  if(!targets.length)return false;
+
+  if(mapOpen)setMapVisible(false);
+  if(document.pointerLockElement)document.exitPointerLock();
+
+  spectatorActive=true;
+
+  if(!spectatorTargetKey||!targets.some(t=>t.key===spectatorTargetKey)){
+    spectatorIndex=0;
+    spectatorTargetKey=targets[0].key;
+  }
+
+  updateSpectatorHud();
+  return true;
+}
+function stopSpectating(returnControl=true){
+  spectatorActive=false;
+  spectatorCameraPose=null;
+  spectatorHud.style.display='none';
+
+  if(returnControl&&!playerDead&&!mapOpen){
+    setTimeout(()=>{
+      try{canvas.requestPointerLock();}catch(_){}
+    },0);
+  }
 }
 
 // ---------- UAV rules ported from the Roblox system ----------
@@ -449,8 +639,22 @@ function updateUavAudio(dt){
   if(!uavAudioCtx||!uavAudioNodes.length)return;
   const t=uavAudioCtx.currentTime;
 
-  const pgx=Math.floor(px/TILE);
-  const pgz=Math.floor(pz/TILE);
+  let listenerX=px,listenerY=PLAYER_EYE,listenerZ=pz,listenerYaw=yaw;
+
+  // Third-person spectator audio follows the spectator camera instead of the
+  // dead/original player position.
+  if(spectatorActive){
+    const pose=getSpectatorCameraPose();
+    if(pose){
+      listenerX=pose.eye[0];
+      listenerY=pose.eye[1];
+      listenerZ=pose.eye[2];
+      listenerYaw=pose.cameraYaw;
+    }
+  }
+
+  const pgx=Math.floor(listenerX/TILE);
+  const pgz=Math.floor(listenerZ/TILE);
   const playerIndoors=
     pgx>=0&&pgz>=0&&pgx<GRID&&pgz<GRID&&isFloor(pgx,pgz);
 
@@ -467,7 +671,7 @@ function updateUavAudio(dt){
 
   // Outside always hears flight noise.
   // Indoors only an exit-connected semantic space hears it.
-  const flightWhirrAllowed=!playerIndoors||playerExitConnectedSpace;
+  const flightWhirrAllowed=spectatorActive||!playerIndoors||playerExitConnectedSpace;
 
   for(let i=0;i<uavAudioNodes.length;i++){
     const n=uavAudioNodes[i];
@@ -479,12 +683,12 @@ function updateUavAudio(dt){
       continue;
     }
 
-    const dx=d.x-px;
-    const dz=d.z-pz;
-    const dy=d.y-PLAYER_EYE;
+    const dx=d.x-listenerX;
+    const dz=d.z-listenerZ;
+    const dy=d.y-listenerY;
     const dist=Math.hypot(dx,dy,dz);
 
-    const rel=Math.atan2(dx,-dz)-yaw;
+    const rel=Math.atan2(dx,-dz)-listenerYaw;
     const pan=Math.max(-1,Math.min(1,Math.sin(rel)));
 
     // ============================================================
@@ -494,7 +698,7 @@ function updateUavAudio(dt){
     //   outside -> audible
     //   exit-connected room/semantic area -> smoothly audible
     //   deeper room with no direct outside exit -> smoothly fades away
-    if(!flightWhirrAllowed||playerDead||mapOpen){
+    if(!flightWhirrAllowed){
       n.flightGain.gain.setTargetAtTime(0,t,0.42);
     }else{
       const dist01=Math.max(0,1-Math.min(1,dist/420.0));
@@ -521,7 +725,7 @@ function updateUavAudio(dt){
     const ent=scanning?uavEntities.get(d.targetId):null;
     const active=!!(ent&&ent.isAlive());
 
-    if(!active||playerDead){
+    if(!active){
       n.scanMaster.gain.setTargetAtTime(0,t,0.035);
       n.carrierGain.gain.setTargetAtTime(0,t,0.025);
       n.whineGain.gain.setTargetAtTime(0,t,0.025);
@@ -551,7 +755,7 @@ function updateUavAudio(dt){
 
     let scanGain=0.10+progress*0.11;
     if(d.targetId===localUavEntityId)scanGain+=0.07;
-    if(mapOpen)scanGain*=0.35;
+    if(mapOpen)scanGain*=0.70;
 
     n.scanMaster.gain.setTargetAtTime(Math.min(0.28,scanGain),t,0.025);
   }
@@ -1927,12 +2131,16 @@ function rebuildMapOverlayMesh(){
   mapOverlayVerts.length=0;
   const yellow=[1.0,0.92,0.0],yellowSide=[0.72,0.61,0.0];
 
-  // The map overlay now contains only the tactical player puck.
-  // User-drawn squares live in a dedicated persistent world-space neon mesh.
-  const puckY=mapSurfaceYAt(px,pz)+0.30;
-  const puckTop=playerDead?[0.92,0.05,0.03]:yellow;
-  const puckSide=playerDead?[0.52,0.02,0.01]:yellowSide;
-  addMapOverlayBox(px,puckY,pz,1.6,0.42,1.6,puckTop,puckSide);
+  // Singleplayer keeps the old tactical player puck.
+  // Multiplayer does NOT: every player already has a real capsule model on the
+  // tactical map, and this local-only square was why each person saw a square
+  // on themselves that nobody else could see.
+  if(!multiplayer){
+    const puckY=mapSurfaceYAt(px,pz)+0.30;
+    const puckTop=playerDead?[0.92,0.05,0.03]:yellow;
+    const puckSide=playerDead?[0.52,0.02,0.01]:yellowSide;
+    addMapOverlayBox(px,puckY,pz,1.6,0.42,1.6,puckTop,puckSide);
+  }
 
   const data=new Float32Array(mapOverlayVerts);
   mapOverlayVertexCount=data.length/9;
@@ -3516,16 +3724,18 @@ function teardownPeer(){
   hostConn=null;
   for(const c of peerConnections.values())try{c.close();}catch(_){}
   peerConnections.clear();
+  connectionHealth.clear();
+  heartbeatSweepTimer=0;
   try{if(peer)peer.destroy();}catch(_){}
   peer=null;
 }
 function updateNetworkInfo(){
   if(gameMode==='host'){
     networkInfoEl.innerHTML='HOST <b>'+displayName+'</b><br>JOIN CODE <b style="font-size:16px;letter-spacing:2px">'+joinCode+'</b><br>PLAYERS <b>'+netPlayers.size+'</b><br>';
-    tipEl.textContent='WASD move · mouse look · Shift sprint · M map · N host-new-map · your drawings yellow · other players red';
+    tipEl.textContent='WASD move · mouse look · Shift sprint · M map · V spectate · Q/E cycle · N host-new-map · your drawings yellow · other players red';
   }else if(gameMode==='client'){
     networkInfoEl.innerHTML='MULTIPLAYER <b>'+displayName+'</b><br>CODE <b>'+joinCode+'</b><br>PLAYERS <b>'+netPlayers.size+'</b><br>';
-    tipEl.textContent='WASD move · mouse look · Shift sprint · M map · your drawings yellow · other players red';
+    tipEl.textContent='WASD move · mouse look · Shift sprint · M map · V spectate · Q/E cycle · your drawings yellow · other players red';
   }else{
     networkInfoEl.innerHTML='SINGLE PLAYER<br>';
     tipEl.textContent='WASD move · mouse look · Shift sprint · M map · N new building';
@@ -3592,6 +3802,12 @@ function applyDrawSnapshot(list){
     for(const p of d.points||[])s.push({x:Number(p.x),z:Number(p.z)});
     if(s.length)mapDrawStrokes.push(s);
   }
+  // Defensive normalization for late joiners / snapshots: every owner gets
+  // their own full MAP_DRAW_MAX_POINTS allowance.
+  for(const ownerId of new Set(mapDrawStrokes.map(s=>s.ownerId))){
+    trimMapDrawPoints(ownerId);
+  }
+
   currentDrawStroke=null;currentDrawStrokeId='';rebuildMapOverlayMesh();
 }
 function findDrawStroke(id,ownerId){return mapDrawStrokes.find(s=>s.strokeId===id&&s.ownerId===ownerId)||null;}
@@ -3599,7 +3815,14 @@ function applyDrawAdd(ownerId,strokeId,q,allowOccupied=false){
   if(!allowOccupied&&mapDrawPointOccupied(q))return null;
   let s=findDrawStroke(strokeId,ownerId);
   if(!s){s=[];s.strokeId=strokeId;s.ownerId=ownerId;mapDrawStrokes.push(s);}
-  if(!s.some(p=>Math.abs(p.x-q.x)<.001&&Math.abs(p.z-q.z)<.001)){s.push({x:q.x,z:q.z});trimMapDrawPoints();rebuildMapOverlayMesh();}
+  if(!s.some(p=>Math.abs(p.x-q.x)<.001&&Math.abs(p.z-q.z)<.001)){
+    s.push({x:q.x,z:q.z});
+
+    // Only this drawing owner's oldest points are eligible for trimming.
+    trimMapDrawPoints(ownerId);
+
+    rebuildMapOverlayMesh();
+  }
   return s;
 }
 function removeRejectedDrawPoint(ownerId,strokeId,q){
@@ -3608,16 +3831,36 @@ function removeRejectedDrawPoint(ownerId,strokeId,q){
   if(!s.length)mapDrawStrokes=mapDrawStrokes.filter(x=>x!==s);
   rebuildMapOverlayMesh();
 }
-function applyOwnerErase(ownerId,x,z,r){
+function applyEraseAny(x,z,r){
   const r2=r*r,rebuilt=[];
+
   for(const stroke of mapDrawStrokes){
-    if(stroke.ownerId!==ownerId){rebuilt.push(stroke);continue;}
     let seg=[];
-    const flush=()=>{if(!seg.length)return;seg.ownerId=stroke.ownerId;seg.strokeId=stroke.strokeId+'-'+Math.random().toString(36).slice(2,5);rebuilt.push(seg);seg=[];};
-    for(const q of stroke){const erased=(q.x-x)*(q.x-x)+(q.z-z)*(q.z-z)<=r2;if(erased)flush();else seg.push(q);}
+    let segmentIndex=0;
+
+    const flush=()=>{
+      if(!seg.length)return;
+
+      // Preserve ownership/color even though somebody else may have erased it.
+      seg.ownerId=stroke.ownerId;
+      seg.strokeId=(stroke.strokeId||'stroke')+'-e'+(segmentIndex++);
+      rebuilt.push(seg);
+      seg=[];
+    };
+
+    for(const q of stroke){
+      const erased=(q.x-x)*(q.x-x)+(q.z-z)*(q.z-z)<=r2;
+      if(erased)flush();
+      else seg.push(q);
+    }
+
     flush();
   }
-  mapDrawStrokes=rebuilt;currentDrawStroke=null;currentDrawStrokeId='';rebuildMapOverlayMesh();
+
+  mapDrawStrokes=rebuilt;
+  currentDrawStroke=null;
+  currentDrawStrokeId='';
+  rebuildMapOverlayMesh();
 }
 function submitDrawPoint(q){
   if(!currentDrawStrokeId)currentDrawStrokeId=makeStrokeId();
@@ -3631,9 +3874,15 @@ function submitDrawPoint(q){
   return currentDrawStroke;
 }
 function submitEraseAt(x,z){
-  applyOwnerErase(localPeerId,x,z,MAP_ERASE_RADIUS);
-  if(gameMode==='client')sendConn(hostConn,{type:'erase',x,z,r:MAP_ERASE_RADIUS});
-  else if(gameMode==='host')broadcastHost({type:'eraseApply',ownerId:localPeerId,x,z,r:MAP_ERASE_RADIUS});
+  // Erasers are intentionally not ownership-locked. Any player may erase any
+  // map drawing, including red drawings made by somebody else.
+  applyEraseAny(x,z,MAP_ERASE_RADIUS);
+
+  if(gameMode==='client'){
+    sendConn(hostConn,{type:'erase',x,z,r:MAP_ERASE_RADIUS});
+  }else if(gameMode==='host'){
+    broadcastHost({type:'eraseApply',x,z,r:MAP_ERASE_RADIUS});
+  }
 }
 function addDeathFeed(name,killer){
   const row=document.createElement('div');row.className='deathFeedRow';row.textContent=safeName(name)+'  ⚡  '+String(killer||'UAV');
@@ -3679,6 +3928,7 @@ function serializeWorldState(){return{type:'world',generation:mapGeneration,play
 function hostBroadcastWorld(){broadcastHost(serializeWorldState());}
 function hostRemovePlayer(peerId){
   peerConnections.delete(peerId);
+  connectionHealth.delete(peerId);
 
   if(!netPlayers.has(peerId))return;
 
@@ -3737,6 +3987,40 @@ function hostEnsurePlayerForConnection(conn,requestedName){
   broadcastHost({type:'playerJoined',player:serializePlayer(p)},conn.peer);
   return p;
 }
+
+function forceDisconnectPeer(peerId,reason='heartbeat timeout'){
+  const conn=peerConnections.get(peerId);
+  console.warn('Disconnecting stale multiplayer peer:',peerId,reason);
+
+  try{if(conn)conn.close();}catch(_){}
+  hostRemovePlayer(peerId);
+}
+function hostHeartbeatSweep(){
+  if(!isHost)return;
+
+  const now=performance.now();
+
+  for(const [peerId,conn] of peerConnections){
+    let health=connectionHealth.get(peerId);
+    if(!health){
+      health={lastPingMs:now,awaiting:false};
+      connectionHealth.set(peerId,health);
+    }
+
+    if(health.awaiting){
+      if(now-health.lastPingMs>=HEARTBEAT_TIMEOUT_MS){
+        forceDisconnectPeer(peerId,'no heartbeat response for '+HEARTBEAT_TIMEOUT_MS+' ms');
+      }
+      continue;
+    }
+
+    if(now-health.lastPingMs>=HEARTBEAT_INTERVAL_MS){
+      health.awaiting=true;
+      health.lastPingMs=now;
+      sendConn(conn,{type:'heartbeatPing',sentAt:Date.now()});
+    }
+  }
+}
 function hostAcceptConnection(conn){
   if(!isHost){
     try{conn.close();}catch(_){}
@@ -3746,6 +4030,10 @@ function hostAcceptConnection(conn){
   // Register the connection immediately so a HELLO that arrives the instant
   // the data channel opens cannot beat our listener setup.
   peerConnections.set(conn.peer,conn);
+  connectionHealth.set(conn.peer,{
+    lastPingMs:performance.now(),
+    awaiting:false
+  });
 
   conn.on('open',()=>{
     // Do not create/spawn the player yet. The joining client explicitly sends
@@ -3760,6 +4048,18 @@ function hostAcceptConnection(conn){
 function handleHostMessage(conn,msg){
   if(!isHost||!msg||typeof msg!=='object')return;
   const peerId=conn.peer;
+
+  // Any valid packet proves this peer is still reachable. This also prevents a
+  // lost heartbeat packet from kicking an otherwise actively moving player.
+  const health=connectionHealth.get(peerId);
+  if(health){
+    health.awaiting=false;
+    health.lastPingMs=performance.now();
+  }
+
+  if(msg.type==='heartbeatPong'){
+    return;
+  }
 
   if(msg.type==='hello'){
     hostEnsurePlayerForConnection(conn,msg.displayName);
@@ -3788,8 +4088,13 @@ function handleHostMessage(conn,msg){
     applyDrawAdd(peerId,strokeId,q,false);broadcastHost({type:'drawAdd',ownerId:peerId,strokeId,x:q.x,z:q.z},peerId);return;
   }
   if(msg.type==='erase'){
-    const x=Number(msg.x),z=Number(msg.z),r=Math.min(MAP_ERASE_RADIUS,Math.max(.1,Number(msg.r)||MAP_ERASE_RADIUS));if(!Number.isFinite(x)||!Number.isFinite(z))return;
-    applyOwnerErase(peerId,x,z,r);broadcastHost({type:'eraseApply',ownerId:peerId,x,z,r},peerId);
+    const x=Number(msg.x),z=Number(msg.z);
+    const r=Math.min(MAP_ERASE_RADIUS,Math.max(.1,Number(msg.r)||MAP_ERASE_RADIUS));
+    if(!Number.isFinite(x)||!Number.isFinite(z))return;
+
+    // Host is authoritative, but erasing is global rather than owner-only.
+    applyEraseAny(x,z,r);
+    broadcastHost({type:'eraseApply',x,z,r},peerId);
   }
 }
 function stopClientHandshakeRetry(){
@@ -3846,6 +4151,11 @@ function handleClientMessage(msg){
   if(!msg||typeof msg!=='object')return;
 
   try{
+    if(msg.type==='heartbeatPing'){
+      sendConn(hostConn,{type:'heartbeatPong',sentAt:msg.sentAt});
+      return;
+    }
+
     if(msg.type==='welcomeCore'){
       applyWelcomeCore(msg);
       return;
@@ -3928,7 +4238,7 @@ function handleClientMessage(msg){
     }
 
     if(msg.type==='eraseApply'){
-      applyOwnerErase(String(msg.ownerId),Number(msg.x),Number(msg.z),Number(msg.r));
+      applyEraseAny(Number(msg.x),Number(msg.z),Number(msg.r));
       return;
     }
 
@@ -4078,6 +4388,13 @@ function updateMultiplayerFrame(dt){
   rebuildNetPlayerMesh();
   if(isHost){
     if(multiplayerNextMapTimer>=0){multiplayerNextMapTimer-=dt;if(multiplayerNextMapTimer<=0)hostStartNewMap();}
+
+    heartbeatSweepTimer-=dt;
+    if(heartbeatSweepTimer<=0){
+      heartbeatSweepTimer=1.0;
+      hostHeartbeatSweep();
+    }
+
     networkBroadcastTimer-=dt;if(networkBroadcastTimer<=0){networkBroadcastTimer=.065;hostBroadcastWorld();}
   }else{
     networkSendTimer-=dt;if(networkSendTimer<=0){networkSendTimer=.05;const self=netPlayers.get(localPeerId);if(self&&self.alive!==false)sendConn(hostConn,{type:'playerState',x:px,z:pz,yaw});}
@@ -4713,7 +5030,7 @@ function beginPlayerDeath(killerId){
   deadMapActive=false;
   deathFade.style.opacity='0';
   deadHud.innerHTML=multiplayer
-    ? '<b>DEAD</b><br>Waiting for the next map'
+    ? '<b>DEAD</b><br>Q / E spectate · M tactical map'
     : '<b>DEAD</b><br>Waiting for the next map · Press N';
   deadHud.style.display='none';
   for(const k in keys)keys[k]=false;
@@ -4730,20 +5047,27 @@ function updateDeathState(dt){
     }
     if(deathTimer>=1.14){
       deathFade.style.opacity='1';
-      mapViewMode='MAP';
-      deadMapActive=true;
-      deathPhase='mapfade';
       deathTimer=0;
-      setMapVisible(true);
-      rebuildMapOverlayMesh();
       deadHud.style.display='block';
+
+      if(multiplayer){
+        deadMapActive=false;
+        deathPhase='spectatefade';
+        startSpectating(true);
+      }else{
+        mapViewMode='MAP';
+        deadMapActive=true;
+        deathPhase='mapfade';
+        setMapVisible(true);
+        rebuildMapOverlayMesh();
+      }
     }
-  }else if(deathPhase==='mapfade'){
+  }else if(deathPhase==='mapfade'||deathPhase==='spectatefade'){
     deathTimer+=dt;
     deathFade.style.opacity=String(1-Math.max(0,Math.min(1,deathTimer/0.48)));
     if(deathTimer>=0.48){
       deathFade.style.opacity='0';
-      deathPhase='deadmap';
+      deathPhase=deathPhase==='spectatefade'?'deadspectate':'deadmap';
     }
   }
 }
@@ -4758,6 +5082,8 @@ function resetDeathForNewMap(){
   deadMapActive=false;
   deathFade.style.opacity='0';
   deadHud.style.display='none';
+  if(spectatorActive)stopSpectating(false);
+  spectatorTargetKey='';
   if(wasDead&&mapOpen)setMapVisible(false);
   return wasDead;
 }
@@ -4901,11 +5227,33 @@ function validMapPoint(p){
   const pad=35;
   return p.x>=-pad&&p.z>=-pad&&p.x<=WORLD+pad&&p.z<=WORLD+pad;
 }
-function totalMapDrawPoints(){let n=0;for(const s of mapDrawStrokes)n+=s.length;return n;}
-function trimMapDrawPoints(){
-  while(totalMapDrawPoints()>MAP_DRAW_MAX_POINTS&&mapDrawStrokes.length){
-    if(mapDrawStrokes[0].length<=1)mapDrawStrokes.shift();
-    else mapDrawStrokes[0].shift();
+function totalMapDrawPoints(ownerId=null){
+  let n=0;
+  for(const s of mapDrawStrokes){
+    if(ownerId==null||s.ownerId===ownerId)n+=s.length;
+  }
+  return n;
+}
+function trimMapDrawPoints(ownerId){
+  // MAP_DRAW_MAX_POINTS is a PER-PLAYER budget.
+  // One player reaching 400 points must never delete another player's drawings.
+  if(ownerId==null)return;
+
+  while(totalMapDrawPoints(ownerId)>MAP_DRAW_MAX_POINTS){
+    let trimmed=false;
+
+    for(let i=0;i<mapDrawStrokes.length;i++){
+      const stroke=mapDrawStrokes[i];
+      if(stroke.ownerId!==ownerId)continue;
+
+      if(stroke.length<=1)mapDrawStrokes.splice(i,1);
+      else stroke.shift();
+
+      trimmed=true;
+      break;
+    }
+
+    if(!trimmed)break;
   }
 }
 function mapDrawPointOccupied(q){
@@ -5016,6 +5364,7 @@ function updateRoomMapLabels(){
 }
 
 function setMapVisible(show){
+  if(show&&spectatorActive)stopSpectating(false);
   mapOpen=show;
   document.body.classList.toggle('map-open',show);
   mapHud.style.display=show?'block':'none';
@@ -5291,7 +5640,30 @@ function frame(now){
 
   updateFollower(dt);
 
-  if(locked&&!playerDead){
+  if(spectatorActive){
+    const pose=getSpectatorCameraPose();
+
+    if(pose){
+      spectatorCameraPose=pose;
+      perspective(proj,75*Math.PI/180,canvas.width/canvas.height,0.04,260);
+      lookAt(view,pose.eye,pose.center,[0,1,0]);
+      renderWorldWithCamera(false,false);
+      updatePlayerNameLabels(false);
+      updateSpectatorHud();
+
+      requestAnimationFrame(frame);
+      return;
+    }
+
+    // If a target disappeared, automatically try another one.
+    spectatorTargetKey='';
+    if(!startSpectating(true)&&playerDead){
+      mapViewMode='MAP';
+      setMapVisible(true);
+    }
+  }
+
+  if(locked&&!playerDead&&!spectatorActive){
     let forwardInput=(keys.KeyW?1:0)-(keys.KeyS?1:0);
     let rightInput=(keys.KeyD?1:0)-(keys.KeyA?1:0);
     const len=Math.hypot(forwardInput,rightInput)||1;forwardInput/=len;rightInput/=len;
@@ -5329,13 +5701,43 @@ addEventListener('keydown',e=>{
   // Text typed into menu fields must NEVER leak into M/N/WASD/Space shortcuts.
   if(isMenuOrTextInputActive(e.target))return;
 
+  if(e.code==='KeyV'){
+    e.preventDefault();
+
+    if(spectatorActive){
+      stopSpectating(!playerDead);
+    }else{
+      startSpectating();
+    }
+    return;
+  }
+
   if(e.code==='KeyM'){
     e.preventDefault();
-    if(playerDead)return;
+
     if(mapOpen){
       setMapVisible(false);
-      try{canvas.requestPointerLock();}catch(_){}
-    }else setMapVisible(true);
+
+      if(playerDead){
+        startSpectating(true);
+      }else{
+        try{canvas.requestPointerLock();}catch(_){}
+      }
+    }else{
+      if(spectatorActive)stopSpectating(false);
+      setMapVisible(true);
+    }
+    return;
+  }
+
+  if(spectatorActive){
+    if(e.code==='KeyQ'){
+      e.preventDefault();
+      spectatorCycle(-1);
+    }else if(e.code==='KeyE'){
+      e.preventDefault();
+      spectatorCycle(1);
+    }
     return;
   }
 
@@ -5375,7 +5777,15 @@ addEventListener('keyup',e=>{
 
 canvas.addEventListener('contextmenu',e=>{if(gameStarted&&mapOpen)e.preventDefault();});
 canvas.addEventListener('wheel',e=>{
-  if(!gameStarted||isMenuOrTextInputActive(e.target)||!mapOpen)return;
+  if(!gameStarted||isMenuOrTextInputActive(e.target))return;
+
+  if(spectatorActive&&!mapOpen){
+    e.preventDefault();
+    spectatorCycle(e.deltaY>0?1:-1);
+    return;
+  }
+
+  if(!mapOpen)return;
   e.preventDefault();
 
   // Roblox: zoom = clamp(zoom - wheelZ*zoomStep).
@@ -5433,7 +5843,7 @@ addEventListener('keydown',e=>{
 canvas.addEventListener('click',()=>{
   if(!gameStarted||isMenuOrTextInputActive(document.activeElement))return;
   ensureGameAudio();
-  if(!locked&&!mapOpen&&!playerDead)canvas.requestPointerLock();
+  if(!locked&&!mapOpen&&!playerDead&&!spectatorActive)canvas.requestPointerLock();
 });
 document.addEventListener('pointerlockchange',()=>{
   locked=document.pointerLockElement===canvas;
