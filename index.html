@@ -79,7 +79,7 @@ body.map-open #spectatorHud,body.menu-open #spectatorHud{display:none!important}
 <div id="deadHud"><b>DEAD</b><br>Waiting for the next map · Press N</div>
 <div id="spectatorHud"></div>
 <div id="hud"><span id="networkInfo"></span>SEED <b id="seed"></b><br>ROOMS <b id="roomCount"></b><br>WINDOWS <b id="windowCount"></b><br>EXITS <b id="exitCount"></b><br>SINGLE OPENINGS <b id="smallDoorCount"></b><br>DOUBLE OPENINGS <b id="bigDoorCount"></b><br>OPEN WALLS <b id="openWallCount"></b></div>
-<div id="tip">WASD move · mouse look · Shift sprint · M map · N new building · Outside or in an exit-connected room: UAV whirring fades in · deeper rooms fade it out · lock tones stay separate</div>
+<div id="tip">WASD move · mouse look · Shift sprint · C crouch · Space jump · M map · N new building · Outside or in an exit-connected room: UAV whirring fades in · deeper rooms fade it out · lock tones stay separate</div>
 <div id="overlay"></div>
 <div id="deathFeed"></div>
 <div id="playerNameLayer"></div>
@@ -147,6 +147,12 @@ const WINDOW_GLASS_CLEARANCE=0.004;
 const WINDOW_CHANCE=0.30;          // chance for an eligible exterior room wall module to become a window
 const PLAYER_EYE=1.65;
 const PLAYER_RADIUS=0.28;
+const PLAYER_CAPSULE_HEIGHT=1.70;
+const PLAYER_CROUCH_CAPSULE_HEIGHT=1.05;
+const PLAYER_CROUCH_EYE=0.92;
+const PLAYER_CROUCH_SPEED=9.0;
+const PLAYER_JUMP_SPEED=5.35;
+const PLAYER_GRAVITY=14.5;
 
 // Blue cylinder follower: no damage, no attack, no interaction. It only follows.
 const FOLLOWER_RADIUS=0.30;
@@ -320,10 +326,11 @@ function buildSpectatorTargets(){
   if(multiplayer){
     for(const p of netPlayers.values()){
       if(p.id===localPeerId)continue;
+      if(p.alive===false)continue; // corpses are NEVER spectator targets
       out.push({
         key:'player:'+p.id,
         kind:'PLAYER',
-        label:p.name+(p.alive===false?' (DEAD)':''),
+        label:p.name,
         playerId:p.id
       });
     }
@@ -403,7 +410,10 @@ function getSpectatorCameraPose(){
     const p=netPlayers.get(target.playerId);
     if(!p)return null;
     const ground=mapSurfaceYAt(p.x,p.z);
-    center=[p.x,ground+(p.alive===false?0.62:1.02),p.z];
+    const crouch=Math.max(0,Math.min(1,Number(p.crouch)||0));
+    const jump=Math.max(0,Number(p.jumpOffset)||0);
+    const centerHeight=1.02+(0.67-1.02)*crouch;
+    center=[p.x,ground+jump+centerHeight,p.z];
   }else if(target.key==='follower'){
     center=[followerX,followerBaseY+FOLLOWER_HEIGHT*.58,followerZ];
   }else if(target.key.startsWith('uav:')){
@@ -461,6 +471,10 @@ function updateSpectatorHud(){
 }
 function startSpectating(force=false){
   if(!gameStarted)return false;
+
+  // Spectator is a DEAD-PLAYER-ONLY system.
+  // Living players must never be able to detach from their first-person body.
+  if(!playerDead)return false;
 
   const targets=buildSpectatorTargets();
   if(!targets.length)return false;
@@ -1294,14 +1308,25 @@ const targetedPlayerGlowVerts=[];
 function NPV(x,y,z,nx,ny,nz,r,g,b){netPlayerVerts.push(x,y,z,nx,ny,nz,r,g,b);}
 function netPlayerTransform(p,lx,ly,lz){
   const fall=(p.alive===false)?(-Math.PI*.5*smooth01(p.deathT==null?1:p.deathT)):0;
+
+  // Standing capsule physically compresses downward while crouched.
+  // Dead bodies retain their normal full-size corpse silhouette.
+  const crouch=(p.alive===false)?0:Math.max(0,Math.min(1,Number(p.crouch)||0));
+  const crouchScale=1-crouch*(1-PLAYER_CROUCH_CAPSULE_HEIGHT/PLAYER_CAPSULE_HEIGHT);
+  ly*=crouchScale;
+
   const cf=Math.cos(fall),sf=Math.sin(fall);
   const y2=ly*cf-lz*sf,z2=ly*sf+lz*cf;
-  const lift=p.alive===false?.34:0;
+  const lift=p.alive===false?.34:Math.max(0,Number(p.jumpOffset)||0);
   const c=Math.cos(p.yaw||0),s=Math.sin(p.yaw||0);
   return [p.x+lx*c+z2*s,mapSurfaceYAt(p.x,p.z)+lift+y2,p.z+lx*s-z2*c];
 }
 function netPlayerNormal(p,lx,ly,lz){
   const fall=(p.alive===false)?(-Math.PI*.5*smooth01(p.deathT==null?1:p.deathT)):0;
+  const crouch=(p.alive===false)?0:Math.max(0,Math.min(1,Number(p.crouch)||0));
+  const crouchScale=1-crouch*(1-PLAYER_CROUCH_CAPSULE_HEIGHT/PLAYER_CAPSULE_HEIGHT);
+  ly*=crouchScale;
+
   const cf=Math.cos(fall),sf=Math.sin(fall);
   const y2=ly*cf-lz*sf,z2=ly*sf+lz*cf;
   const c=Math.cos(p.yaw||0),s=Math.sin(p.yaw||0);
@@ -1312,8 +1337,10 @@ function addNetCapsule(p){
   const col=(p.color&&p.color.rgb)||[.3,.55,1];
   const seg=14;
   const rings=[
-    {y:0.00,r:.03,ny:-1},{y:.08,r:.23,ny:-.7},{y:.30,r:.32,ny:0},
-    {y:1.38,r:.32,ny:0},{y:1.61,r:.23,ny:.7},{y:1.70,r:.03,ny:1}
+    // Zero-radius bottom/top apexes completely close the capsule. The previous
+    // .03-radius final ring left a visible little hole in the crown.
+    {y:0.00,r:0,ny:-1},{y:.08,r:.23,ny:-.7},{y:.30,r:.32,ny:0},
+    {y:1.38,r:.32,ny:0},{y:1.61,r:.23,ny:.7},{y:1.70,r:0,ny:1}
   ];
   for(let ri=0;ri<rings.length-1;ri++){
     const a=rings[ri],b=rings[ri+1];
@@ -1337,12 +1364,12 @@ function TPGV(x,y,z){targetedPlayerGlowVerts.push(x,y,z);}
 function addTargetedGlowCapsule(p,scale=1.18){
   const seg=18;
   const rings=[
-    {y:-0.035,r:.03*scale},
+    {y:-0.035,r:0},
     {y:.055,r:.23*scale},
     {y:.28,r:.32*scale},
     {y:1.40,r:.32*scale},
     {y:1.645,r:.23*scale},
-    {y:1.735,r:.03*scale}
+    {y:1.735,r:0}
   ];
 
   for(let ri=0;ri<rings.length-1;ri++){
@@ -1466,38 +1493,76 @@ function renderNetPlayers(mapCamera){
 
 // ---------- map death X markers ----------
 const deathMarkerBuffer=gl.createBuffer();
+const ownDeathMarkerBuffer=gl.createBuffer();
 let deathMarkerVertexCount=0;
+let ownDeathMarkerVertexCount=0;
 const deathMarkerVerts=[];
-function DMV(x,y,z){deathMarkerVerts.push(x,y,z);}
-function deathMarkerRect(cx,cy,cz,length,width,angle){
+const ownDeathMarkerVerts=[];
+function DMV(arr,x,y,z){arr.push(x,y,z);}
+function deathMarkerRect(arr,cx,cy,cz,length,width,angle){
   const c=Math.cos(angle),s=Math.sin(angle),hx=length*.5,hz=width*.5;
   const P=(x,z)=>[cx+x*c-z*s,cy,cz+x*s+z*c];
   const a=P(-hx,-hz),b=P(hx,-hz),cc=P(hx,hz),d=P(-hx,hz);
-  DMV(...a);DMV(...b);DMV(...cc);DMV(...a);DMV(...cc);DMV(...d);
+  DMV(arr,...a);DMV(arr,...b);DMV(arr,...cc);
+  DMV(arr,...a);DMV(arr,...cc);DMV(arr,...d);
 }
 function rebuildDeathMarkerMesh(){
   deathMarkerVerts.length=0;
+  ownDeathMarkerVerts.length=0;
+
   for(const m of deathMarkers){
     const y=mapSurfaceYAt(m.x,m.z)+.24;
-    deathMarkerRect(m.x,y,m.z,1.25,.16,Math.PI*.25);
-    deathMarkerRect(m.x,y,m.z,1.25,.16,-Math.PI*.25);
+
+    // In multiplayer, YOUR own corpse marker is yellow only on your own
+    // machine. Every other player's death remains red.
+    const arr=(multiplayer&&String(m.peerId)===String(localPeerId))
+      ? ownDeathMarkerVerts
+      : deathMarkerVerts;
+
+    deathMarkerRect(arr,m.x,y,m.z,1.25,.16,Math.PI*.25);
+    deathMarkerRect(arr,m.x,y,m.z,1.25,.16,-Math.PI*.25);
   }
+
   gl.bindBuffer(gl.ARRAY_BUFFER,deathMarkerBuffer);
   gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(deathMarkerVerts),gl.DYNAMIC_DRAW);
   deathMarkerVertexCount=deathMarkerVerts.length/3;
+
+  gl.bindBuffer(gl.ARRAY_BUFFER,ownDeathMarkerBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(ownDeathMarkerVerts),gl.DYNAMIC_DRAW);
+  ownDeathMarkerVertexCount=ownDeathMarkerVerts.length/3;
+}
+function renderDeathMarkerBuffer(buf,count,r,g,b,a){
+  if(!count)return;
+  gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+  gl.enableVertexAttribArray(mapDrawPosLoc);
+  gl.vertexAttribPointer(mapDrawPosLoc,3,gl.FLOAT,false,12,0);
+  gl.uniform4f(mapDrawColorLoc,r,g,b,a);
+  gl.drawArrays(gl.TRIANGLES,0,count);
 }
 function renderDeathMarkers(){
-  if(!mapOpen||!deathMarkerVertexCount)return;
-  gl.useProgram(mapDrawProg);
-  gl.uniformMatrix4fv(mapDrawProjLoc,false,proj);gl.uniformMatrix4fv(mapDrawViewLoc,false,view);
-  gl.bindBuffer(gl.ARRAY_BUFFER,deathMarkerBuffer);
-  gl.enableVertexAttribArray(mapDrawPosLoc);gl.vertexAttribPointer(mapDrawPosLoc,3,gl.FLOAT,false,12,0);
-  gl.disable(gl.DEPTH_TEST);gl.depthMask(false);gl.disable(gl.CULL_FACE);gl.enable(gl.BLEND);
-  gl.blendFunc(gl.SRC_ALPHA,gl.ONE);gl.uniform4f(mapDrawColorLoc,1,.04,.02,.95);
-  gl.drawArrays(gl.TRIANGLES,0,deathMarkerVertexCount);
-  gl.disable(gl.BLEND);gl.depthMask(true);gl.enable(gl.DEPTH_TEST);gl.enable(gl.CULL_FACE);
-}
+  if(!mapOpen||(!deathMarkerVertexCount&&!ownDeathMarkerVertexCount))return;
 
+  gl.useProgram(mapDrawProg);
+  gl.uniformMatrix4fv(mapDrawProjLoc,false,proj);
+  gl.uniformMatrix4fv(mapDrawViewLoc,false,view);
+
+  gl.disable(gl.DEPTH_TEST);
+  gl.depthMask(false);
+  gl.disable(gl.CULL_FACE);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA,gl.ONE);
+
+  // Other players = red.
+  renderDeathMarkerBuffer(deathMarkerBuffer,deathMarkerVertexCount,1,.04,.02,.95);
+
+  // Your own dead X = yellow on your own client/host only.
+  renderDeathMarkerBuffer(ownDeathMarkerBuffer,ownDeathMarkerVertexCount,1,.92,.02,1.0);
+
+  gl.disable(gl.BLEND);
+  gl.depthMask(true);
+  gl.enable(gl.DEPTH_TEST);
+  gl.enable(gl.CULL_FACE);
+}
 function projectWorldToScreen(x,y,z){
   const vx=view[0]*x+view[4]*y+view[8]*z+view[12],vy=view[1]*x+view[5]*y+view[9]*z+view[13];
   const vz=view[2]*x+view[6]*y+view[10]*z+view[14],vw=view[3]*x+view[7]*y+view[11]*z+view[15];
@@ -1520,7 +1585,14 @@ function updatePlayerNameLabels(mapCamera){
   for(const p of netPlayers.values()){
     const el=playerNameEls.get(p.id);if(!el)continue;
     if(!mapCamera&&p.id===localPeerId){el.style.display='none';continue;}
-    const s=projectWorldToScreen(p.x,mapSurfaceYAt(p.x,p.z)+(p.alive===false?.8:1.95),p.z);
+    const crouch=Math.max(0,Math.min(1,Number(p.crouch)||0));
+    const jump=Math.max(0,Number(p.jumpOffset)||0);
+    const standingTagHeight=1.95+(1.28-1.95)*crouch;
+    const s=projectWorldToScreen(
+      p.x,
+      mapSurfaceYAt(p.x,p.z)+(p.alive===false?.8:standingTagHeight+jump),
+      p.z
+    );
     if(!s||s.x<-80||s.x>innerWidth+80||s.y<-50||s.y>innerHeight+50){el.style.display='none';continue;}
     el.style.display='block';el.style.left=s.x+'px';el.style.top=s.y+'px';
   }
@@ -3853,13 +3925,13 @@ function teardownPeer(){
 function updateNetworkInfo(){
   if(gameMode==='host'){
     networkInfoEl.innerHTML='HOST <b>'+displayName+'</b><br>JOIN CODE <b style="font-size:16px;letter-spacing:2px">'+joinCode+'</b><br>PLAYERS <b>'+netPlayers.size+'</b><br>';
-    tipEl.textContent='WASD move · mouse look · Shift sprint · M map · V spectate · mouse orbit · L/R click targets · N host-new-map · your drawings yellow · other players red';
+    tipEl.textContent='WASD move · mouse look · Shift sprint · C crouch · Space jump · M map · N host-new-map · your drawings yellow · other players red';
   }else if(gameMode==='client'){
     networkInfoEl.innerHTML='MULTIPLAYER <b>'+displayName+'</b><br>CODE <b>'+joinCode+'</b><br>PLAYERS <b>'+netPlayers.size+'</b><br>';
-    tipEl.textContent='WASD move · mouse look · Shift sprint · M map · V spectate · mouse orbit · L/R click targets · your drawings yellow · other players red';
+    tipEl.textContent='WASD move · mouse look · Shift sprint · C crouch · Space jump · M map · your drawings yellow · other players red';
   }else{
     networkInfoEl.innerHTML='SINGLE PLAYER<br>';
-    tipEl.textContent='WASD move · mouse look · Shift sprint · M map · N new building';
+    tipEl.textContent='WASD move · mouse look · Shift sprint · C crouch · Space jump · M map · N new building';
   }
 }
 function sendConn(conn,msg){try{if(conn&&conn.open)conn.send(msg);}catch(err){console.warn('network send failed',err);}}
@@ -3868,17 +3940,28 @@ function broadcastHost(msg,exceptPeerId=null){
   for(const [id,c] of peerConnections){if(id!==exceptPeerId)sendConn(c,msg);}
 }
 function serializePlayer(p){
-  return {id:p.id,entityId:p.entityId,name:p.name,slot:p.slot,colorIndex:p.colorIndex,x:p.x,z:p.z,yaw:p.yaw,
+  return {
+    id:p.id,entityId:p.entityId,name:p.name,slot:p.slot,colorIndex:p.colorIndex,
+    x:p.x,z:p.z,yaw:p.yaw,
+    crouch:Number.isFinite(p.crouch)?p.crouch:0,
+    jumpOffset:Number.isFinite(p.jumpOffset)?p.jumpOffset:0,
     alive:p.alive!==false,deathYaw:p.deathYaw||0,deathX:p.deathX,deathZ:p.deathZ,
-    deathT:p.deathT==null?(p.alive===false?1:0):p.deathT};
+    deathT:p.deathT==null?(p.alive===false?1:0):p.deathT
+  };
 }
 function serializePlayers(){return [...netPlayers.values()].map(serializePlayer);}
 function playerFromData(d){
   const ci=Number.isFinite(d.colorIndex)?d.colorIndex:0;
-  return {id:String(d.id),entityId:Number(d.entityId),name:safeName(d.name),slot:Number(d.slot)||0,colorIndex:ci,
-    color:playerColorForSlot(ci),x:Number(d.x)||0,z:Number(d.z)||0,yaw:Number(d.yaw)||0,alive:d.alive!==false,
+  return {
+    id:String(d.id),entityId:Number(d.entityId),name:safeName(d.name),slot:Number(d.slot)||0,colorIndex:ci,
+    color:playerColorForSlot(ci),
+    x:Number(d.x)||0,z:Number(d.z)||0,yaw:Number(d.yaw)||0,
+    crouch:Math.max(0,Math.min(1,Number(d.crouch)||0)),
+    jumpOffset:Math.max(0,Math.min(2.0,Number(d.jumpOffset)||0)),
+    alive:d.alive!==false,
     deathYaw:Number(d.deathYaw)||0,deathX:d.deathX,deathZ:d.deathZ,
-    deathT:Number.isFinite(d.deathT)?d.deathT:(d.alive===false?1:0)};
+    deathT:Number.isFinite(d.deathT)?d.deathT:(d.alive===false?1:0)
+  };
 }
 function applyPlayerSnapshot(list,preserveSelf=true){
   const incoming=new Set();
@@ -3889,7 +3972,13 @@ function applyPlayerSnapshot(list,preserveSelf=true){
     else{
       const self=id===localPeerId;
       p.entityId=Number(d.entityId);p.name=safeName(d.name);p.slot=Number(d.slot)||0;p.colorIndex=Number(d.colorIndex)||0;p.color=playerColorForSlot(p.colorIndex);
-      if(!(preserveSelf&&self)){p.x=Number(d.x)||0;p.z=Number(d.z)||0;p.yaw=Number(d.yaw)||0;}
+      if(!(preserveSelf&&self)){
+        p.x=Number(d.x)||0;
+        p.z=Number(d.z)||0;
+        p.yaw=Number(d.yaw)||0;
+        p.crouch=Math.max(0,Math.min(1,Number(d.crouch)||0));
+        p.jumpOffset=Math.max(0,Math.min(2.0,Number(d.jumpOffset)||0));
+      }
       p.alive=d.alive!==false;p.deathYaw=Number(d.deathYaw)||0;p.deathX=d.deathX;p.deathZ=d.deathZ;
       p.deathT=Number.isFinite(d.deathT)?d.deathT:(p.alive?0:1);
     }
@@ -4022,9 +4111,19 @@ function spawnPointForSlot(slot){
 }
 function setAllPlayersForNewRound(){
   for(const p of netPlayers.values()){
-    const s=spawnPointForSlot(p.slot);p.x=s.x;p.z=s.z;p.yaw=0;p.alive=true;p.deathT=0;p.deathYaw=0;p.deathX=undefined;p.deathZ=undefined;
+    const s=spawnPointForSlot(p.slot);
+    p.x=s.x;p.z=s.z;p.yaw=0;
+    p.crouch=0;p.jumpOffset=0;
+    p.alive=true;p.deathT=0;p.deathYaw=0;p.deathX=undefined;p.deathZ=undefined;
   }
-  const me=netPlayers.get(localPeerId);if(me){px=me.x;pz=me.z;yaw=0;pitch=0;localUavEntityId=me.entityId;}
+  const me=netPlayers.get(localPeerId);
+  if(me){
+    px=me.x;pz=me.z;yaw=0;pitch=0;
+    playerCrouchAmount=0;
+    playerVerticalOffset=0;
+    playerVerticalVelocity=0;
+    localUavEntityId=me.entityId;
+  }
   rebuildNetPlayerMesh();
 }
 function hostAllPlayersDead(){if(!isHost||!netPlayers.size)return false;for(const p of netPlayers.values())if(p.alive!==false)return false;return true;}
@@ -4096,6 +4195,7 @@ function hostEnsurePlayerForConnection(conn,requestedName){
     name,slot,colorIndex,
     color:playerColorForSlot(colorIndex),
     x:sp.x,z:sp.z,yaw:0,
+    crouch:0,jumpOffset:0,
     alive:true,deathT:0
   };
 
@@ -4202,7 +4302,11 @@ function handleHostMessage(conn,msg){
   if(msg.type==='playerState'&&p&&p.alive!==false){
     const nx=Number(msg.x),nz=Number(msg.z),nyaw=Number(msg.yaw);
     if(Number.isFinite(nx)&&Number.isFinite(nz)&&!circleHitsWall(nx,nz)){p.x=nx;p.z=nz;}
-    if(Number.isFinite(nyaw))p.yaw=nyaw;return;
+    if(Number.isFinite(nyaw))p.yaw=nyaw;
+
+    p.crouch=Math.max(0,Math.min(1,Number(msg.crouch)||0));
+    p.jumpOffset=Math.max(0,Math.min(2.0,Number(msg.jumpOffset)||0));
+    return;
   }
   if(msg.type==='drawPoint'){
     const q={x:Number(msg.x),z:Number(msg.z)},strokeId=String(msg.strokeId||'');if(!Number.isFinite(q.x)||!Number.isFinite(q.z)||!strokeId)return;
@@ -4247,6 +4351,9 @@ function applyWelcomeCore(msg){
   const me=netPlayers.get(localPeerId);
   if(me){
     px=me.x;pz=me.z;yaw=me.yaw||0;pitch=0;
+    playerCrouchAmount=Math.max(0,Math.min(1,Number(me.crouch)||0));
+    playerVerticalOffset=Math.max(0,Number(me.jumpOffset)||0);
+    playerVerticalVelocity=0;
     localUavEntityId=me.entityId;
   }
 
@@ -4400,7 +4507,7 @@ function tryCreateHostPeer(attempt=0){
   const pObj=new Peer(peerRoomId(joinCode),{debug:1});let opened=false;
   pObj.on('open',id=>{
     opened=true;peer=pObj;localPeerId=id;
-    const slot=0,colorIndex=0;netPlayers.clear();netPlayers.set(id,{id,entityId:makeEntityId(slot),name:displayName,slot,colorIndex,color:playerColorForSlot(colorIndex),x:0,z:0,yaw:0,alive:true,deathT:0});
+    const slot=0,colorIndex=0;netPlayers.clear();netPlayers.set(id,{id,entityId:makeEntityId(slot),name:displayName,slot,colorIndex,color:playerColorForSlot(colorIndex),x:0,z:0,yaw:0,crouch:0,jumpOffset:0,alive:true,deathT:0});
     localUavEntityId=makeEntityId(slot);nextPlayerSlot=1;pObj.on('connection',hostAcceptConnection);
     hideMainMenu();hostStartNewMap();updateNetworkInfo();
   });
@@ -4506,7 +4613,15 @@ function hostStartNewMap(){
 function updateMultiplayerFrame(dt){
   if(!multiplayer)return;
   for(const p of netPlayers.values()){if(p.alive===false)p.deathT=Math.min(1,(p.deathT||0)+dt/.72);else p.deathT=0;}
-  const me=netPlayers.get(localPeerId);if(me){if(me.alive!==false){me.x=px;me.z=pz;me.yaw=yaw;}me.alive=!playerDead;}
+  const me=netPlayers.get(localPeerId);
+  if(me){
+    if(me.alive!==false){
+      me.x=px;me.z=pz;me.yaw=yaw;
+      me.crouch=playerCrouchAmount;
+      me.jumpOffset=playerVerticalOffset;
+    }
+    me.alive=!playerDead;
+  }
   rebuildNetPlayerMesh();
   if(isHost){
     if(multiplayerNextMapTimer>=0){
@@ -4528,13 +4643,64 @@ function updateMultiplayerFrame(dt){
 
     networkBroadcastTimer-=dt;if(networkBroadcastTimer<=0){networkBroadcastTimer=.065;hostBroadcastWorld();}
   }else{
-    networkSendTimer-=dt;if(networkSendTimer<=0){networkSendTimer=.05;const self=netPlayers.get(localPeerId);if(self&&self.alive!==false)sendConn(hostConn,{type:'playerState',x:px,z:pz,yaw});}
+    networkSendTimer-=dt;if(networkSendTimer<=0){networkSendTimer=.05;const self=netPlayers.get(localPeerId);if(self&&self.alive!==false)sendConn(hostConn,{
+      type:'playerState',
+      x:px,z:pz,yaw,
+      crouch:playerCrouchAmount,
+      jumpOffset:playerVerticalOffset
+    });}
   }
 }
 
 // ---------- player / exact wall-piece collision ----------
 let px=0,pz=0,yaw=0,pitch=0,locked=false,last=performance.now();
 const keys={};
+
+let playerCrouchAmount=0;
+let playerVerticalOffset=0;
+let playerVerticalVelocity=0;
+
+function localPlayerEyeHeight(){
+  return PLAYER_EYE+(PLAYER_CROUCH_EYE-PLAYER_EYE)*playerCrouchAmount;
+}
+function localPlayerTargetHeight(){
+  // UAVs aim lower when you crouch; this is the effective vertical hit/LOS point.
+  return localPlayerEyeHeight()*0.82;
+}
+function tryPlayerJump(){
+  if(playerDead||mapOpen||spectatorActive)return;
+  if(playerVerticalOffset>0.015||Math.abs(playerVerticalVelocity)>0.05)return;
+  if(playerCrouchAmount>0.28)return;
+
+  playerVerticalVelocity=PLAYER_JUMP_SPEED;
+}
+function updatePlayerVerticalAndCrouch(dt){
+  if(playerDead){
+    playerCrouchAmount=0;
+    playerVerticalOffset=0;
+    playerVerticalVelocity=0;
+    return;
+  }
+
+  // C is hold-to-crouch. Crouching is disabled while airborne so the physical
+  // hit/LOS height cannot be abused as a mid-air instant collapse.
+  const wantCrouch=!!keys.KeyC && playerVerticalOffset<=0.015;
+  const target=wantCrouch?1:0;
+  const step=PLAYER_CROUCH_SPEED*dt;
+
+  if(playerCrouchAmount<target)playerCrouchAmount=Math.min(target,playerCrouchAmount+step);
+  else if(playerCrouchAmount>target)playerCrouchAmount=Math.max(target,playerCrouchAmount-step);
+
+  if(playerVerticalOffset>0||playerVerticalVelocity!==0){
+    playerVerticalVelocity-=PLAYER_GRAVITY*dt;
+    playerVerticalOffset+=playerVerticalVelocity*dt;
+
+    if(playerVerticalOffset<=0){
+      playerVerticalOffset=0;
+      playerVerticalVelocity=0;
+    }
+  }
+}
 function circleHitsWall(x,z){
   for(const c of colliders){
     if(x+PLAYER_RADIUS<c.x0||x-PLAYER_RADIUS>c.x1||z+PLAYER_RADIUS<c.z0||z-PLAYER_RADIUS>c.z1)continue;
@@ -5243,7 +5409,23 @@ function resetUavEntityRegistryForMode(){
         p.entityId,'player',p.name,
         ()=>{
           const cur=netPlayers.get(p.id);if(!cur)return null;
-          return{x:cur.id===localPeerId?px:cur.x,y:PLAYER_EYE*.82,z:cur.id===localPeerId?pz:cur.z};
+          const isLocal=cur.id===localPeerId;
+          const tx=isLocal?px:cur.x;
+          const tz=isLocal?pz:cur.z;
+          const crouch=isLocal
+            ? playerCrouchAmount
+            : Math.max(0,Math.min(1,Number(cur.crouch)||0));
+          const jump=isLocal
+            ? playerVerticalOffset
+            : Math.max(0,Number(cur.jumpOffset)||0);
+
+          const eyeHeight=PLAYER_EYE+(PLAYER_CROUCH_EYE-PLAYER_EYE)*crouch;
+
+          return{
+            x:tx,
+            y:mapSurfaceYAt(tx,tz)+jump+eyeHeight*.82,
+            z:tz
+          };
         },
         ()=>{const cur=netPlayers.get(p.id);return!!(cur&&cur.alive!==false);},
         drone=>{if(isHost)hostKillNetworkPlayer(p.id,drone.id);}
@@ -5253,7 +5435,16 @@ function resetUavEntityRegistryForMode(){
     return;
   }
   localUavEntityId=1;
-  registerUavEntity(1,'player','YOU',()=>({x:px,y:PLAYER_EYE*.82,z:pz}),()=>!playerDead,drone=>beginPlayerDeath(drone.id));
+  registerUavEntity(
+    1,'player','YOU',
+    ()=>({
+      x:px,
+      y:mapSurfaceYAt(px,pz)+playerVerticalOffset+localPlayerTargetHeight(),
+      z:pz
+    }),
+    ()=>!playerDead,
+    drone=>beginPlayerDeath(drone.id)
+  );
   registerUavEntity(2,'npc','BLUE MAN',
     ()=>followerAlive&&Number.isFinite(followerX)&&Number.isFinite(followerZ)?{x:followerX,y:followerBaseY+FOLLOWER_HEIGHT*.62,z:followerZ}:null,
     ()=>followerAlive&&Number.isFinite(followerX)&&Number.isFinite(followerZ),
@@ -5559,7 +5750,12 @@ function loadBuildingSeed(forcedSeed,allowFollower){
   // From this point onward mapSurfaceYAt / capsule mesh generation is safe.
   worldGeometryReady=true;
 
-  const r=rooms[0];px=(r.x+r.w/2)*TILE;pz=(r.z+r.h/2)*TILE;yaw=0;pitch=0;
+  const r=rooms[0];
+  px=(r.x+r.w/2)*TILE;pz=(r.z+r.h/2)*TILE;
+  yaw=0;pitch=0;
+  playerCrouchAmount=0;
+  playerVerticalOffset=0;
+  playerVerticalVelocity=0;
   if(!multiplayer&&allowFollower){
     try{spawnFollower();}
     catch(err){console.error('Follower initialization failed; continuing without follower:',err);followerAlive=false;followerX=NaN;followerZ=NaN;followerWaypoints=[];followerWaypointIndex=0;followerVertexCount=0;}
@@ -5762,6 +5958,7 @@ function frame(now){
     return;
   }
 
+  updatePlayerVerticalAndCrouch(dt);
   updateMultiplayerFrame(dt);
   updateUavs(dt);
   updateUavKillFlash(dt);
@@ -5825,13 +6022,14 @@ function frame(now){
 
   let camPitch=pitch;
   let camYaw=yaw;
-  let camEyeY=PLAYER_EYE;
+  const localSurfaceY=mapSurfaceYAt(px,pz);
+  let camEyeY=localSurfaceY+playerVerticalOffset+localPlayerEyeHeight();
 
   if(playerDead&&deathPhase==='fall'){
     const fall=smooth01(deathTimer/0.86);
     camPitch=deathStartPitch+(1.43-deathStartPitch)*fall;
     camYaw=deathStartYaw;
-    camEyeY=PLAYER_EYE+(0.34-PLAYER_EYE)*fall;
+    camEyeY=localSurfaceY+PLAYER_EYE+(0.34-PLAYER_EYE)*fall;
   }
 
   const cp=Math.cos(camPitch);
@@ -5868,10 +6066,15 @@ addEventListener('keydown',e=>{
   if(e.code==='KeyV'){
     e.preventDefault();
 
+    // V only has meaning after death.
+    if(!playerDead)return;
+
     if(spectatorActive){
-      stopSpectating(!playerDead);
+      stopSpectating(false);
+      mapViewMode='MAP';
+      setMapVisible(true);
     }else{
-      startSpectating();
+      startSpectating(true);
     }
     return;
   }
@@ -5921,6 +6124,12 @@ addEventListener('keydown',e=>{
       mapKeys[e.code]=true;
       e.preventDefault();
     }
+    return;
+  }
+
+  if(e.code==='Space'){
+    e.preventDefault();
+    if(!e.repeat)tryPlayerJump();
     return;
   }
 
