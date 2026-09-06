@@ -3007,25 +3007,28 @@ function windowFrameQuad(a,b,c,d,n){
   WFV(...a,...n);WFV(...c,...n);WFV(...d,...n);
 }
 
-function addWindowFrameMesh(ax,az,bx,bz,kind){
-  const {opening,offset}=windowProfile(kind);
+function addWindowFrameMesh(ax,az,bx,bz,kind,full=false){
+  const {opening,offset}=full?{opening:TILE-EDGE_JAMB*2,offset:0}:windowProfile(kind);
+  const inset=full?FULL_GLASS_INSET:WINDOW_FRAME_INSET;
+  const width=full?FULL_GLASS_FRAME_WIDTH:WINDOW_FRAME_WIDTH;
+  const depth=full?FULL_GLASS_FRAME_DEPTH:WINDOW_FRAME_DEPTH;
 
   // Exact inner and outer rectangles.
-  const iL=-opening/2+WINDOW_FRAME_INSET;
-  const iR= opening/2-WINDOW_FRAME_INSET;
-  const iB=WINDOW_SILL+WINDOW_FRAME_INSET;
-  const iT=WINDOW_SILL+WINDOW_HEIGHT-WINDOW_FRAME_INSET;
+  const iL=-opening/2+inset;
+  const iR= opening/2-inset;
+  const iB=full?FULL_GLASS_BOTTOM+width:WINDOW_SILL+inset;
+  const iT=full?FULL_GLASS_TOP-width:WINDOW_SILL+WINDOW_HEIGHT-inset;
 
-  const oL=iL-WINDOW_FRAME_WIDTH;
-  const oR=iR+WINDOW_FRAME_WIDTH;
-  const oB=iB-WINDOW_FRAME_WIDTH;
-  const oT=iT+WINDOW_FRAME_WIDTH;
+  const oL=iL-width;
+  const oR=iR+width;
+  const oB=iB-width;
+  const oT=iT+width;
 
   if(ax!==bx){
     const x=Math.max(ax,bx)*TILE;
     const center=(az+.5)*TILE+offset;
-    const x0=x-WINDOW_FRAME_DEPTH/2;
-    const x1=x+WINDOW_FRAME_DEPTH/2;
+    const x0=x-depth/2;
+    const x1=x+depth/2;
 
     const uL=center+oL,uR=center+oR,uiL=center+iL,uiR=center+iR;
 
@@ -3056,8 +3059,8 @@ function addWindowFrameMesh(ax,az,bx,bz,kind){
   }else{
     const z=Math.max(az,bz)*TILE;
     const center=(ax+.5)*TILE+offset;
-    const z0=z-WINDOW_FRAME_DEPTH/2;
-    const z1=z+WINDOW_FRAME_DEPTH/2;
+    const z0=z-depth/2;
+    const z1=z+depth/2;
 
     const uL=center+oL,uR=center+oR,uiL=center+iL,uiR=center+iR;
 
@@ -6798,15 +6801,11 @@ function addFullGlassWallModule(ax,az,bx,bz){
   const tileMin=-TILE/2,tileMax=TILE/2;
   const fillA=Math.max(0,outerL-tileMin);
   const fillB=Math.max(0,tileMax-outerR);
-  const frameTop=[0.13,0.15,0.16],frameSide=[0.42,0.31,0.09],frameUnder=[0.10,0.11,0.12];
   const glassInset=.004;
   const gL=innerL+glassInset,gR=innerR-glassInset;
   const gB=FULL_GLASS_BOTTOM+FULL_GLASS_FRAME_WIDTH+glassInset;
   const gT=FULL_GLASS_TOP-FULL_GLASS_FRAME_WIDTH-glassInset;
 
-  function addFrameBox(cx,cy,cz,sx,sy,sz){
-    addBox(cx,cy,cz,sx,sy,sz,frameTop,frameSide,frameUnder);
-  }
 
   if(ax!==bx){
     const x=Math.max(ax,bx)*TILE;
@@ -6822,10 +6821,6 @@ function addFullGlassWallModule(ax,az,bx,bz){
     if(upperH>0.0001)
       addDualWallBox(ax,az,bx,bz,x,FULL_GLASS_TOP+upperH/2,wc,WALL_THICKNESS,upperH,span);
 
-    addFrameBox(x,FULL_GLASS_BOTTOM+(FULL_GLASS_FRAME_WIDTH*.5),wc,FULL_GLASS_FRAME_DEPTH,FULL_GLASS_FRAME_WIDTH,span);
-    addFrameBox(x,FULL_GLASS_TOP-(FULL_GLASS_FRAME_WIDTH*.5),wc,FULL_GLASS_FRAME_DEPTH,FULL_GLASS_FRAME_WIDTH,span);
-    addFrameBox(x,(FULL_GLASS_BOTTOM+FULL_GLASS_TOP)*.5,zc+innerL-FULL_GLASS_FRAME_WIDTH*.5,FULL_GLASS_FRAME_DEPTH,FULL_GLASS_TOP-FULL_GLASS_BOTTOM-2*FULL_GLASS_FRAME_WIDTH,FULL_GLASS_FRAME_WIDTH);
-    addFrameBox(x,(FULL_GLASS_BOTTOM+FULL_GLASS_TOP)*.5,zc+innerR+FULL_GLASS_FRAME_WIDTH*.5,FULL_GLASS_FRAME_DEPTH,FULL_GLASS_TOP-FULL_GLASS_BOTTOM-2*FULL_GLASS_FRAME_WIDTH,FULL_GLASS_FRAME_WIDTH);
 
     glassQuad([x,gB,zc+gL],[x,gT,zc+gL],[x,gT,zc+gR],[x,gB,zc+gR]);
 
@@ -6845,16 +6840,13 @@ function addFullGlassWallModule(ax,az,bx,bz){
     if(upperH>0.0001)
       addDualWallBox(ax,az,bx,bz,wc,FULL_GLASS_TOP+upperH/2,z,span,upperH,WALL_THICKNESS);
 
-    addFrameBox(wc,FULL_GLASS_BOTTOM+(FULL_GLASS_FRAME_WIDTH*.5),z,span,FULL_GLASS_FRAME_WIDTH,FULL_GLASS_FRAME_DEPTH);
-    addFrameBox(wc,FULL_GLASS_TOP-(FULL_GLASS_FRAME_WIDTH*.5),z,span,FULL_GLASS_FRAME_WIDTH,FULL_GLASS_FRAME_DEPTH);
-    addFrameBox(xc+innerL-FULL_GLASS_FRAME_WIDTH*.5,(FULL_GLASS_BOTTOM+FULL_GLASS_TOP)*.5,z,FULL_GLASS_FRAME_WIDTH,FULL_GLASS_TOP-FULL_GLASS_BOTTOM-2*FULL_GLASS_FRAME_WIDTH,FULL_GLASS_FRAME_DEPTH);
-    addFrameBox(xc+innerR+FULL_GLASS_FRAME_WIDTH*.5,(FULL_GLASS_BOTTOM+FULL_GLASS_TOP)*.5,z,FULL_GLASS_FRAME_WIDTH,FULL_GLASS_TOP-FULL_GLASS_BOTTOM-2*FULL_GLASS_FRAME_WIDTH,FULL_GLASS_FRAME_DEPTH);
 
     glassQuad([xc+gL,gB,z],[xc+gL,gT,z],[xc+gR,gT,z],[xc+gR,gB,z]);
 
     addMapWallTopStrip(ax,az,bx,bz,wc,z,span,WALL_THICKNESS,activeWallHeight());
     collider(wc-span/2,z-WALL_THICKNESS/2,wc+span/2,z+WALL_THICKNESS/2);
   }
+  addWindowFrameMesh(ax,az,bx,bz,null,true);
 }
 
 function parseEdge(k){const [a,b]=k.split('|'),[ax,az]=a.split(',').map(Number),[bx,bz]=b.split(',').map(Number);return[ax,az,bx,bz];}
