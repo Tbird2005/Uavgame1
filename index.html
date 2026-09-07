@@ -2225,7 +2225,7 @@ function rebuildTargetedPlayerGlowMesh(mapCamera){
       // with that rule. Tactical map renders every capsule including yourself.
       if(!mapCamera&&p.id===localPeerId)continue;
 
-      addTargetedGlowCapsule(p,1.20);
+      addTargetedGlowCapsule(netRenderPlayer(p),1.20);
     }
 
     targetedPlayerGlowVertexCount=targetedPlayerGlowVerts.length/3;
@@ -2284,7 +2284,7 @@ function rebuildNetPlayerMesh(){
 
   const remotes=[];let local=null;
   for(const p of netPlayers.values()){if(p.id===localPeerId)local=p;else remotes.push(p);}
-  for(const p of remotes)addNetCapsule(p);
+  for(const p of remotes)addNetCapsule(netRenderPlayer(p));
   netPlayerRemoteVertexCount=netPlayerVerts.length/9;
   if(local)addNetCapsule(local);
   netPlayerAllVertexCount=netPlayerVerts.length/9;
@@ -2531,7 +2531,8 @@ function syncPlayerNameElements(){
 function updatePlayerNameLabels(mapCamera){
   if(!multiplayer||!gameStarted||!worldGeometryReady){playerNameLayer.style.display='none';return;}
   playerNameLayer.style.display='block';syncPlayerNameElements();
-  for(const p of netPlayers.values()){
+  for(const raw of netPlayers.values()){
+    const p=netRenderPlayer(raw);
     const el=playerNameEls.get(p.id);if(!el)continue;
     if(!mapCamera&&p.id===localPeerId){el.style.display='none';continue;}
     const crouch=Math.max(0,Math.min(1,Number(p.crouch)||0));
@@ -5254,6 +5255,38 @@ function jungleConnectL(a,b,width=JUNGLE_CATWALK_WIDTH){
   addJunglePlatformRect(a.x-width*.5,a.z-width*.5,b.x+width*.5,a.z+width*.5,'catwalk');
   addJunglePlatformRect(b.x-width*.5,Math.min(a.z,b.z)-width*.5,b.x+width*.5,Math.max(a.z,b.z)+width*.5,'catwalk');
 }
+// Reserve complete door approaches and retain a connected ground-floor route
+// through every unoccupied room cell. A tower fills one whole 3m module.
+function jungleTowerPlacementSafe(c,cells,placed,accesses){
+ const keys=new Set(cells.map(p=>p[0]+','+p[1]));
+ const occupied=new Set([...placed,c].map(p=>p[0]+','+p[1]));
+ const x=(c[0]+.5)*TILE,z=(c[1]+.5)*TILE,half=JUNGLE_PERCH_SIZE/2;
+ for(const d of accesses){
+  // Door width and body clearance, including offset door openings and turns.
+  for(const step of [0,.8,1.6,2.4]){
+   const px=d.x+d.dx*step,pz=d.z+d.dz*step;
+   const dx=Math.max(0,Math.abs(px-x)-half),dz=Math.max(0,Math.abs(pz-z)-half);
+   if(Math.hypot(dx,dz)<PLAYER_RADIUS+.65)return false;
+  }
+ }
+ for(const p of placed){
+  // Diagonal full-tile towers meet at a point, sealing the tempting gap.
+  if(Math.abs(p[0]-c[0])===1&&Math.abs(p[1]-c[1])===1)return false;
+ }
+ const free=cells.filter(p=>!occupied.has(p[0]+','+p[1]));
+ if(!free.length)return false;
+ const seen=new Set([free[0][0]+','+free[0][1]]),queue=[free[0]];
+ for(let i=0;i<queue.length;i++){
+  const [x,z]=queue[i];
+  for(const [dx,dz] of [[1,0],[-1,0],[0,1],[0,-1]]){
+   const k=(x+dx)+','+(z+dz);
+   if(!keys.has(k)||occupied.has(k)||seen.has(k))continue;
+   seen.add(k);queue.push([x+dx,z+dz]);
+  }
+ }
+ return seen.size===free.length;
+}
+
 function buildJungleArea(){
   jungleZones=[];
   junglePlatforms=[];
@@ -5447,11 +5480,10 @@ function buildJungleArea(){
   const cz=(z0+z1)*.5;
 
   const safeCell=(c,p)=>
-    !pointNearAccess(p.x,p.z,2.75);
+    !pointNearAccess(p.x,p.z,2.75)&&jungleTowerPlacementSafe(c,cells,[],accesses);
 
-  const mainCell=
-    nearestCell(cx,cz,[],safeCell)||
-    nearestCell(cx,cz);
+  // No unsafe fallback: a room without a legal perch remains traversable.
+  const mainCell=nearestCell(cx,cz,[],safeCell);
 
   if(!mainCell)return;
 
@@ -5604,6 +5636,7 @@ function buildJungleArea(){
       [mainCell,...perchCells],
       (cell,p)=>
         !pointNearAccess(p.x,p.z,2.85)&&
+        jungleTowerPlacementSafe(cell,cells,[mainCell,...perchCells],accesses)&&
         !pointNearRamp(p.x,p.z,1.55)&&
         Math.hypot(
           p.x-main.x,
@@ -7050,7 +7083,12 @@ function updateNetworkInfo(){
     tipEl.textContent='WASD move · mouse look · Shift sprint · C crouch · Space jump · M map · P add survivor · L NPC follow/runout · T respawn after death · N new building';
   }
 }
-function sendConn(conn,msg){try{if(conn&&conn.open)conn.send(msg);}catch(err){console.warn('network send failed',err);}}
+function sendConn(conn,msg){
+ try{if(!conn||!conn.open)return;
+  if((msg.type==='world'||msg.type==='playerState')&&((conn.dataChannel&&conn.dataChannel.bufferedAmount>65536)||conn.bufferSize>2))return;
+  conn.send(msg);
+ }catch(err){console.warn('network send failed',err);}
+}
 function broadcastHost(msg,exceptPeerId=null){
   if(!isHost)return;
   for(const [id,c] of peerConnections){if(id!==exceptPeerId)sendConn(c,msg);}
@@ -7102,7 +7140,7 @@ function applyPlayerSnapshot(list,preserveSelf=true){
       p.deathT=Number.isFinite(d.deathT)?d.deathT:(p.alive?0:1);
     }
   }
-  for(const d of list||[]){const p=netPlayers.get(String(d.id));if(p)gunRead(p,d.gun);}
+  for(const d of list||[]){const p=netPlayers.get(String(d.id));if(p){gunRead(p,d.gun);netRecordPose(p);}}
   if(!isHost)for(const id of [...netPlayers.keys()])if(!incoming.has(id))netPlayers.delete(id);
   const me=netPlayers.get(localPeerId);if(me)localUavEntityId=me.entityId;
   updateNetworkInfo();rebuildNetPlayerMesh();syncPlayerNameElements();
@@ -7528,7 +7566,7 @@ function hostKillNetworkPlayer(peerId,killerId){
   p.alive=false;p.deathYaw=p.yaw||0;p.deathX=p.x;p.deathZ=p.z;p.deathT=0;
   addDeathMarker({peerId:p.id,x:p.x,z:p.z,yaw:p.yaw,name:p.name});addDeathFeed(p.name,killerId);
   if(peerId===localPeerId)beginPlayerDeath(killerId);
-  broadcastHost({type:'death',peerId:p.id,name:p.name,killer:killerId,x:p.x,z:p.z,yaw:p.yaw});
+  broadcastHost({type:'death',generation:mapGeneration,peerId:p.id,name:p.name,killer:killerId,x:p.x,z:p.z,yaw:p.yaw});
   if(hostAllPlayersDead())multiplayerNextMapTimer=ROUND_RESET_DELAY_SEC;
 }
 function applyRemoteDeath(msg){
@@ -7539,7 +7577,7 @@ function applyRemoteDeath(msg){
   if(String(msg.peerId)===localPeerId)beginPlayerDeath(msg.killer);
   rebuildNetPlayerMesh();
 }
-function serializeWorldState(){return{type:'world',generation:mapGeneration,players:serializePlayers(),uav:{elapsed:uavElapsed,grace:uavSpawnGrace,drones:serializeUavs()}};}
+function serializeWorldState(){return{type:'world',generation:mapGeneration,seq:++netWorldSeq,glass:glassSnapshot(),players:serializePlayers(),uav:{elapsed:uavElapsed,grace:uavSpawnGrace,drones:serializeUavs()}};}
 function hostBroadcastWorld(){broadcastHost(serializeWorldState());}
 function hostRemovePlayer(peerId){
   peerConnections.delete(peerId);
@@ -7559,6 +7597,7 @@ function assignNextSlot(){const used=new Set([...netPlayers.values()].map(p=>p.s
 function makeWelcomeCore(peerId){
   return {
     type:'welcomeCore',
+    protocol:NET_PROTOCOL,
     code:joinCode,
     selfId:peerId,
     seed,
@@ -7570,6 +7609,7 @@ function makeStateSync(){
   return {
     type:'stateSync',
     generation:mapGeneration,
+    glass:glassSnapshot(),
     drawings:serializeDrawings(),
     deaths:deathMarkers,
     uav:{elapsed:uavElapsed,grace:uavSpawnGrace,drones:serializeUavs()}
@@ -7679,12 +7719,15 @@ function handleHostMessage(conn,msg){
   }
 
   if(msg.type==='hello'){
+    if(msg.protocol!==NET_PROTOCOL){sendConn(conn,{type:'versionMismatch'});return;}
+    conn.gridlockProtocol=NET_PROTOCOL;
     hostEnsurePlayerForConnection(conn,msg.displayName);
     sendConn(conn,makeWelcomeCore(peerId));
     return;
   }
 
   if(msg.type==='readyForState'){
+    if(conn.gridlockProtocol!==NET_PROTOCOL||msg.generation!==mapGeneration)return;
     // Client has successfully built the deterministic seed/map.
     sendConn(conn,makeStateSync());
     // An immediate authoritative snapshot removes any gap before the regular
@@ -7694,28 +7737,12 @@ function handleHostMessage(conn,msg){
   }
 
   const p=netPlayers.get(peerId);
-  if(msg.type==='gunFire'||msg.type==='gunReload'){gunAuthority(peerId,msg);return;}
-  if(msg.type==='playerState'&&p&&p.alive!==false){
-    const nx=Number(msg.x),nz=Number(msg.z),nyaw=Number(msg.yaw);
-
-    const nextCrouch=Math.max(0,Math.min(1,Number(msg.crouch)||0));
-    const nextFeet=Number.isFinite(msg.feetY)?msg.feetY:networkPlayerFeetY(p);
-    const nextHeight=PLAYER_CAPSULE_HEIGHT+(PLAYER_CROUCH_CAPSULE_HEIGHT-PLAYER_CAPSULE_HEIGHT)*nextCrouch;
-    const ownCollider=physicsRemotePlayers.get(peerId)?.collider;
-    if(Number.isFinite(nx)&&Number.isFinite(nz)&&
-      Math.hypot(nx-p.x,nz-p.z)<=2.25&&
-      nextFeet>=outsideGroundY()-.25&&nextFeet<=activePillarTop()+3&&
-      physicsCapsuleClear(nx,nextFeet,nz,nextHeight,ownCollider)){
-      p.x=nx;p.z=nz;p.feetY=nextFeet;p.crouch=nextCrouch;
-    }
-
-    if(Number.isFinite(nyaw))p.yaw=nyaw;
-    if(Number.isFinite(msg.pitch))p.pitch=Math.max(-1.5,Math.min(1.5,msg.pitch));
-
-    p.crouch=Math.max(0,Math.min(1,Number(msg.crouch)||0));
-    p.jumpOffset=Math.max(0,Number(msg.jumpOffset)||0);
-    return;
+  if(msg.type==='glassTouch'){glassHandleTouch(conn,msg);return;}
+  if(msg.type==='gunFire'||msg.type==='gunReload'){
+    if(msg.motion&&msg.generation===mapGeneration)netAcceptState(conn,msg.motion);
+    gunAuthority(peerId,msg);return;
   }
+  if(msg.type==='playerState'){netAcceptState(conn,msg);return;}
   if(msg.type==='drawPoint'){
     const q={x:Number(msg.x),z:Number(msg.z)},strokeId=String(msg.strokeId||'');if(!Number.isFinite(q.x)||!Number.isFinite(q.z)||!strokeId)return;
     if(mapDrawPointOccupied(q)){sendConn(peerConnections.get(peerId),{type:'drawReject',ownerId:peerId,strokeId,x:q.x,z:q.z});return;}
@@ -7739,9 +7766,10 @@ function stopClientHandshakeRetry(){
 }
 function sendClientHello(){
   if(!hostConn||!hostConn.open)return;
-  sendConn(hostConn,{type:'hello',displayName});
+  sendConn(hostConn,{type:'hello',protocol:NET_PROTOCOL,displayName});
 }
 function applyWelcomeCore(msg){
+  if(msg.protocol!==NET_PROTOCOL){netVersionError();return;}
   showMenuStatus('Host found. Building synchronized map…',false);
 
   joinCode=String(msg.code||joinCode);
@@ -7778,6 +7806,7 @@ function applyStateSync(msg){
   if(!clientHandshakeComplete||!worldGeometryReady)return;
   if(Number(msg.generation)!==mapGeneration)return;
 
+  glassApplySnapshot(msg.glass);
   applyDrawSnapshot(msg.drawings||[]);
   deathMarkers=(msg.deaths||[]).map(x=>({...x}));
   rebuildDeathMarkerMesh();
@@ -7787,6 +7816,10 @@ function handleClientMessage(msg){
   if(!msg||typeof msg!=='object')return;
 
   try{
+    if(msg.type==='versionMismatch'){netVersionError();return;}
+    if(msg.type==='glassBreak'){glassBreakEvent(msg);return;}
+    if(msg.type==='glassReject'){if(msg.generation===mapGeneration&&!glassBroken.has(msg.id)){glassPredicted.delete(msg.id);glassSetBroken(breakableGlass[msg.id],false);}return;}
+    if(msg.type==='positionCorrection'){netApplyCorrection(msg);return;}
     if(msg.type==='gunShot'){gunEvent(msg);return;}
     if(msg.type==='gunReloaded'){if(msg.generation===mapGeneration){const p=netPlayers.get(msg.shooter);if(p)gunState(p).reloadEnd=gunNow()+GUN_RELOAD;}return;}
     if(msg.type==='heartbeatPing'){
@@ -7831,13 +7864,16 @@ function handleClientMessage(msg){
       if(!clientHandshakeComplete||!worldGeometryReady)return;
       if(Number(msg.generation)!==mapGeneration)return;
 
+      if(!Number.isSafeInteger(msg.seq)||msg.seq<=netLastWorldSeq)return;
+      netLastWorldSeq=msg.seq;glassApplySnapshot(msg.glass);
       applyPlayerSnapshot(msg.players||[],true);
       applyUavSnapshot(msg.uav);
       return;
     }
 
     if(msg.type==='newMap'){
-      mapGeneration=Number(msg.generation)||mapGeneration+1;
+      if(!Number.isSafeInteger(msg.generation)||msg.generation<=mapGeneration)return;
+      mapGeneration=msg.generation;
 
       // New round: geometry first, network capsule mesh second.
       netPlayers.clear();
@@ -7862,6 +7898,7 @@ function handleClientMessage(msg){
     }
 
     if(msg.type==='death'){
+      if(msg.generation!==mapGeneration)return;
       applyRemoteDeath(msg);
       return;
     }
@@ -8092,14 +8129,9 @@ function updateMultiplayerFrame(dt){
       hostHeartbeatSweep();
     }
 
-    networkBroadcastTimer-=dt;if(networkBroadcastTimer<=0){networkBroadcastTimer=.065;hostBroadcastWorld();}
+    networkBroadcastTimer-=dt;if(networkBroadcastTimer<=0){networkBroadcastTimer=.05;hostBroadcastWorld();}
   }else{
-    networkSendTimer-=dt;if(networkSendTimer<=0){networkSendTimer=.05;const self=netPlayers.get(localPeerId);if(self&&self.alive!==false)sendConn(hostConn,{
-      type:'playerState',
-      x:px,z:pz,yaw,pitch,feetY:playerFeetY,
-      crouch:playerCrouchAmount,
-      jumpOffset:playerVerticalOffset
-    });}
+    networkSendTimer-=dt;if(networkSendTimer<=0){networkSendTimer=1/30;const self=netPlayers.get(localPeerId);if(self&&self.alive!==false)sendConn(hostConn,netMakeState());}
   }
 }
 
@@ -8166,6 +8198,7 @@ let physicsRemotePlayers=new Map();
 let physicsUavColliders=[],physicsUavIndex=0;
 
 function physicsBeginWorld(){
+  glassReset();
   if(physicsWorld)physicsWorld.free();
   physicsWorld=new RAPIER.World({x:0,y:-PLAYER_GRAVITY,z:0});
   physicsWorld.timestep=PHYSICS_DT;
@@ -8176,7 +8209,7 @@ function physicsBeginWorld(){
 }
 function physicsAddBox(cx,cy,cz,sx,sy,sz){
   if(Math.min(sx,sy,sz)<=.000001)return;
-  physicsWorld.createCollider(RAPIER.ColliderDesc.cuboid(sx/2,sy/2,sz/2)
+  return physicsWorld.createCollider(RAPIER.ColliderDesc.cuboid(sx/2,sy/2,sz/2)
     .setTranslation(cx,cy,cz).setFriction(0).setRestitution(0));
 }
 function physicsHullPrimitive(fn){
@@ -8228,11 +8261,7 @@ emitDoorFramePrismX=physicsHullPrimitive(emitDoorFramePrismX);
 emitDoorFramePrismZ=physicsHullPrimitive(emitDoorFramePrismZ);
 const physicsRenderGlass=glassQuad;
 glassQuad=function(...points){
-  if(physicsCapture){
-    const lo=[0,1,2].map(k=>Math.min(...points.map(p=>p[k])));
-    const hi=[0,1,2].map(k=>Math.max(...points.map(p=>p[k])));
-    physicsAddBox(...lo.map((v,k)=>(v+hi[k])/2),...lo.map((v,k)=>Math.max(.012,hi[k]-v)));
-  }
+  if(physicsCapture)glassRegister(points);
   return physicsRenderGlass(...points);
 };
 function physicsAddTriangleMesh(data,stride){
@@ -8353,6 +8382,7 @@ function physicsPlayerStep(vx,vz,dt){
   }
   const desired={x:vx*dt,y:playerVerticalVelocity*dt,z:vz*dt};
   playerController.computeColliderMovement(playerCollider,desired);
+  if(glassPlayerContacts())playerController.computeColliderMovement(playerCollider,desired);
   const movement=playerController.computedMovement();
   px+=movement.x;playerFeetY+=movement.y;pz+=movement.z;
   playerGrounded=playerController.computedGrounded()&&playerVerticalVelocity<=0;
@@ -14182,6 +14212,7 @@ function frame(now){
   updatePlayerPhysics(dt);
   updateLavaHazard();
   if(!playerDead&&playerFeetY<outsideGroundY()-12)beginPlayerDeath("FALL");
+  glassFlush();
   gunUpdate();
   updateMultiplayerFrame(dt);
   updateUavs(dt);
@@ -14588,7 +14619,7 @@ joinCodeInput.addEventListener('keyup',stopMenuKeyFromReachingGame);
 
 // Shared world-space sidearm, host-authoritative combat.
 const GUN_DAMAGE=25,GUN_MAG=17,GUN_RELOAD=1.65,GUN_INTERVAL=.18,GUN_RANGE=90;
-const gunBuffer=gl.createBuffer(),gunTraces=[],gunFlashes=new Map();
+const gunBuffer=gl.createBuffer(),gunTraces=[],gunFlashes=new Map(),gunSeenEvents=new Map();
 let gunLocal={hp:100,ammo:GUN_MAG,reloadEnd:0,nextShot:0,lastSeq:0},gunSeq=0,gunReloadVisual=0,gunHitUntil=0;
 const gunNow=()=>performance.now()/1000;
 const gunHud=document.createElement('div');gunHud.id='gunHud';
@@ -14598,7 +14629,7 @@ const gunCross=document.createElement('div');gunCross.id='gunCross';gunCross.tex
 function gunState(p){if(!p.gun)p.gun={hp:p.alive===false?0:100,ammo:GUN_MAG,reloadEnd:0,nextShot:0,lastSeq:0};return p.gun;}
 function gunFinishReload(s){if(s.reloadEnd&&gunNow()>=s.reloadEnd){s.ammo=GUN_MAG;s.reloadEnd=0;}}
 function gunSelf(){return multiplayer?(netPlayers.get(localPeerId)?gunState(netPlayers.get(localPeerId)):gunLocal):gunLocal;}
-function gunReset(){gunLocal={hp:100,ammo:GUN_MAG,reloadEnd:0,nextShot:0,lastSeq:0};gunTraces.length=0;gunFlashes.clear();gunReloadVisual=0;gunSeq=0;}
+function gunReset(){gunSeenEvents.clear();gunLocal={hp:100,ammo:GUN_MAG,reloadEnd:0,nextShot:0,lastSeq:0};gunTraces.length=0;gunFlashes.clear();gunReloadVisual=0;gunSeq=0;}
 function gunPack(p){const s=gunState(p);gunFinishReload(s);return {hp:s.hp,ammo:s.ammo,reloadLeft:Math.max(0,s.reloadEnd-gunNow()),lastSeq:s.lastSeq,pitch:p.pitch||0};}
 function gunRead(p,d){if(!d)return;const s=gunState(p);s.hp=Math.max(0,Math.min(100,Number(d.hp)||0));s.ammo=Math.max(0,Math.min(GUN_MAG,Number(d.ammo)||0));s.reloadEnd=d.reloadLeft>0?gunNow()+Math.min(GUN_RELOAD,d.reloadLeft):0;s.lastSeq=d.lastSeq||0;p.pitch=Math.max(-1.5,Math.min(1.5,Number(d.pitch)||0));}
 function gunEye(p){const c=Math.max(0,Math.min(1,p.crouch||0));return {x:p.x,y:networkPlayerFeetY(p)+PLAYER_EYE+(PLAYER_CROUCH_EYE-PLAYER_EYE)*c,z:p.z};}
@@ -14619,7 +14650,7 @@ function gunRay(o,d,shooter){
  const wall=physicsWorld.castRay(new RAPIER.Ray(o,d),GUN_RANGE,true,undefined,undefined,undefined,undefined,staticGeometry);
  let distance=wall?wall.timeOfImpact:GUN_RANGE,target=null;
  for(const p of netPlayers.values())if(p.id!==shooter&&p.alive!==false){const t=gunCapsuleHit(o,d,p);if(t<distance){distance=t;target=p;}}
- return {target,distance,end:{x:o.x+d.x*distance,y:o.y+d.y*distance,z:o.z+d.z*distance}};
+ return {target,distance,pane:!target&&wall?glassByHandle.get(wall.collider.handle):null,end:{x:o.x+d.x*distance,y:o.y+d.y*distance,z:o.z+d.z*distance}};
 }
 function gunSound(remote=false){
  try{const C=window.AudioContext||window.webkitAudioContext;if(!C)return;const ctx=gunSound.ctx||(gunSound.ctx=new C());if(ctx.state==='suspended')ctx.resume();
@@ -14628,7 +14659,8 @@ function gunSound(remote=false){
  }catch(_){}
 }
 function gunEvent(e){
- if(e.generation!==mapGeneration)return;
+ if(e.generation!==mapGeneration||!Number.isSafeInteger(e.seq)||e.seq<=(gunSeenEvents.get(e.shooter)||0))return;
+ gunSeenEvents.set(e.shooter,e.seq);
  gunTraces.push({...e,at:gunNow()});if(gunTraces.length>80)gunTraces.shift();
  if(e.shooter!==localPeerId){gunFlashes.set(e.shooter,gunNow());gunSound(true);}
  if(e.shooter===localPeerId&&e.hit)gunHitUntil=gunNow()+.16;
@@ -14655,8 +14687,9 @@ function gunAuthority(id,msg){
  const mountBlock=obstruct(o,muzzlePoint),flightBlock=obstruct(muzzlePoint,hit.end);
  if(mountBlock||flightBlock){
   const a=mountBlock?o:muzzlePoint,b=mountBlock?muzzlePoint:hit.end,t=(mountBlock||flightBlock).timeOfImpact;
-  hit.target=null;hit.end={x:a.x+(b.x-a.x)*t,y:a.y+(b.y-a.y)*t,z:a.z+(b.z-a.z)*t};
+  hit.target=null;hit.pane=glassByHandle.get((mountBlock||flightBlock).collider.handle);hit.end={x:a.x+(b.x-a.x)*t,y:a.y+(b.y-a.y)*t,z:a.z+(b.z-a.z)*t};
  }
+ if(hit.pane)glassBreakAuthority(hit.pane.id,hit.end);
  if(hit.target){const victim=gunState(hit.target);victim.hp=Math.max(0,victim.hp-GUN_DAMAGE);if(!victim.hp)hostKillNetworkPlayer(hit.target.id,p.name||'GLOCK');}
  const e={type:'gunShot',generation:mapGeneration,shooter:id,seq:msg.seq,from:{x:muzzle[0],y:muzzle[1],z:muzzle[2]},end:hit.end,hit:!!hit.target};
  gunEvent(e);if(multiplayer){broadcastHost(e);hostBroadcastWorld();}return true;
@@ -14665,7 +14698,7 @@ function gunFire(){
  if(!gameStarted||playerDead||mapOpen||spectatorActive||!locked||isMenuOrTextInputActive())return;
  const s=gunSelf();gunFinishReload(s);if(s.reloadEnd||s.ammo<=0||gunNow()<s.localNext)return;
  s.localNext=gunNow()+GUN_INTERVAL;
- const msg={type:'gunFire',generation:mapGeneration,seq:++gunSeq,yaw,pitch};
+ const msg={type:'gunFire',generation:mapGeneration,seq:++gunSeq,yaw,pitch,motion:multiplayer&&!isHost?netMakeState():undefined};
  if(multiplayer&&!isHost)sendConn(hostConn,msg);else if(!gunAuthority(localPeerId,msg))return;
  gunFlashes.set(localPeerId,gunNow());gunSound();
 }
@@ -14720,9 +14753,10 @@ function gunModel(out,p){
 }
 function renderGuns(mapCamera){
  const out=[];
+ if(!mapCamera)glassShardMesh(out);
  if(multiplayer){for(const p of netPlayers.values())if(p.alive!==false){
   const local=p.id===localPeerId;if(local&&!mapCamera&&(playerDead||spectatorActive))continue;
-  gunModel(out,local?{...p,x:px,z:pz,feetY:playerFeetY,yaw,pitch,crouch:playerCrouchAmount}:p);
+  gunModel(out,local?{...p,x:px,z:pz,feetY:playerFeetY,yaw,pitch,crouch:playerCrouchAmount}:netRenderPlayer(p));
  }}else if(!playerDead&&!spectatorActive)gunModel(out,{id:localPeerId,x:px,z:pz,feetY:playerFeetY,yaw,pitch,crouch:playerCrouchAmount,gun:gunLocal});
  const now=gunNow();
  for(let i=gunTraces.length-1;i>=0;i--){const e=gunTraces[i],age=now-e.at;if(age>.16){gunTraces.splice(i,1);continue;}
@@ -14740,6 +14774,190 @@ function renderGuns(mapCamera){
 }
 canvas.addEventListener('mousedown',e=>{if(e.button===0)gunFire();});
 addEventListener('keydown',e=>{if(e.code==='KeyR'&&!e.repeat){gunReload();}});
+
+const NET_PROTOCOL='gridlock-glass-7';
+function netVersionError(){
+ stopClientHandshakeRetry();clientHandshakeComplete=false;
+ try{if(hostConn)hostConn.close();}catch(_){}
+ showMainMenu();showMenuStatus('Game versions differ. Everyone must open the same updated HTML file.');
+}
+// Authoritative gameplay state is separate from the smoothed display pose.
+let netMoveSeq=0,netWorldSeq=0,netLastWorldSeq=-1,netCorrectionSeq=-1;
+const netPoseHistory=new Map();
+function netResetMotion(){netMoveSeq=0;netWorldSeq=0;netLastWorldSeq=-1;netCorrectionSeq=-1;netPoseHistory.clear();for(const p of netPlayers.values()){p.moveSeq=-1;p.moveAt=0;}}
+function netRecordPose(p){
+ if(p.id===localPeerId)return;
+ const at=performance.now(),pose={x:p.x,z:p.z,feetY:networkPlayerFeetY(p),yaw:p.yaw||0,pitch:p.pitch||0,crouch:p.crouch||0,at};
+ let h=netPoseHistory.get(p.id);if(!h){h=[];netPoseHistory.set(p.id,h);}
+ const last=h[h.length-1];if(last&&Math.hypot(last.x-p.x,last.z-p.z,last.feetY-pose.feetY)>5)h.length=0;
+ h.push(pose);if(h.length>10)h.shift();
+}
+function netRenderPlayer(p,now=performance.now()){
+ if(p.id===localPeerId||p.alive===false)return p;
+ const h=netPoseHistory.get(p.id);if(!h||!h.length)return p;
+ const at=now-75;let a=h[0],b=a;
+ for(let i=1;i<h.length;i++){b=h[i];if(b.at>=at)break;a=b;}
+ // Bounded interpolation only: no extrapolation through doors or cover.
+ const f=b.at>a.at?Math.max(0,Math.min(1,(at-a.at)/(b.at-a.at))):1;
+ const out={...p};for(const k of ['x','z','feetY','pitch','crouch'])out[k]=a[k]+(b[k]-a[k])*f;
+ out.yaw=a.yaw+Math.atan2(Math.sin(b.yaw-a.yaw),Math.cos(b.yaw-a.yaw))*f;return out;
+}
+function netMakeState(){return {type:'playerState',generation:mapGeneration,seq:++netMoveSeq,x:px,z:pz,yaw,pitch,feetY:playerFeetY,crouch:playerCrouchAmount,jumpOffset:playerVerticalOffset};}
+function netPositionClear(x,y,z,height){
+ const shape=playerShape(height),pos={x,y:y+height/2,z};let clear=true;
+ physicsWorld.intersectionsWithShape(pos,PHYSICS_ROT,shape,c=>{const contact=c.contactShape(shape,pos,PHYSICS_ROT,0);if(contact&&contact.distance<-.001){clear=false;return false;}return true;},undefined,undefined,undefined,undefined,staticGeometry);return clear;
+}
+function netAcceptState(conn,msg){
+ const p=netPlayers.get(conn.peer);
+ if(!p||p.alive===false||msg.generation!==mapGeneration||!Number.isSafeInteger(msg.seq)||msg.seq<0||msg.seq<=(p.moveSeq??-1))return false;
+ p.moveSeq=msg.seq;
+ const nx=msg.x,nz=msg.z,feet=msg.feetY,now=performance.now();
+ const crouch=Math.max(0,Math.min(1,Number(msg.crouch)||0)),height=PLAYER_CAPSULE_HEIGHT+(PLAYER_CROUCH_CAPSULE_HEIGHT-PLAYER_CAPSULE_HEIGHT)*crouch;
+ // Allow a bounded burst after a stalled tab/network, without the old fixed
+ // distance limit permanently rejecting every later position.
+ const elapsed=Math.min(.8,Math.max(.05,(now-(p.moveAt||now-100))/1000)),limit=Math.max(1.2,elapsed*9+.6);
+ let valid=[nx,nz,feet,msg.yaw,msg.pitch].every(Number.isFinite)&&Math.abs(msg.pitch)<=1.5&&
+  Math.hypot(nx-p.x,nz-p.z)<=limit&&feet>=outsideGroundY()-.25&&feet<=activePillarTop()+3&&netPositionClear(nx,feet,nz,height);
+ if(valid&&Math.abs(feet-networkPlayerFeetY(p))<.16){
+  // A swept body prevents a packet from hopping through a thin wall.
+  const hit=physicsWorld.castShape({x:p.x,y:networkPlayerFeetY(p)+height/2+.18,z:p.z},PHYSICS_ROT,
+   {x:nx-p.x,y:feet-networkPlayerFeetY(p),z:nz-p.z},playerShape(height),.001,1,false,
+   undefined,undefined,undefined,undefined,staticGeometry);
+  if(hit&&hit.time_of_impact<.995)valid=false;
+ }
+ if(!valid){sendConn(conn,{type:'positionCorrection',generation:mapGeneration,seq:msg.seq,x:p.x,z:p.z,feetY:networkPlayerFeetY(p),crouch:p.crouch||0});return false;}
+ p.x=nx;p.z=nz;p.feetY=feet;p.crouch=crouch;p.yaw=msg.yaw;p.pitch=msg.pitch;p.jumpOffset=Math.max(0,Math.min(5,Number(msg.jumpOffset)||0));p.moveAt=now;
+ netRecordPose(p);return true;
+}
+function netApplyCorrection(msg){
+ if(msg.generation!==mapGeneration||!Number.isSafeInteger(msg.seq)||msg.seq<=netCorrectionSeq||![msg.x,msg.z,msg.feetY].every(Number.isFinite))return;
+ netCorrectionSeq=msg.seq;px=msg.x;pz=msg.z;playerCrouchAmount=Math.max(0,Math.min(1,msg.crouch||0));resetPlayerPhysics(msg.feetY);
+ const p=netPlayers.get(localPeerId);if(p){p.x=px;p.z=pz;p.feetY=playerFeetY;p.crouch=playerCrouchAmount;}
+ networkSendTimer=0;
+}
+
+// Destructible panes: stable generation-local IDs, independent render/collision state.
+const breakableGlass=[],glassByHandle=new Map(),glassBroken=new Set(),glassPredicted=new Map();
+const glassShards=[];
+let glassRevision=0,glassMeshDirty=false,glassNavDirty=false;
+function glassReset(){
+ breakableGlass.length=0;glassByHandle.clear();glassBroken.clear();glassPredicted.clear();glassShards.length=0;
+ glassRevision=0;glassMeshDirty=false;glassNavDirty=false;netResetMotion();
+}
+function glassRegister(points){
+ const lo=[0,1,2].map(k=>Math.min(...points.map(p=>p[k]))),hi=[0,1,2].map(k=>Math.max(...points.map(p=>p[k])));
+ const pane={id:breakableGlass.length,points:points.map(p=>p.slice()),lo,hi,center:lo.map((v,k)=>(v+hi[k])/2),size:lo.map((v,k)=>Math.max(.012,hi[k]-v)),collider:null,broken:false};
+ breakableGlass.push(pane);glassMakeCollider(pane);return pane;
+}
+function glassMakeCollider(pane){
+ pane.collider=physicsAddBox(...pane.center,...pane.size);glassByHandle.set(pane.collider.handle,pane);
+ if(!physicsCapture)physicsStaticHandles.add(pane.collider.handle);
+}
+function glassSetBroken(pane,broken,effects=false,impact=null){
+ if(!pane||pane.broken===broken)return false;
+ pane.broken=broken;
+ if(broken){
+  if(pane.collider){const h=pane.collider.handle;glassByHandle.delete(h);physicsStaticHandles.delete(h);physicsWorld.removeCollider(pane.collider,false);pane.collider=null;}
+  if(effects)glassEffects(pane,impact);
+ }else glassMakeCollider(pane);
+ glassMeshDirty=true;glassNavDirty=true;return true;
+}
+function glassFlush(){
+ if(glassMeshDirty){
+  glassVerts.length=0;for(const pane of breakableGlass)if(!pane.broken)physicsRenderGlass(...pane.points);
+  glassVertexCount=glassVerts.length/3;gl.bindBuffer(gl.ARRAY_BUFFER,glassBuffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(glassVerts),gl.DYNAMIC_DRAW);glassMeshDirty=false;
+ }
+ if(glassNavDirty){
+  // Keep the existing controller/probe, but invalidate graph and pending plans.
+  nav3Columns.clear();nav3Edges.clear();nav3WalkCache.clear();nav3Portals.clear();nav3PortalList=[];nav3Ready=false;nav3Pending.clear();glassNavDirty=false;
+ }
+ const now=performance.now();
+ for(const [id,at] of glassPredicted)if(now-at>1800){glassPredicted.delete(id);if(!glassBroken.has(id))glassSetBroken(breakableGlass[id],false);}
+}
+function glassSnapshot(){return {revision:glassRevision,broken:[...glassBroken]};}
+function glassApplySnapshot(data){
+ if(!data||!Array.isArray(data.broken)||!Number.isSafeInteger(data.revision)||data.revision<glassRevision)return;
+ glassRevision=data.revision;
+ for(const id of data.broken)if(Number.isInteger(id)&&breakableGlass[id]){
+  glassBroken.add(id);glassPredicted.delete(id);glassSetBroken(breakableGlass[id],true,false);
+ }
+}
+function glassBreakAuthority(id,impact=null){
+ if(multiplayer&&!isHost)return false;
+ const pane=breakableGlass[id];if(!pane||glassBroken.has(id))return false;
+ glassBroken.add(id);glassRevision++;glassSetBroken(pane,true,true,impact);
+ if(multiplayer)broadcastHost({type:'glassBreak',generation:mapGeneration,id,revision:glassRevision,impact});
+ return true;
+}
+function glassBreakEvent(msg){
+ if(msg.generation!==mapGeneration||!Number.isInteger(msg.id)||!breakableGlass[msg.id])return;
+ const pane=breakableGlass[msg.id];glassBroken.add(msg.id);glassPredicted.delete(msg.id);
+ glassRevision=Math.max(glassRevision,Number(msg.revision)||0);glassSetBroken(pane,true,true,msg.impact);
+}
+function glassTouches(pane,p,height,pad=.065){
+ if(!pane||!p||![p.x,p.y,p.z,height].every(Number.isFinite))return false;
+ // Exact capsule segment to the pane's axis-aligned box distance.
+ const dx=Math.max(0,pane.lo[0]-p.x,p.x-pane.hi[0]),dz=Math.max(0,pane.lo[2]-p.z,p.z-pane.hi[2]);
+ if(dx>PLAYER_RADIUS+pad||dz>PLAYER_RADIUS+pad)return false;
+ const dy=Math.max(0,pane.lo[1]-(p.y+height-PLAYER_RADIUS),p.y+PLAYER_RADIUS-pane.hi[1]);
+ return dx*dx+dy*dy+dz*dz<=(PLAYER_RADIUS+pad)**2;
+}
+function glassTouchRequest(id,contact){
+ const pane=breakableGlass[id];if(!pane||pane.broken)return false;
+ if(!multiplayer||isHost)return glassBreakAuthority(id,contact);
+ const msg={type:'glassTouch',generation:mapGeneration,id,contact,height:localPlayerCapsuleHeight()};
+ glassPredicted.set(id,performance.now());glassSetBroken(pane,true,true,contact);sendConn(hostConn,msg);return true;
+}
+function glassHandleTouch(conn,msg){
+ const p=netPlayers.get(conn.peer),pane=breakableGlass[msg.id],c=msg.contact;
+ if(!p||p.alive===false||msg.generation!==mapGeneration||!Number.isInteger(msg.id)||!pane||!c)return;
+ const height=PLAYER_CAPSULE_HEIGHT+(PLAYER_CROUCH_CAPSULE_HEIGHT-PLAYER_CAPSULE_HEIGHT)*(p.crouch||0);
+ if(![c.x,c.y,c.z].every(Number.isFinite)||Math.hypot(c.x-p.x,c.z-p.z)>2.25||Math.abs(c.y-networkPlayerFeetY(p))>1.6||!glassTouches(pane,c,height)){
+  sendConn(conn,{type:'glassReject',generation:mapGeneration,id:msg.id});return;
+ }
+ glassBreakAuthority(msg.id,c);
+ if(glassBroken.has(msg.id))sendConn(conn,{type:'glassBreak',generation:mapGeneration,id:msg.id,revision:glassRevision,impact:c});
+}
+function glassPlayerContacts(){
+ // Test resting contact as well as movement collisions; jumping/falling counts.
+ const p={x:px,y:playerFeetY,z:pz},height=localPlayerCapsuleHeight();let changed=false;
+ for(const pane of breakableGlass)if(!pane.broken&&glassTouches(pane,p,height,.02))changed=glassTouchRequest(pane.id,p)||changed;
+ for(let i=0;i<playerController.numComputedCollisions();i++){
+  const hit=playerController.computedCollision(i),pane=hit&&hit.collider&&glassByHandle.get(hit.collider.handle);
+  if(pane){const t=hit.translationDeltaApplied,c={x:px+t.x,y:playerFeetY+t.y,z:pz+t.z};changed=glassTouchRequest(pane.id,c)||changed;}
+ }
+ return changed;
+}
+function glassSound(center){
+ try{
+  const C=window.AudioContext||window.webkitAudioContext;if(!C)return;
+  const ctx=gunSound.ctx||(gunSound.ctx=new C());if(ctx.state==='suspended')ctx.resume();
+  const dist=Math.hypot(center[0]-px,center[1]-playerFeetY,center[2]-pz),volume=.32/(1+dist*.16);if(volume<.009)return;
+  const out=ctx.createGain();out.gain.value=volume;
+  if(ctx.createStereoPanner){const pan=ctx.createStereoPanner();pan.pan.value=Math.max(-1,Math.min(1,((center[0]-px)*Math.cos(yaw)+(center[2]-pz)*Math.sin(yaw))/Math.max(2,dist)));out.connect(pan);pan.connect(ctx.destination);}else out.connect(ctx.destination);
+  const buffer=ctx.createBuffer(1,Math.floor(ctx.sampleRate*.65),ctx.sampleRate),a=buffer.getChannelData(0);
+  for(let i=0;i<a.length;i++){const t=i/ctx.sampleRate;a[i]=(Math.random()*2-1)*Math.exp(-t*8)*(t<.025?1:.25+Math.max(0,Math.sin(t*180))*.55);}
+  const src=ctx.createBufferSource(),filter=ctx.createBiquadFilter();filter.type='highpass';filter.frequency.value=1800;src.buffer=buffer;src.connect(filter);filter.connect(out);src.start();
+  for(let i=0;i<6;i++){const osc=ctx.createOscillator(),gain=ctx.createGain(),at=ctx.currentTime+.006*i;osc.type='sine';osc.frequency.value=1800+Math.random()*6500;gain.gain.setValueAtTime(.15,at);gain.gain.exponentialRampToValueAtTime(.001,at+.15+Math.random()*.35);osc.connect(gain);gain.connect(out);osc.start(at);osc.stop(at+.55);}
+ }catch(_){}
+}
+function glassEffects(pane,impact){
+ glassSound(pane.center);const now=gunNow(),a=pane.points[0],u=pane.points[1].map((v,k)=>v-a[k]),v=pane.points[3].map((v,k)=>v-a[k]);
+ const count=Math.min(54,Math.max(18,Math.ceil(Math.hypot(...u)*Math.hypot(...v)*5)));
+ for(let i=0;i<count;i++){
+  const s=Math.random(),t=Math.random(),p=a.map((x,k)=>x+u[k]*s+v[k]*t),sz=.045+Math.random()*.16;
+  glassShards.push({p,vel:[(Math.random()-.5)*3,1+Math.random()*2.5,(Math.random()-.5)*3],at:now,life:1.05+Math.random()*.55,sz,spin:Math.random()*6.28});
+ }
+ if(glassShards.length>384)glassShards.splice(0,glassShards.length-384);
+}
+function glassShardMesh(out){
+ const now=gunNow();for(let i=glassShards.length-1;i>=0;i--){const s=glassShards[i],t=now-s.at;if(t>s.life){glassShards.splice(i,1);continue;}
+  const p=s.p.map((v,k)=>v+s.vel[k]*t-(k===1?5.5*t*t:0)),r=s.sz*Math.min(1,(s.life-t)*5),q=s.spin+t*9;
+  const u=[Math.cos(q)*r,Math.sin(q)*r,0],v=[-Math.sin(q)*r*.6,Math.cos(q)*r*.6,Math.sin(q*.7)*r];
+  const ps=[p.map((x,k)=>x-u[k]),p.map((x,k)=>x+u[k]),p.map((x,k)=>x+v[k])],n=[u[1]*v[2],-u[0]*v[2],u[0]*v[1]-u[1]*v[0]],l=Math.hypot(...n)||1;
+  for(const sign of [1,-1])for(const k of sign===1?[0,1,2]:[2,1,0])out.push(...ps[k],...n.map(x=>x/l*sign),.55,.82,.88);
+ }
+}
 
 document.body.classList.add('menu-open');
 showMainMenu();
