@@ -61,6 +61,8 @@ body.menu-open #hud,body.menu-open #tip,body.menu-open #dot,body.menu-open #uavS
 #spectatorHud{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:31;display:none;min-width:330px;max-width:calc(100vw - 36px);padding:8px 12px;background:#071018df;border:1px solid #8cd8ff99;color:#fff;font:700 12px/1.35 Consolas,monospace;text-align:center;text-shadow:0 1px 2px #000;pointer-events:none;box-shadow:0 5px 20px #0008}
 #spectatorHud b{color:#8cddff}
 body.map-open #spectatorHud,body.menu-open #spectatorHud{display:none!important}
+
+#gunHud{position:fixed;bottom:18px;left:24px;width:220px;z-index:35;pointer-events:none;color:#f1f7f5;font:700 17px monospace;text-shadow:0 2px 4px #000;display:none}#gunHealthTrack{height:11px;background:#101917d9;border:1px solid #81a69966;margin:7px 0 10px;border-radius:4px;overflow:hidden}#gunHealthFill{height:100%;width:100%;background:#51e0ad;transition:width .12s}#gunAmmo{font-size:23px}.gunHint{font-size:10px;letter-spacing:1px;margin-top:5px;color:#bbc8c3}#gunCross{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:34;color:white;pointer-events:none;font:22px monospace;text-shadow:0 1px 3px #000;display:none}
 </style>
 </head>
 <body>
@@ -7055,6 +7057,7 @@ function broadcastHost(msg,exceptPeerId=null){
 }
 function serializePlayer(p){
   return {
+    gun:gunPack(p),
     id:p.id,entityId:p.entityId,name:p.name,slot:p.slot,colorIndex:p.colorIndex,
     x:p.x,z:p.z,yaw:p.yaw,feetY:networkPlayerFeetY(p),
     crouch:Number.isFinite(p.crouch)?p.crouch:0,
@@ -7099,6 +7102,7 @@ function applyPlayerSnapshot(list,preserveSelf=true){
       p.deathT=Number.isFinite(d.deathT)?d.deathT:(p.alive?0:1);
     }
   }
+  for(const d of list||[]){const p=netPlayers.get(String(d.id));if(p)gunRead(p,d.gun);}
   if(!isHost)for(const id of [...netPlayers.keys()])if(!incoming.has(id))netPlayers.delete(id);
   const me=netPlayers.get(localPeerId);if(me)localUavEntityId=me.entityId;
   updateNetworkInfo();rebuildNetPlayerMesh();syncPlayerNameElements();
@@ -7501,6 +7505,7 @@ function setAllPlayersForNewRound(){
     const s=spawnPointForSlot(p.slot);
     p.x=s.x;p.z=s.z;p.yaw=0;
     p.crouch=0;p.jumpOffset=0;p.feetY=FLOOR_TOP+PHYSICS_SKIN;
+    p.gun={hp:100,ammo:GUN_MAG,reloadEnd:0,nextShot:0,lastSeq:0};
     p.alive=true;p.deathT=0;p.deathYaw=0;p.deathX=undefined;p.deathZ=undefined;
   }
   const me=netPlayers.get(localPeerId);
@@ -7519,6 +7524,7 @@ function hostAllPlayersDead(){if(!isHost||!netPlayers.size)return false;for(cons
 function hostKillNetworkPlayer(peerId,killerId){
   if(!isHost)return;
   const p=netPlayers.get(peerId);if(!p||p.alive===false)return;
+  gunState(p).hp=0;
   p.alive=false;p.deathYaw=p.yaw||0;p.deathX=p.x;p.deathZ=p.z;p.deathT=0;
   addDeathMarker({peerId:p.id,x:p.x,z:p.z,yaw:p.yaw,name:p.name});addDeathFeed(p.name,killerId);
   if(peerId===localPeerId)beginPlayerDeath(killerId);
@@ -7688,6 +7694,7 @@ function handleHostMessage(conn,msg){
   }
 
   const p=netPlayers.get(peerId);
+  if(msg.type==='gunFire'||msg.type==='gunReload'){gunAuthority(peerId,msg);return;}
   if(msg.type==='playerState'&&p&&p.alive!==false){
     const nx=Number(msg.x),nz=Number(msg.z),nyaw=Number(msg.yaw);
 
@@ -7703,6 +7710,7 @@ function handleHostMessage(conn,msg){
     }
 
     if(Number.isFinite(nyaw))p.yaw=nyaw;
+    if(Number.isFinite(msg.pitch))p.pitch=Math.max(-1.5,Math.min(1.5,msg.pitch));
 
     p.crouch=Math.max(0,Math.min(1,Number(msg.crouch)||0));
     p.jumpOffset=Math.max(0,Number(msg.jumpOffset)||0);
@@ -7779,6 +7787,8 @@ function handleClientMessage(msg){
   if(!msg||typeof msg!=='object')return;
 
   try{
+    if(msg.type==='gunShot'){gunEvent(msg);return;}
+    if(msg.type==='gunReloaded'){if(msg.generation===mapGeneration){const p=netPlayers.get(msg.shooter);if(p)gunState(p).reloadEnd=gunNow()+GUN_RELOAD;}return;}
     if(msg.type==='heartbeatPing'){
       sendConn(hostConn,{type:'heartbeatPong',sentAt:msg.sentAt});
       return;
@@ -8057,7 +8067,7 @@ function updateMultiplayerFrame(dt){
   const me=netPlayers.get(localPeerId);
   if(me){
     if(me.alive!==false){
-      me.x=px;me.z=pz;me.yaw=yaw;me.feetY=playerFeetY;
+      me.x=px;me.z=pz;me.yaw=yaw;me.pitch=pitch;me.feetY=playerFeetY;
       me.crouch=playerCrouchAmount;
       me.jumpOffset=playerVerticalOffset;
     }
@@ -8086,7 +8096,7 @@ function updateMultiplayerFrame(dt){
   }else{
     networkSendTimer-=dt;if(networkSendTimer<=0){networkSendTimer=.05;const self=netPlayers.get(localPeerId);if(self&&self.alive!==false)sendConn(hostConn,{
       type:'playerState',
-      x:px,z:pz,yaw,feetY:playerFeetY,
+      x:px,z:pz,yaw,pitch,feetY:playerFeetY,
       crouch:playerCrouchAmount,
       jumpOffset:playerVerticalOffset
     });}
@@ -13515,6 +13525,7 @@ function updateDeathState(dt){
   }
 }
 function resetDeathForNewMap(){
+  gunReset();
   const wasDead=playerDead;
   playerDead=false;
   uavKillFlashTimer=0;
@@ -14100,6 +14111,8 @@ function renderWorldWithCamera(mapCamera,mapVisual){
   // UAVs are real dynamic 3D world objects and remain visible in both views.
   renderUavs();
 
+  renderGuns(mapCamera);
+
   // Glass exists in first-person only. It is 0% visible in SAT/MAP.
   if(glassVertexCount && !mapCamera){
     gl.useProgram(glassProg);
@@ -14169,6 +14182,7 @@ function frame(now){
   updatePlayerPhysics(dt);
   updateLavaHazard();
   if(!playerDead&&playerFeetY<outsideGroundY()-12)beginPlayerDeath("FALL");
+  gunUpdate();
   updateMultiplayerFrame(dt);
   updateUavs(dt);
   updateUavKillFlash(dt);
@@ -14571,6 +14585,161 @@ joinCodeInput.addEventListener('keydown',e=>{
   if(e.key==='Enter')menuConfirmBtn.click();
 });
 joinCodeInput.addEventListener('keyup',stopMenuKeyFromReachingGame);
+
+// Shared world-space sidearm, host-authoritative combat.
+const GUN_DAMAGE=25,GUN_MAG=17,GUN_RELOAD=1.65,GUN_INTERVAL=.18,GUN_RANGE=90;
+const gunBuffer=gl.createBuffer(),gunTraces=[],gunFlashes=new Map();
+let gunLocal={hp:100,ammo:GUN_MAG,reloadEnd:0,nextShot:0,lastSeq:0},gunSeq=0,gunReloadVisual=0,gunHitUntil=0;
+const gunNow=()=>performance.now()/1000;
+const gunHud=document.createElement('div');gunHud.id='gunHud';
+gunHud.innerHTML='<div id="gunHealthText">100 / 100 HP</div><div id="gunHealthTrack"><div id="gunHealthFill"></div></div><div id="gunAmmo">17 / 17</div><div class="gunHint">LMB FIRE · R RELOAD</div>';
+document.body.appendChild(gunHud);
+const gunCross=document.createElement('div');gunCross.id='gunCross';gunCross.textContent='+';document.body.appendChild(gunCross);
+function gunState(p){if(!p.gun)p.gun={hp:p.alive===false?0:100,ammo:GUN_MAG,reloadEnd:0,nextShot:0,lastSeq:0};return p.gun;}
+function gunFinishReload(s){if(s.reloadEnd&&gunNow()>=s.reloadEnd){s.ammo=GUN_MAG;s.reloadEnd=0;}}
+function gunSelf(){return multiplayer?(netPlayers.get(localPeerId)?gunState(netPlayers.get(localPeerId)):gunLocal):gunLocal;}
+function gunReset(){gunLocal={hp:100,ammo:GUN_MAG,reloadEnd:0,nextShot:0,lastSeq:0};gunTraces.length=0;gunFlashes.clear();gunReloadVisual=0;gunSeq=0;}
+function gunPack(p){const s=gunState(p);gunFinishReload(s);return {hp:s.hp,ammo:s.ammo,reloadLeft:Math.max(0,s.reloadEnd-gunNow()),lastSeq:s.lastSeq,pitch:p.pitch||0};}
+function gunRead(p,d){if(!d)return;const s=gunState(p);s.hp=Math.max(0,Math.min(100,Number(d.hp)||0));s.ammo=Math.max(0,Math.min(GUN_MAG,Number(d.ammo)||0));s.reloadEnd=d.reloadLeft>0?gunNow()+Math.min(GUN_RELOAD,d.reloadLeft):0;s.lastSeq=d.lastSeq||0;p.pitch=Math.max(-1.5,Math.min(1.5,Number(d.pitch)||0));}
+function gunEye(p){const c=Math.max(0,Math.min(1,p.crouch||0));return {x:p.x,y:networkPlayerFeetY(p)+PLAYER_EYE+(PLAYER_CROUCH_EYE-PLAYER_EYE)*c,z:p.z};}
+function gunDirection(y,p){return {x:Math.sin(y)*Math.cos(p),y:Math.sin(p),z:-Math.cos(y)*Math.cos(p)};}
+function gunCapsuleHit(o,d,p){
+ const h=PLAYER_CAPSULE_HEIGHT+(PLAYER_CROUCH_CAPSULE_HEIGHT-PLAYER_CAPSULE_HEIGHT)*(p.crouch||0),r=PLAYER_RADIUS;
+ const bottom=networkPlayerFeetY(p)+r,top=networkPlayerFeetY(p)+h-r;
+ const ox=o.x-p.x,oz=o.z-p.z;let nearest=Infinity;
+ const A=d.x*d.x+d.z*d.z,B=2*(ox*d.x+oz*d.z),C=ox*ox+oz*oz-r*r;
+ if(A>1e-10){const disc=B*B-4*A*C;if(disc>=0)for(const t of [(-B-Math.sqrt(disc))/(2*A),(-B+Math.sqrt(disc))/(2*A)]){
+  const y=o.y+t*d.y;if(t>=0&&y>=bottom&&y<=top)nearest=Math.min(nearest,t);
+ }}
+ for(const y of [bottom,top]){const oy=o.y-y,b=ox*d.x+oy*d.y+oz*d.z,c=ox*ox+oy*oy+oz*oz-r*r,disc=b*b-c;
+  if(disc>=0){const t=-b-Math.sqrt(disc);if(t>=0)nearest=Math.min(nearest,t);}}
+ return nearest;
+}
+function gunRay(o,d,shooter){
+ const wall=physicsWorld.castRay(new RAPIER.Ray(o,d),GUN_RANGE,true,undefined,undefined,undefined,undefined,staticGeometry);
+ let distance=wall?wall.timeOfImpact:GUN_RANGE,target=null;
+ for(const p of netPlayers.values())if(p.id!==shooter&&p.alive!==false){const t=gunCapsuleHit(o,d,p);if(t<distance){distance=t;target=p;}}
+ return {target,distance,end:{x:o.x+d.x*distance,y:o.y+d.y*distance,z:o.z+d.z*distance}};
+}
+function gunSound(remote=false){
+ try{const C=window.AudioContext||window.webkitAudioContext;if(!C)return;const ctx=gunSound.ctx||(gunSound.ctx=new C());if(ctx.state==='suspended')ctx.resume();
+  const n=ctx.createBuffer(1,ctx.sampleRate*.09,ctx.sampleRate),a=n.getChannelData(0);for(let i=0;i<a.length;i++)a[i]=(Math.random()*2-1)*Math.exp(-i/(a.length*.17));
+  const src=ctx.createBufferSource(),gain=ctx.createGain();src.buffer=n;gain.gain.value=remote?.08:.23;src.connect(gain);gain.connect(ctx.destination);src.start();
+ }catch(_){}
+}
+function gunEvent(e){
+ if(e.generation!==mapGeneration)return;
+ gunTraces.push({...e,at:gunNow()});if(gunTraces.length>80)gunTraces.shift();
+ if(e.shooter!==localPeerId){gunFlashes.set(e.shooter,gunNow());gunSound(true);}
+ if(e.shooter===localPeerId&&e.hit)gunHitUntil=gunNow()+.16;
+}
+function gunAuthority(id,msg){
+ if(multiplayer&&!isHost)return false;
+ const p=multiplayer?netPlayers.get(id):{id:'single',x:px,z:pz,feetY:playerFeetY,crouch:playerCrouchAmount,alive:!playerDead,gun:gunLocal};
+ if(!p||p.alive===false||msg.generation!==mapGeneration)return false;
+ const s=gunState(p);gunFinishReload(s);
+ if(msg.type==='gunReload'){
+  if(!s.reloadEnd&&s.ammo<GUN_MAG){s.reloadEnd=gunNow()+GUN_RELOAD;const e={type:'gunReloaded',generation:mapGeneration,shooter:id};if(multiplayer)broadcastHost(e);if(id===localPeerId)gunReloadVisual=gunNow();}
+  return true;
+ }
+ if(!Number.isSafeInteger(msg.seq)||msg.seq<=s.lastSeq||!Number.isFinite(msg.yaw)||!Number.isFinite(msg.pitch)||Math.abs(msg.pitch)>1.5)return false;
+ s.lastSeq=msg.seq;
+ if(s.reloadEnd||s.ammo<=0||gunNow()+.004<s.nextShot)return false;
+ s.ammo--;s.nextShot=gunNow()+GUN_INTERVAL;p.yaw=msg.yaw;p.pitch=msg.pitch;
+ const o=gunEye(p),d=gunDirection(p.yaw,p.pitch),hit=gunRay(o,d,id);
+ // Also require a clear muzzle path, so aiming around an edge cannot shoot
+ // through the wall that the visible held gun is touching.
+ const muzzle=gunPose(p,false).point(0,.025,-.19);
+ const muzzlePoint={x:muzzle[0],y:muzzle[1],z:muzzle[2]};
+ const obstruct=(a,b)=>{const delta={x:b.x-a.x,y:b.y-a.y,z:b.z-a.z};return physicsWorld.castRay(new RAPIER.Ray(a,delta),.999,true,undefined,undefined,undefined,undefined,staticGeometry);};
+ const mountBlock=obstruct(o,muzzlePoint),flightBlock=obstruct(muzzlePoint,hit.end);
+ if(mountBlock||flightBlock){
+  const a=mountBlock?o:muzzlePoint,b=mountBlock?muzzlePoint:hit.end,t=(mountBlock||flightBlock).timeOfImpact;
+  hit.target=null;hit.end={x:a.x+(b.x-a.x)*t,y:a.y+(b.y-a.y)*t,z:a.z+(b.z-a.z)*t};
+ }
+ if(hit.target){const victim=gunState(hit.target);victim.hp=Math.max(0,victim.hp-GUN_DAMAGE);if(!victim.hp)hostKillNetworkPlayer(hit.target.id,p.name||'GLOCK');}
+ const e={type:'gunShot',generation:mapGeneration,shooter:id,seq:msg.seq,from:{x:muzzle[0],y:muzzle[1],z:muzzle[2]},end:hit.end,hit:!!hit.target};
+ gunEvent(e);if(multiplayer){broadcastHost(e);hostBroadcastWorld();}return true;
+}
+function gunFire(){
+ if(!gameStarted||playerDead||mapOpen||spectatorActive||!locked||isMenuOrTextInputActive())return;
+ const s=gunSelf();gunFinishReload(s);if(s.reloadEnd||s.ammo<=0||gunNow()<s.localNext)return;
+ s.localNext=gunNow()+GUN_INTERVAL;
+ const msg={type:'gunFire',generation:mapGeneration,seq:++gunSeq,yaw,pitch};
+ if(multiplayer&&!isHost)sendConn(hostConn,msg);else if(!gunAuthority(localPeerId,msg))return;
+ gunFlashes.set(localPeerId,gunNow());gunSound();
+}
+function gunReload(){
+ if(!gameStarted||playerDead||mapOpen||spectatorActive||isMenuOrTextInputActive())return;
+ const s=gunSelf();if(s.reloadEnd||s.ammo===GUN_MAG)return;
+ const msg={type:'gunReload',generation:mapGeneration};
+ if(multiplayer&&!isHost){s.reloadEnd=gunNow()+GUN_RELOAD;sendConn(hostConn,msg);}else gunAuthority(localPeerId,msg);
+ gunReloadVisual=gunNow();
+}
+function gunUpdate(){
+ if(isHost)for(const p of netPlayers.values())gunFinishReload(gunState(p));
+ const s=gunSelf();if(!multiplayer)gunFinishReload(s);if(playerDead)s.hp=0;
+ const show=gameStarted&&!isMenuOrTextInputActive();gunHud.style.display=show?'block':'none';gunCross.style.display=show&&!mapOpen&&!playerDead&&!spectatorActive?'block':'none';
+ document.getElementById('gunHealthText').textContent=Math.ceil(s.hp)+' / 100 HP';document.getElementById('gunHealthFill').style.width=s.hp+'%';
+ document.getElementById('gunHealthFill').style.background=s.hp<=25?'#ff4e43':'#51e0ad';
+ document.getElementById('gunAmmo').textContent=s.reloadEnd?'RELOADING…':s.ammo+' / '+GUN_MAG;
+ gunCross.style.color=gunNow()<gunHitUntil?'#ff7155':'#fff';
+}
+function gunPose(p,animate=true){
+ const t=gunNow(),shot=animate?Math.max(0,1-(t-(gunFlashes.get(p.id)||-99))/.14):0;
+ const s=gunState(p),reload=animate&&s.reloadEnd?Math.max(0,Math.min(1,1-(s.reloadEnd-t)/GUN_RELOAD)):0;
+ const dip=Math.sin(reload*Math.PI),y=p.yaw||0,pi=(p.pitch||0)+shot*.12+dip*.32;
+ const R=[Math.cos(y),0,Math.sin(y)],U=[-Math.sin(y)*Math.sin(pi),Math.cos(pi),Math.cos(y)*Math.sin(pi)],B=[-Math.sin(y)*Math.cos(pi),-Math.sin(pi),Math.cos(y)*Math.cos(pi)];
+ const eye=gunEye(p),aim=gunDirection(y,p.pitch||0),block=physicsWorld.castRay(new RAPIER.Ray(eye,aim),.9,true,undefined,undefined,undefined,undefined,staticGeometry);
+ const reach=block?Math.max(.12,Math.min(.46,block.timeOfImpact-.30)):.46;
+ const origin=[eye.x+R[0]*.17-U[0]*(.20-dip*.08)-B[0]*(reach-shot*.035),eye.y+R[1]*.17-U[1]*(.20-dip*.08)-B[1]*(reach-shot*.035),eye.z+R[2]*.17-U[2]*(.20-dip*.08)-B[2]*(reach-shot*.035)];
+ return {reload,shot,point:(x,y,z)=>origin.map((v,i)=>v+R[i]*x+U[i]*y+B[i]*z),normal:(x,y,z)=>R.map((v,i)=>v*x+U[i]*y+B[i]*z)};
+}
+function gunBox(out,pose,x,y,z,w,h,d,col){
+ const ps=[[-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],[-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1]].map(v=>pose.point(x+v[0]*w/2,y+v[1]*h/2,z+v[2]*d/2));
+ for(const [ids,n] of [[[0,3,2,1],[0,0,-1]],[[4,5,6,7],[0,0,1]],[[0,4,7,3],[-1,0,0]],[[1,2,6,5],[1,0,0]],[[3,7,6,2],[0,1,0]],[[0,1,5,4],[0,-1,0]]]){
+  const normal=pose.normal(...n);for(const k of [0,1,2,0,2,3])out.push(...ps[ids[k]],...normal,...col);
+ }
+}
+function gunModel(out,p){
+ const pose=gunPose(p),box=(x,y,z,w,h,d,c)=>gunBox(out,pose,x,y,z,w,h,d,c),metal=[.18,.20,.22],poly=[.065,.073,.082];
+ box(0,.035,-pose.shot*.024,.055,.055,.235,metal);box(0,-.002,0,.054,.024,.22,poly);
+ box(0,-.081,.07,.05,.15,.065,poly);box(0,.026,-.123,.026,.027,.018,[.025,.025,.027]);
+ box(0,.022,-.134,.014,.014,.003,[.005,.005,.006]);
+ box(0,.071,-.08,.009,.018,.016,[.04,.045,.05]);
+ box(-.019,.069,.09,.009,.014,.018,poly);box(.019,.069,.09,.009,.014,.018,poly);
+ for(const x of [-.019,.019])box(x,.075,.101,.005,.005,.003,[.9,.92,.88]);
+ for(let i=0;i<6;i++)box(.028,.032,.034+i*.01,.003,.037,.003,[.055,.061,.067]);
+ box(-.023,-.04,-.01,.008,.052,.064,poly);box(.023,-.04,-.01,.008,.052,.064,poly);box(0,-.065,-.01,.05,.008,.064,poly);
+ box(0,-.035,.0,.008,.038,.009,[.2,.21,.22]);
+ const magDrop=pose.reload?Math.sin(pose.reload*Math.PI)*.18:0;
+ box(0,-.16-magDrop,.073,.049,.035,.064,[.12,.13,.14]);
+ box(.01,-.07,.096,.076,.065,.07,[.13,.14,.15]);box(.019,-.12,.17,.072,.078,.17,[.42,.27,.18]);
+ box(-.038,-.063-magDrop*.5,.029,.046,.057,.096,[.115,.12,.13]);
+ if(pose.shot>.45){box(0,.025,-.19,.07*pose.shot,.07*pose.shot,.12,[1,.65,.13]);box(0,.025,-.23,.025,.025,.15,[1,.94,.57]);}
+}
+function renderGuns(mapCamera){
+ const out=[];
+ if(multiplayer){for(const p of netPlayers.values())if(p.alive!==false){
+  const local=p.id===localPeerId;if(local&&!mapCamera&&(playerDead||spectatorActive))continue;
+  gunModel(out,local?{...p,x:px,z:pz,feetY:playerFeetY,yaw,pitch,crouch:playerCrouchAmount}:p);
+ }}else if(!playerDead&&!spectatorActive)gunModel(out,{id:localPeerId,x:px,z:pz,feetY:playerFeetY,yaw,pitch,crouch:playerCrouchAmount,gun:gunLocal});
+ const now=gunNow();
+ for(let i=gunTraces.length-1;i>=0;i--){const e=gunTraces[i],age=now-e.at;if(age>.16){gunTraces.splice(i,1);continue;}
+  const a=e.from,b=e.end,dx=b.x-a.x,dy=b.y-a.y,dz=b.z-a.z,len=Math.hypot(dx,dy,dz)||1;
+  const center=Math.min(len,age*750),start=Math.max(0,center-4),end=Math.min(len,center+.4);
+  const B=[dx/len,dy/len,dz/len],R=Math.abs(B[1])>.95?[1,0,0]:[B[2],0,-B[0]],rl=Math.hypot(...R);for(let k=0;k<3;k++)R[k]/=rl;
+  const U=[B[1]*R[2]-B[2]*R[1],B[2]*R[0]-B[0]*R[2],B[0]*R[1]-B[1]*R[0]],c=[a.x+B[0]*(start+end)/2,a.y+B[1]*(start+end)/2,a.z+B[2]*(start+end)/2];
+  const pose={point:(x,y,z)=>c.map((v,k)=>v+R[k]*x+U[k]*y+B[k]*z),normal:(x,y,z)=>R.map((v,k)=>v*x+U[k]*y+B[k]*z)};
+  gunBox(out,pose,0,0,0,.012,.012,Math.max(.025,end-start),[1,.85,.35]);
+ }
+ if(!out.length)return;
+ gl.useProgram(uavProg);gl.uniformMatrix4fv(uavProjLoc,false,proj);gl.uniformMatrix4fv(uavViewLoc,false,view);
+ gl.bindBuffer(gl.ARRAY_BUFFER,gunBuffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(out),gl.DYNAMIC_DRAW);bindUavBuffer(gunBuffer);
+ gl.enable(gl.DEPTH_TEST);gl.depthMask(true);gl.enable(gl.CULL_FACE);gl.disable(gl.BLEND);gl.drawArrays(gl.TRIANGLES,0,out.length/9);
+}
+canvas.addEventListener('mousedown',e=>{if(e.button===0)gunFire();});
+addEventListener('keydown',e=>{if(e.code==='KeyR'&&!e.repeat){gunReload();}});
 
 document.body.classList.add('menu-open');
 showMainMenu();
