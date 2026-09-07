@@ -7095,7 +7095,7 @@ function broadcastHost(msg,exceptPeerId=null){
 }
 function serializePlayer(p){
   return {
-    gun:gunPack(p),
+    gun:gunPack(p),motion:netMotionPack(p),
     id:p.id,entityId:p.entityId,name:p.name,slot:p.slot,colorIndex:p.colorIndex,
     x:p.x,z:p.z,yaw:p.yaw,feetY:networkPlayerFeetY(p),
     crouch:Number.isFinite(p.crouch)?p.crouch:0,
@@ -7128,7 +7128,9 @@ function applyPlayerSnapshot(list,preserveSelf=true){
     else{
       const self=id===localPeerId;
       p.entityId=Number(d.entityId);p.name=safeName(d.name);p.slot=Number(d.slot)||0;p.colorIndex=Number(d.colorIndex)||0;p.color=playerColorForSlot(p.colorIndex);
-      if(!(preserveSelf&&self)){
+      const incomingMotion=d.motion&&d.motion.samples&&d.motion.samples.at(-1);
+      const freshMotion=!p.motionSamples?.length||(d.motion&&d.motion.epoch>(p.motionEpoch||0))||(incomingMotion&&incomingMotion[0]>(p.moveSeq??-1));
+      if(!(preserveSelf&&self)&&freshMotion){
         p.x=Number(d.x)||0;
         p.z=Number(d.z)||0;
         p.yaw=Number(d.yaw)||0;
@@ -7140,7 +7142,7 @@ function applyPlayerSnapshot(list,preserveSelf=true){
       p.deathT=Number.isFinite(d.deathT)?d.deathT:(p.alive?0:1);
     }
   }
-  for(const d of list||[]){const p=netPlayers.get(String(d.id));if(p){gunRead(p,d.gun);netRecordPose(p);}}
+  for(const d of list||[]){const p=netPlayers.get(String(d.id));if(p){gunRead(p,d.gun);if(p.id!==localPeerId)netReceivePose(p,d.motion);}}
   if(!isHost)for(const id of [...netPlayers.keys()])if(!incoming.has(id))netPlayers.delete(id);
   const me=netPlayers.get(localPeerId);if(me)localUavEntityId=me.entityId;
   updateNetworkInfo();rebuildNetPlayerMesh();syncPlayerNameElements();
@@ -7585,7 +7587,7 @@ function hostRemovePlayer(peerId){
 
   if(!netPlayers.has(peerId))return;
 
-  netPlayers.delete(peerId);
+  netPlayers.delete(peerId);netPoseHistory.delete(peerId);
   broadcastHost({type:'playerLeft',peerId});
   updateNetworkInfo();
   rebuildNetPlayerMesh();
@@ -7631,7 +7633,7 @@ function hostEnsurePlayerForConnection(conn,requestedName){
     color:playerColorForSlot(colorIndex),
     x:sp.x,z:sp.z,yaw:0,
     crouch:0,jumpOffset:0,
-    alive:true,deathT:0
+    alive:true,deathT:0,motionJoinAt:performance.now()
   };
 
   netPlayers.set(conn.peer,p);
@@ -7720,7 +7722,7 @@ function handleHostMessage(conn,msg){
 
   if(msg.type==='hello'){
     if(msg.protocol!==NET_PROTOCOL){sendConn(conn,{type:'versionMismatch'});return;}
-    conn.gridlockProtocol=NET_PROTOCOL;
+    conn.gridlockProtocol=NET_PROTOCOL;netInstallTransport(conn);
     hostEnsurePlayerForConnection(conn,msg.displayName);
     sendConn(conn,makeWelcomeCore(peerId));
     return;
@@ -7766,6 +7768,7 @@ function stopClientHandshakeRetry(){
 }
 function sendClientHello(){
   if(!hostConn||!hostConn.open)return;
+  netInstallTransport(hostConn);
   sendConn(hostConn,{type:'hello',protocol:NET_PROTOCOL,displayName});
 }
 function applyWelcomeCore(msg){
@@ -7816,6 +7819,7 @@ function handleClientMessage(msg){
   if(!msg||typeof msg!=='object')return;
 
   try{
+    if(msg.type==='motion'){netReceiveMotion(msg);return;}
     if(msg.type==='versionMismatch'){netVersionError();return;}
     if(msg.type==='glassBreak'){glassBreakEvent(msg);return;}
     if(msg.type==='glassReject'){if(msg.generation===mapGeneration&&!glassBroken.has(msg.id)){glassPredicted.delete(msg.id);glassSetBroken(breakableGlass[msg.id],false);}return;}
@@ -7928,7 +7932,7 @@ function handleClientMessage(msg){
     }
 
     if(msg.type==='playerLeft'){
-      netPlayers.delete(String(msg.peerId));
+      netPlayers.delete(String(msg.peerId));netPoseHistory.delete(String(msg.peerId));
       updateNetworkInfo();
       rebuildNetPlayerMesh();
       syncPlayerNameElements();
@@ -8129,10 +8133,9 @@ function updateMultiplayerFrame(dt){
       hostHeartbeatSweep();
     }
 
-    networkBroadcastTimer-=dt;if(networkBroadcastTimer<=0){networkBroadcastTimer=.05;hostBroadcastWorld();}
-  }else{
-    networkSendTimer-=dt;if(networkSendTimer<=0){networkSendTimer=1/30;const self=netPlayers.get(localPeerId);if(self&&self.alive!==false)sendConn(hostConn,netMakeState());}
+    networkBroadcastTimer-=dt;if(networkBroadcastTimer<=0){networkBroadcastTimer=.25;hostBroadcastWorld();}
   }
+  netMotionTick(dt);
 }
 
 // ---------- player / exact wall-piece collision ----------
@@ -8345,14 +8348,15 @@ function physicsSyncRemotePlayers(){
   if(multiplayer)for(const p of netPlayers.values()){
     if(p.id===localPeerId||p.alive===false)continue;
     alive.add(p.id);
-    const h=PLAYER_CAPSULE_HEIGHT+(PLAYER_CROUCH_CAPSULE_HEIGHT-PLAYER_CAPSULE_HEIGHT)*(p.crouch||0);
+    const visible=netRenderPlayer(p);
+    const h=PLAYER_CAPSULE_HEIGHT+(PLAYER_CROUCH_CAPSULE_HEIGHT-PLAYER_CAPSULE_HEIGHT)*(visible.crouch||0);
     let entry=physicsRemotePlayers.get(p.id);
     if(!entry){
       entry={collider:physicsWorld.createCollider(RAPIER.ColliderDesc.capsule(h/2-PLAYER_RADIUS,PLAYER_RADIUS)),height:h};
       physicsRemotePlayers.set(p.id,entry);
     }
     if(entry.height!==h){entry.collider.setShape(playerShape(h));entry.height=h;}
-    entry.collider.setTranslation({x:p.x,y:networkPlayerFeetY(p)+h/2,z:p.z});
+    entry.collider.setTranslation({x:visible.x,y:networkPlayerFeetY(visible)+h/2,z:visible.z});
   }
   for(const [id,entry] of physicsRemotePlayers)if(!alive.has(id)){
     physicsWorld.removeCollider(entry.collider,false);physicsRemotePlayers.delete(id);
@@ -14775,65 +14779,171 @@ function renderGuns(mapCamera){
 canvas.addEventListener('mousedown',e=>{if(e.button===0)gunFire();});
 addEventListener('keydown',e=>{if(e.code==='KeyR'&&!e.repeat){gunReload();}});
 
-const NET_PROTOCOL='gridlock-glass-7';
-function netVersionError(){
- stopClientHandshakeRetry();clientHandshakeComplete=false;
- try{if(hostConn)hostConn.close();}catch(_){}
- showMainMenu();showMenuStatus('Game versions differ. Everyone must open the same updated HTML file.');
+const NET_PROTOCOL='gridlock-wifi-8';
+function netVersionError(){stopClientHandshakeRetry();clientHandshakeComplete=false;try{if(hostConn)hostConn.close();}catch(_){}showMainMenu();showMenuStatus('Game versions differ. Everyone must open the same updated HTML file.');}
+let netMoveSeq=0,netWorldSeq=0,netLastWorldSeq=-1,netCorrectionSeq=-1,netLocalEpoch=0,netMotionTimer=0;
+const netPoseHistory=new Map(),netLocalSamples=[];
+const netRound=v=>Math.round(v*1000)/1000;
+const netClamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+function netResetMotion(){
+ netMoveSeq=0;netWorldSeq=0;netLastWorldSeq=-1;netCorrectionSeq=-1;netLocalEpoch=0;netMotionTimer=0;
+ netPoseHistory.clear();netLocalSamples.length=0;
+ for(const p of netPlayers.values()){p.moveSeq=-1;p.moveAt=0;p.motionStamp=undefined;p.motionEpoch=0;p.motionSamples=[];p.netCorrection=null;p.motionJoinAt=performance.now();}
 }
-// Authoritative gameplay state is separate from the smoothed display pose.
-let netMoveSeq=0,netWorldSeq=0,netLastWorldSeq=-1,netCorrectionSeq=-1;
-const netPoseHistory=new Map();
-function netResetMotion(){netMoveSeq=0;netWorldSeq=0;netLastWorldSeq=-1;netCorrectionSeq=-1;netPoseHistory.clear();for(const p of netPlayers.values()){p.moveSeq=-1;p.moveAt=0;}}
-function netRecordPose(p){
- if(p.id===localPeerId)return;
- const at=performance.now(),pose={x:p.x,z:p.z,feetY:networkPlayerFeetY(p),yaw:p.yaw||0,pitch:p.pitch||0,crouch:p.crouch||0,at};
- let h=netPoseHistory.get(p.id);if(!h){h=[];netPoseHistory.set(p.id,h);}
- const last=h[h.length-1];if(last&&Math.hypot(last.x-p.x,last.z-p.z,last.feetY-pose.feetY)>5)h.length=0;
- h.push(pose);if(h.length>10)h.shift();
+function netSample(p,seq,at){return [seq,netRound(at),netRound(p.x),netRound(networkPlayerFeetY(p)),netRound(p.z),netRound(p.yaw||0),netRound(p.pitch||0),netRound(p.crouch||0)];}
+function netValidSample(s){return Array.isArray(s)&&s.length===8&&s.every(Number.isFinite)&&Number.isSafeInteger(s[0])&&s[0]>=0&&s[1]>=0&&Math.abs(s[6])<=1.5&&s[7]>=0&&s[7]<=1;}
+function netUnpack(s){return {x:s[2],feetY:s[3],z:s[4],yaw:s[5],pitch:s[6],crouch:s[7]};}
+function netMotionPack(p){return {epoch:p.motionEpoch||0,samples:(p.motionSamples||[]).slice(-8)};}
+function netRecordPose(p,samples=p.motionSamples,now=performance.now()){
+ if(p.id===localPeerId||!samples||!samples.length)return;
+ const epoch=p.motionEpoch||0;let h=netPoseHistory.get(p.id);
+ if(!h||h.epoch!==epoch){h={epoch,samples:[],transit:[],delay:100,lastSeq:-1,lastFrame:now,playAt:null,visual:null};netPoseHistory.set(p.id,h);}
+ const newest=samples[samples.length-1];if(!netValidSample(newest)||newest[0]<=h.lastSeq)return;
+ // Source timestamps preserve the spacing of motion when Wi-Fi delivers a burst.
+ for(const s of samples)if(netValidSample(s)&&!h.samples.some(v=>v[0]===s[0]))h.samples.push(s.slice());
+ h.samples.sort((a,b)=>a[1]-b[1]||a[0]-b[0]);if(h.samples.length>90)h.samples.splice(0,h.samples.length-90);
+ h.lastSeq=newest[0];h.lastArrival=now;h.lastStamp=newest[1];
+ h.transit.push({at:now,value:now-newest[1]});h.transit=h.transit.filter(v=>now-v.at<3000);
+ const sorted=h.transit.map(v=>v.value).sort((a,b)=>a-b),base=sorted[0],spread=sorted[Math.floor((sorted.length-1)*.9)]-base;
+ h.offset=base;
+ const desired=netClamp(100+spread,100,420);
+ h.delay=desired>h.delay?desired:Math.max(desired,h.delay-4);
+ if(h.playAt===null)h.playAt=newest[1]-h.delay;
+}
+function netReceivePose(p,motion){
+ if(!motion||!Number.isSafeInteger(motion.epoch)||!Array.isArray(motion.samples)||motion.samples.length>24)return;
+ const samples=motion.samples.filter(netValidSample);if(!samples.length)return;
+ const last=samples[samples.length-1];
+ if(motion.epoch<(p.motionEpoch||0))return;
+ if(motion.epoch===(p.motionEpoch||0)&&last[0]<=(p.moveSeq??-1))return;
+ Object.assign(p,netUnpack(last));p.motionEpoch=motion.epoch;p.moveSeq=last[0];p.motionStamp=last[1];p.motionSamples=samples;
+ netRecordPose(p,samples);
 }
 function netRenderPlayer(p,now=performance.now()){
  if(p.id===localPeerId||p.alive===false)return p;
- const h=netPoseHistory.get(p.id);if(!h||!h.length)return p;
- const at=now-75;let a=h[0],b=a;
- for(let i=1;i<h.length;i++){b=h[i];if(b.at>=at)break;a=b;}
- // Bounded interpolation only: no extrapolation through doors or cover.
- const f=b.at>a.at?Math.max(0,Math.min(1,(at-a.at)/(b.at-a.at))):1;
- const out={...p};for(const k of ['x','z','feetY','pitch','crouch'])out[k]=a[k]+(b[k]-a[k])*f;
- out.yaw=a.yaw+Math.atan2(Math.sin(b.yaw-a.yaw),Math.cos(b.yaw-a.yaw))*f;return out;
+ const h=netPoseHistory.get(p.id);if(!h||!h.samples.length)return p;
+ if(h.visual&&now-h.lastFrame<1)return {...p,...h.visual};
+ const dt=netClamp(now-h.lastFrame,0,100);h.lastFrame=now;
+ const target=now-h.offset-h.delay,error=target-h.playAt;
+ // Build/drain the adaptive buffer by changing playback speed, never rewinding.
+ h.playAt+=dt*netClamp(1+error/500,.6,1.15);
+ const list=h.samples;let a=list[0],b=a;
+ for(let i=1;i<list.length;i++){b=list[i];if(b[1]>=h.playAt)break;a=b;}
+ const f=b[1]>a[1]?netClamp((h.playAt-a[1])/(b[1]-a[1]),0,1):1;
+ const result=netUnpack(a);
+ for(const [k,index] of [['x',2],['feetY',3],['z',4],['pitch',6],['crouch',7]])result[k]=a[index]+(b[index]-a[index])*f;
+ result.yaw=a[5]+Math.atan2(Math.sin(b[5]-a[5]),Math.cos(b[5]-a[5]))*f;
+ // Brief dead reckoning bridges isolated lost updates; stop safely after 80 ms.
+ const last=list[list.length-1],previous=list[list.length-2],extra=netClamp(h.playAt-last[1],0,80);
+ if(extra&&previous&&last[1]>previous[1]){
+  const seconds=(last[1]-previous[1])/1000,scale=extra/1000;
+  const vx=netClamp((last[2]-previous[2])/seconds,-8,8),vz=netClamp((last[4]-previous[4])/seconds,-8,8);
+  const x=last[2]+vx*scale,z=last[4]+vz*scale;
+  if(netPositionClear(x,last[3],z,PLAYER_CAPSULE_HEIGHT)) {result.x=x;result.z=z;}
+ }
+ if(h.visual&&dt){
+  // After an outage, converge over multiple frames instead of teleporting.
+  const dx=result.x-h.visual.x,dy=result.feetY-h.visual.feetY,dz=result.z-h.visual.z,d=Math.hypot(dx,dy,dz);
+  const cap=14*dt/1000;
+  if(d>cap){const t=cap/d;result.x=h.visual.x+dx*t;result.feetY=h.visual.feetY+dy*t;result.z=h.visual.z+dz*t;}
+ }
+ h.visual=result;return {...p,...result};
 }
-function netMakeState(){return {type:'playerState',generation:mapGeneration,seq:++netMoveSeq,x:px,z:pz,yaw,pitch,feetY:playerFeetY,crouch:playerCrouchAmount,jumpOffset:playerVerticalOffset};}
+function netMakeState(){
+ const at=performance.now(),p={x:px,z:pz,feetY:playerFeetY,yaw,pitch,crouch:playerCrouchAmount};
+ const s=netSample(p,++netMoveSeq,at);netLocalSamples.push(s);if(netLocalSamples.length>12)netLocalSamples.shift();
+ return {type:'playerState',generation:mapGeneration,epoch:netLocalEpoch,seq:s[0],stamp:s[1],...p,jumpOffset:playerVerticalOffset,history:netLocalSamples.map(s=>s.slice())};
+}
 function netPositionClear(x,y,z,height){
  const shape=playerShape(height),pos={x,y:y+height/2,z};let clear=true;
- physicsWorld.intersectionsWithShape(pos,PHYSICS_ROT,shape,c=>{const contact=c.contactShape(shape,pos,PHYSICS_ROT,0);if(contact&&contact.distance<-.001){clear=false;return false;}return true;},undefined,undefined,undefined,undefined,staticGeometry);return clear;
+ physicsWorld.intersectionsWithShape(pos,PHYSICS_ROT,shape,c=>{const contact=c.contactShape(shape,pos,PHYSICS_ROT,0);if(contact&&contact.distance<-.002){clear=false;return false;}return true;},undefined,undefined,undefined,undefined,staticGeometry);return clear;
+}
+function netCorrect(conn,p,seq,stamp){
+ p.motionEpoch=(p.motionEpoch||0)+1;p.motionSamples=[];p.moveSeq=seq;p.motionStamp=undefined;p.motionJoinAt=performance.now();
+ const msg={type:'positionCorrection',generation:mapGeneration,epoch:p.motionEpoch,seq,stamp,x:p.x,z:p.z,feetY:networkPlayerFeetY(p),crouch:p.crouch||0};
+ p.netCorrection=msg;p.correctionAt=performance.now();sendConn(conn,msg);
 }
 function netAcceptState(conn,msg){
- const p=netPlayers.get(conn.peer);
- if(!p||p.alive===false||msg.generation!==mapGeneration||!Number.isSafeInteger(msg.seq)||msg.seq<0||msg.seq<=(p.moveSeq??-1))return false;
- p.moveSeq=msg.seq;
- const nx=msg.x,nz=msg.z,feet=msg.feetY,now=performance.now();
- const crouch=Math.max(0,Math.min(1,Number(msg.crouch)||0)),height=PLAYER_CAPSULE_HEIGHT+(PLAYER_CROUCH_CAPSULE_HEIGHT-PLAYER_CAPSULE_HEIGHT)*crouch;
- // Allow a bounded burst after a stalled tab/network, without the old fixed
- // distance limit permanently rejecting every later position.
- const elapsed=Math.min(.8,Math.max(.05,(now-(p.moveAt||now-100))/1000)),limit=Math.max(1.2,elapsed*9+.6);
- let valid=[nx,nz,feet,msg.yaw,msg.pitch].every(Number.isFinite)&&Math.abs(msg.pitch)<=1.5&&
-  Math.hypot(nx-p.x,nz-p.z)<=limit&&feet>=outsideGroundY()-.25&&feet<=activePillarTop()+3&&netPositionClear(nx,feet,nz,height);
- if(valid&&Math.abs(feet-networkPlayerFeetY(p))<.16){
-  // A swept body prevents a packet from hopping through a thin wall.
-  const hit=physicsWorld.castShape({x:p.x,y:networkPlayerFeetY(p)+height/2+.18,z:p.z},PHYSICS_ROT,
-   {x:nx-p.x,y:feet-networkPlayerFeetY(p),z:nz-p.z},playerShape(height),.001,1,false,
-   undefined,undefined,undefined,undefined,staticGeometry);
-  if(hit&&hit.time_of_impact<.995)valid=false;
+ const p=netPlayers.get(conn.peer),now=performance.now();
+ if(!p||p.alive===false||msg.generation!==mapGeneration||!Number.isSafeInteger(msg.seq)||msg.seq<0||!Number.isFinite(msg.stamp))return false;
+ if(msg.epoch!==(p.motionEpoch||0)){
+  if(p.netCorrection&&now-p.correctionAt>500){sendConn(conn,p.netCorrection);p.correctionAt=now;}return false;
  }
- if(!valid){sendConn(conn,{type:'positionCorrection',generation:mapGeneration,seq:msg.seq,x:p.x,z:p.z,feetY:networkPlayerFeetY(p),crouch:p.crouch||0});return false;}
- p.x=nx;p.z=nz;p.feetY=feet;p.crouch=crouch;p.yaw=msg.yaw;p.pitch=msg.pitch;p.jumpOffset=Math.max(0,Math.min(5,Number(msg.jumpOffset)||0));p.moveAt=now;
- netRecordPose(p);return true;
+ if(msg.seq<=(p.moveSeq??-1))return false;
+ const root=[msg.seq,msg.stamp,msg.x,msg.feetY,msg.z,msg.yaw,msg.pitch,netClamp(Number(msg.crouch)||0,0,1)];
+ if(!netValidSample(root))return false;
+ const history=Array.isArray(msg.history)?msg.history.slice(-12):[];
+ const batch=history.filter(s=>netValidSample(s)&&s[0]>(p.moveSeq??-1)&&s[0]<msg.seq);batch.push(root);batch.sort((a,b)=>a[0]-b[0]);
+ for(const s of batch){
+  const prevStamp=p.motionStamp,seconds=prevStamp===undefined?Math.max(.15,(now-(p.motionJoinAt??now))/1000):(s[1]-prevStamp)/1000;
+  if(seconds<0||seconds>15){netCorrect(conn,p,msg.seq,msg.stamp);return false;}
+  const q=netUnpack(s),distance=Math.hypot(q.x-p.x,q.z-p.z),height=PLAYER_CAPSULE_HEIGHT+(PLAYER_CROUCH_CAPSULE_HEIGHT-PLAYER_CAPSULE_HEIGHT)*q.crouch;
+  let valid=distance<=Math.max(.35,seconds*9+.22)&&q.feetY>=outsideGroundY()-.25&&q.feetY<=activePillarTop()+3;
+  if(valid){
+   // Motion can overtake the reliable glass event. Infer real capsule contact
+   // from this validated movement segment before testing the resulting pose.
+   for(const pane of breakableGlass)if(!pane.broken&&glassTouches(pane,{x:q.x,y:q.feetY,z:q.z},height,.02))glassBreakAuthority(pane.id,{x:q.x,y:q.feetY,z:q.z});
+   valid=netPositionClear(q.x,q.feetY,q.z,height);
+  }
+  if(valid&&seconds<=.16&&Math.abs(q.feetY-networkPlayerFeetY(p))<.16){
+   const hit=physicsWorld.castShape({x:p.x,y:networkPlayerFeetY(p)+height/2+.10,z:p.z},PHYSICS_ROT,
+    {x:q.x-p.x,y:q.feetY-networkPlayerFeetY(p),z:q.z-p.z},playerShape(Math.max(.7,height-.14)),.001,1,false,
+    undefined,undefined,undefined,undefined,staticGeometry);
+   if(hit&&hit.time_of_impact<.995){const pane=glassByHandle.get(hit.collider.handle);if(pane)glassBreakAuthority(pane.id);else valid=false;}
+  }
+  // When the preceding trajectory is missing for >160 ms, a straight sweep
+  // cannot prove a wall crossing: the player may have gone around a corner.
+  if(!valid){netCorrect(conn,p,msg.seq,msg.stamp);return false;}
+  Object.assign(p,q);p.jumpOffset=Math.max(0,Math.min(5,Number(msg.jumpOffset)||0));p.moveSeq=s[0];p.motionStamp=s[1];p.moveAt=now;
+  if(!p.motionSamples)p.motionSamples=[];p.motionSamples.push(s.slice());if(p.motionSamples.length>24)p.motionSamples.shift();
+ }
+ p.netCorrection=null;netRecordPose(p);return true;
 }
 function netApplyCorrection(msg){
- if(msg.generation!==mapGeneration||!Number.isSafeInteger(msg.seq)||msg.seq<=netCorrectionSeq||![msg.x,msg.z,msg.feetY].every(Number.isFinite))return;
- netCorrectionSeq=msg.seq;px=msg.x;pz=msg.z;playerCrouchAmount=Math.max(0,Math.min(1,msg.crouch||0));resetPlayerPhysics(msg.feetY);
+ if(msg.generation!==mapGeneration||!Number.isSafeInteger(msg.epoch)||msg.epoch<=netLocalEpoch||![msg.x,msg.z,msg.feetY].every(Number.isFinite))return;
+ netLocalEpoch=msg.epoch;netCorrectionSeq=msg.seq;netLocalSamples.length=0;
+ px=msg.x;pz=msg.z;playerCrouchAmount=netClamp(msg.crouch||0,0,1);resetPlayerPhysics(msg.feetY);
  const p=netPlayers.get(localPeerId);if(p){p.x=px;p.z=pz;p.feetY=playerFeetY;p.crouch=playerCrouchAmount;}
- networkSendTimer=0;
+ netMotionTimer=0;
+}
+// An explicitly negotiated channel avoids PeerJS's single-channel event handler.
+// Only disposable movement goes here. Deaths, gunfire, glass and maps stay reliable.
+function netInstallTransport(conn){
+ if(!conn||conn.gridlockFast||!conn.peerConnection)return;
+ try{
+  const dc=conn.peerConnection.createDataChannel('gridlock-motion-8',{negotiated:true,id:2,ordered:false,maxRetransmits:0});conn.gridlockFast=dc;
+  dc.onmessage=e=>{try{
+   const msg=JSON.parse(e.data);if(!msg||typeof msg!=='object')return;
+   if(isHost){if(conn.gridlockProtocol===NET_PROTOCOL&&msg.type==='playerState')handleHostMessage(conn,msg);}
+   else if(conn===hostConn&&msg.type==='motion')netReceiveMotion(msg);
+  }catch(_) {}};
+  dc.onerror=()=>{};
+ }catch(err){console.warn('Using movement fallback',err);}
+}
+function netSendMotion(conn,msg){
+ if(!conn||!conn.open)return;
+ const dc=conn.gridlockFast;
+ if(dc&&dc.readyState==='open'){
+  if(dc.bufferedAmount>8192)return;
+  try{dc.send(JSON.stringify(msg));return;}catch(_){}
+ }
+ // Fallback is also bounded: never append obsolete poses to a growing queue.
+ if((conn.dataChannel&&conn.dataChannel.bufferedAmount>8192)||conn.bufferSize>1)return;
+ sendConn(conn,msg);
+}
+function netReceiveMotion(msg){
+ if(isHost||!clientHandshakeComplete||!worldGeometryReady||msg.generation!==mapGeneration||!Array.isArray(msg.players)||msg.players.length>64)return;
+ for(const d of msg.players){const p=netPlayers.get(d.id);if(p&&p.id!==localPeerId&&p.alive!==false)netReceivePose(p,d.motion);}
+}
+function netMotionTick(dt){
+ netMotionTimer-=dt;if(netMotionTimer>0)return;netMotionTimer=1/30;
+ if(isHost){
+  const p=netPlayers.get(localPeerId);if(p&&p.alive!==false){
+   const s=netSample(p,++netMoveSeq,performance.now());p.moveSeq=s[0];p.motionStamp=s[1];if(!p.motionSamples)p.motionSamples=[];p.motionSamples.push(s);if(p.motionSamples.length>24)p.motionSamples.shift();
+  }
+  const msg={type:'motion',generation:mapGeneration,players:[...netPlayers.values()].filter(p=>p.alive!==false).map(p=>({id:p.id,motion:netMotionPack(p)}))};
+  for(const c of peerConnections.values())if(c.gridlockProtocol===NET_PROTOCOL)netSendMotion(c,{...msg,players:msg.players.filter(v=>v.id!==c.peer)});
+ }else{const p=netPlayers.get(localPeerId);if(p&&p.alive!==false)netSendMotion(hostConn,netMakeState());}
 }
 
 // Destructible panes: stable generation-local IDs, independent render/collision state.
