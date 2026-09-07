@@ -537,6 +537,7 @@ function makeEntityId(slot){return 1000+slot;}
 function makeStrokeId(){return localPeerId+'-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,7);}
 
 function isMenuOrTextInputActive(target=document.activeElement){
+  if(scoreboardOpen)return true;
   if(!gameStarted)return true;
   if(!mainMenu.classList.contains('hidden'))return true;
 
@@ -7060,6 +7061,7 @@ function openMenuForm(kind){
   setTimeout(()=>displayNameInput.focus(),0);
 }
 function teardownPeer(){
+  scoreboardOpen=false;scoreRoot.style.display='none';scorePingTimer=0;
   stopClientHandshakeRetry();
   clientHandshakeComplete=false;
   try{if(hostConn)hostConn.close();}catch(_){}
@@ -7074,10 +7076,10 @@ function teardownPeer(){
 function updateNetworkInfo(){
   if(gameMode==='host'){
     networkInfoEl.innerHTML='HOST <b>'+displayName+'</b><br>JOIN CODE <b style="font-size:16px;letter-spacing:2px">'+joinCode+'</b><br>PLAYERS <b>'+netPlayers.size+'</b><br>';
-    tipEl.textContent='WASD move · mouse look · Shift sprint · C crouch · Space jump · M map · N host-new-map · your drawings yellow · other players red';
+    tipEl.textContent='WASD move · mouse look · Shift sprint · C crouch · Space jump · M map · N host-new-map · Tab scoreboard · your drawings yellow · other players red';
   }else if(gameMode==='client'){
     networkInfoEl.innerHTML='MULTIPLAYER <b>'+displayName+'</b><br>CODE <b>'+joinCode+'</b><br>PLAYERS <b>'+netPlayers.size+'</b><br>';
-    tipEl.textContent='WASD move · mouse look · Shift sprint · C crouch · Space jump · M map · your drawings yellow · other players red';
+    tipEl.textContent='WASD move · mouse look · Shift sprint · C crouch · Space jump · M map · Tab scoreboard · your drawings yellow · other players red';
   }else{
     networkInfoEl.innerHTML='SINGLE PLAYER<br>';
     tipEl.textContent='WASD move · mouse look · Shift sprint · C crouch · Space jump · M map · P add survivor · L NPC follow/runout · T respawn after death · N new building';
@@ -7095,7 +7097,7 @@ function broadcastHost(msg,exceptPeerId=null){
 }
 function serializePlayer(p){
   return {
-    gun:gunPack(p),motion:netMotionPack(p),
+    gun:gunPack(p),motion:netMotionPack(p),killOrder:scoreOrder(p),pingMs:scorePingValue(p),
     id:p.id,entityId:p.entityId,name:p.name,slot:p.slot,colorIndex:p.colorIndex,
     x:p.x,z:p.z,yaw:p.yaw,feetY:networkPlayerFeetY(p),
     crouch:Number.isFinite(p.crouch)?p.crouch:0,
@@ -7104,10 +7106,11 @@ function serializePlayer(p){
     deathT:p.deathT==null?(p.alive===false?1:0):p.deathT
   };
 }
-function serializePlayers(){return [...netPlayers.values()].map(serializePlayer);}
+function serializePlayers(){scoreEnsureOrder();return [...netPlayers.values()].map(serializePlayer);}
 function playerFromData(d){
   const ci=Number.isFinite(d.colorIndex)?d.colorIndex:0;
   return {
+    killOrder:Number(d.killOrder)||1,pingMs:Number.isFinite(d.pingMs)?d.pingMs:null,
     id:String(d.id),entityId:Number(d.entityId),name:safeName(d.name),slot:Number(d.slot)||0,colorIndex:ci,
     color:playerColorForSlot(ci),
     x:Number(d.x)||0,z:Number(d.z)||0,yaw:Number(d.yaw)||0,
@@ -7127,6 +7130,7 @@ function applyPlayerSnapshot(list,preserveSelf=true){
     if(!p){p=playerFromData(d);netPlayers.set(id,p);}
     else{
       const self=id===localPeerId;
+      p.killOrder=Number(d.killOrder)||1;p.pingMs=Number.isFinite(d.pingMs)?d.pingMs:null;
       p.entityId=Number(d.entityId);p.name=safeName(d.name);p.slot=Number(d.slot)||0;p.colorIndex=Number(d.colorIndex)||0;p.color=playerColorForSlot(p.colorIndex);
       const incomingMotion=d.motion&&d.motion.samples&&d.motion.samples.at(-1);
       const freshMotion=!p.motionSamples?.length||(d.motion&&d.motion.epoch>(p.motionEpoch||0))||(incomingMotion&&incomingMotion[0]>(p.moveSeq??-1));
@@ -7587,8 +7591,8 @@ function hostRemovePlayer(peerId){
 
   if(!netPlayers.has(peerId))return;
 
-  netPlayers.delete(peerId);netPoseHistory.delete(peerId);
-  broadcastHost({type:'playerLeft',peerId});
+  netPlayers.delete(peerId);netPoseHistory.delete(peerId);scoreEnsureOrder();
+  broadcastHost({type:'playerLeft',peerId});hostBroadcastWorld();
   updateNetworkInfo();
   rebuildNetPlayerMesh();
 
@@ -7627,7 +7631,7 @@ function hostEnsurePlayerForConnection(conn,requestedName){
   const sp=spawnPointForSlot(slot);
 
   p={
-    id:conn.peer,
+    id:conn.peer,killOrder:scoreNextId(),
     entityId:makeEntityId(slot),
     name,slot,colorIndex,
     color:playerColorForSlot(colorIndex),
@@ -7716,6 +7720,7 @@ function handleHostMessage(conn,msg){
     health.lastPingMs=performance.now();
   }
 
+  if(msg.type==='scorePong'){scoreHandlePong(conn,msg);return;}
   if(msg.type==='heartbeatPong'){
     return;
   }
@@ -7826,6 +7831,7 @@ function handleClientMessage(msg){
     if(msg.type==='positionCorrection'){netApplyCorrection(msg);return;}
     if(msg.type==='gunShot'){gunEvent(msg);return;}
     if(msg.type==='gunReloaded'){if(msg.generation===mapGeneration){const p=netPlayers.get(msg.shooter);if(p)gunState(p).reloadEnd=gunNow()+GUN_RELOAD;}return;}
+    if(msg.type==='scorePing'){sendConn(hostConn,{type:'scorePong',token:msg.token});return;}
     if(msg.type==='heartbeatPing'){
       sendConn(hostConn,{type:'heartbeatPong',sentAt:msg.sentAt});
       return;
@@ -13354,7 +13360,7 @@ function uavHasLineOfSight(drone,entity){
 function currentUavEntities(){
   return Array.from(uavEntities.values())
     .filter(e=>e&&e.isAlive&&e.isAlive())
-    .sort((a,b)=>Number(a.id)-Number(b.id));
+    .sort((a,b)=>scorePriority(a)-scorePriority(b)||Number(a.id)-Number(b.id));
 }
 
 function updateUavStatusHud(){
@@ -14219,6 +14225,7 @@ function frame(now){
   glassFlush();
   gunUpdate();
   updateMultiplayerFrame(dt);
+  scoreTick(dt);
   updateUavs(dt);
   updateUavKillFlash(dt);
   updateDeathState(dt);
@@ -14779,7 +14786,7 @@ function renderGuns(mapCamera){
 canvas.addEventListener('mousedown',e=>{if(e.button===0)gunFire();});
 addEventListener('keydown',e=>{if(e.code==='KeyR'&&!e.repeat){gunReload();}});
 
-const NET_PROTOCOL='gridlock-wifi-8';
+const NET_PROTOCOL='gridlock-scoreboard-9';
 function netVersionError(){stopClientHandshakeRetry();clientHandshakeComplete=false;try{if(hostConn)hostConn.close();}catch(_){}showMainMenu();showMenuStatus('Game versions differ. Everyone must open the same updated HTML file.');}
 let netMoveSeq=0,netWorldSeq=0,netLastWorldSeq=-1,netCorrectionSeq=-1,netLocalEpoch=0,netMotionTimer=0;
 const netPoseHistory=new Map(),netLocalSamples=[];
@@ -14911,7 +14918,7 @@ function netApplyCorrection(msg){
 function netInstallTransport(conn){
  if(!conn||conn.gridlockFast||!conn.peerConnection)return;
  try{
-  const dc=conn.peerConnection.createDataChannel('gridlock-motion-8',{negotiated:true,id:2,ordered:false,maxRetransmits:0});conn.gridlockFast=dc;
+  const dc=conn.peerConnection.createDataChannel('gridlock-motion-9',{negotiated:true,id:2,ordered:false,maxRetransmits:0});conn.gridlockFast=dc;
   dc.onmessage=e=>{try{
    const msg=JSON.parse(e.data);if(!msg||typeof msg!=='object')return;
    if(isHost){if(conn.gridlockProtocol===NET_PROTOCOL&&msg.type==='playerState')handleHostMessage(conn,msg);}
@@ -15068,6 +15075,93 @@ function glassShardMesh(out){
   for(const sign of [1,-1])for(const k of sign===1?[0,1,2]:[2,1,0])out.push(...ps[k],...n.map(x=>x/l*sign),.55,.82,.88);
  }
 }
+
+// Kill-order ranks are independent of stable network/entity IDs and UAV timers.
+let scoreboardOpen=false,scoreRefreshTimer=0,scorePingTimer=0,scorePingSerial=0;
+function scoreOrder(p){return Number.isSafeInteger(p.killOrder)&&p.killOrder>0?p.killOrder:Math.max(1,(p.slot||0)+1);}
+function scoreEnsureOrder(){
+ if(!isHost)return;
+ const players=[...netPlayers.values()].sort((a,b)=>scoreOrder(a)-scoreOrder(b)||String(a.id).localeCompare(String(b.id)));
+ players.forEach((p,i)=>p.killOrder=i+1);
+}
+function scoreNextId(){scoreEnsureOrder();return netPlayers.size+1;}
+function scoreRandomize(){
+ if(!multiplayer||!isHost)return false;
+ scoreEnsureOrder();const players=[...netPlayers.values()].sort((a,b)=>scoreOrder(a)-scoreOrder(b)),before=players.slice();
+ for(let i=players.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[players[i],players[j]]=[players[j],players[i]];}
+ if(players.length>1&&players.every((p,i)=>p===before[i]))players.push(players.shift());
+ players.forEach((p,i)=>p.killOrder=i+1);
+ hostBroadcastWorld();scoreRender();return true;
+}
+function scorePriority(entity){
+ if(multiplayer){for(const p of netPlayers.values())if(Number(p.entityId)===Number(entity.id))return scoreOrder(p);}
+ return Number(entity.id);
+}
+function scorePingValue(p){
+ if(isHost&&p.id===localPeerId)return 0;
+ if(!Number.isFinite(p.pingMs)||p.pingMs<0)return null;
+ if(isHost&&performance.now()-(p.pingAt||0)>8000)return null;
+ return Math.round(p.pingMs);
+}
+function scoreHandlePong(conn,msg){
+ if(!isHost||msg.token!==conn.scorePingToken||conn.scorePingToken==null)return;
+ const p=netPlayers.get(conn.peer),rtt=performance.now()-conn.scorePingSentAt;conn.scorePingToken=null;
+ if(!p||rtt<0||rtt>10000)return;
+ p.pingMs=Number.isFinite(p.pingMs)?p.pingMs*.65+rtt*.35:rtt;p.pingAt=performance.now();
+}
+const scoreStyle=document.createElement('style');scoreStyle.textContent=`
+#scoreboard{position:fixed;inset:0;z-index:1200;background:rgba(3,8,12,.76);display:none;align-items:center;justify-content:center;font:15px system-ui,sans-serif;color:#edf8fb;backdrop-filter:blur(6px)}
+#scoreboard .scorePanel{width:min(660px,92vw);max-height:85vh;overflow:auto;border:1px solid #476471;border-radius:14px;background:#101c24;box-shadow:0 24px 90px #0009;padding:24px}
+#scoreboard .scoreTop{display:flex;align-items:center;justify-content:space-between;gap:18px}#scoreboard h2{margin:0;font-size:24px;letter-spacing:.025em}
+#scoreboard p{color:#a7bec9;line-height:1.5;font-size:13px;margin:12px 0 20px}#scoreboard table{width:100%;border-collapse:collapse;text-align:left}
+#scoreboard th{color:#9ab3bf;font-size:11px;text-transform:uppercase;letter-spacing:.09em;padding:10px 8px;border-bottom:1px solid #354753}#scoreboard td{padding:13px 8px;border-bottom:1px solid #253640;font-variant-numeric:tabular-nums}
+#scoreboard td:first-child{font-weight:800;color:#64eac9;font-size:19px;width:70px}#scoreboard .scoreSelf{background:#18312f}#scoreboard .scoreDead{color:#82949e}#scoreboard .scorePingSlow{color:#ffc56b}
+#scoreboard button{font:600 13px system-ui,sans-serif;border:1px solid #597382;border-radius:7px;background:#243845;color:#edf8fb;padding:10px 14px;cursor:pointer}#scoreboard button:focus-visible{outline:2px solid #6deed5;outline-offset:3px}#scoreboard #scoreShuffle{background:#71e4c4;color:#0e2425;border:0}#scoreboard .scoreBottom{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:20px}#scoreboard .scoreHint{color:#9ab3bf;font-size:12px}
+`;document.head.appendChild(scoreStyle);
+const scoreRoot=document.createElement('div');scoreRoot.id='scoreboard';scoreRoot.setAttribute('role','dialog');scoreRoot.setAttribute('aria-modal','true');scoreRoot.setAttribute('aria-label','Connected players scoreboard');
+scoreRoot.innerHTML='<div class="scorePanel"><div class="scoreTop"><h2>Connected players</h2><button id="scoreClose" aria-label="Close scoreboard">Close · Tab</button></div><p>Kill-order ID determines priority when a UAV switches targets. It picks the lowest visible, living ID. Current locks continue.</p><table><thead><tr><th>ID</th><th>Player</th><th>Ping to host</th><th>Status</th></tr></thead><tbody id="scoreRows"></tbody></table><div class="scoreBottom"><span class="scoreHint" id="scoreCount"></span><button id="scoreShuffle">Randomize IDs</button></div></div>';
+document.body.appendChild(scoreRoot);
+function scoreRender(){
+ if(!scoreboardOpen)return;
+ const rows=document.getElementById('scoreRows');rows.replaceChildren();
+ const players=[...netPlayers.values()].sort((a,b)=>scoreOrder(a)-scoreOrder(b));
+ for(const p of players){
+  const tr=document.createElement('tr');if(p.id===localPeerId)tr.className='scoreSelf';
+  const ping=scorePingValue(p),isServer=isHost?p.id===localPeerId:p.slot===0;
+  const values=[String(scoreOrder(p)),p.name+(p.id===localPeerId?' (you)':'')+(isServer?' · HOST':''),ping==null?'—':ping+' ms',p.alive===false?'Dead':'Alive'];
+  values.forEach((value,i)=>{const td=document.createElement('td');td.textContent=value;if(i===2&&ping>180)td.className='scorePingSlow';if(i===3&&p.alive===false)td.className='scoreDead';tr.appendChild(td);});rows.appendChild(tr);
+ }
+ document.getElementById('scoreCount').textContent=players.length+' connected · Tab or Esc to close';
+ const shuffle=document.getElementById('scoreShuffle');shuffle.hidden=!isHost;shuffle.style.display=isHost?'':'none';shuffle.disabled=players.length<2;
+}
+function scoreSetOpen(open){
+ scoreboardOpen=!!open&&multiplayer&&gameStarted;
+ scoreRoot.style.display=scoreboardOpen?'flex':'none';clearPhysicalGameplayKeys();clearAllGameKeys();
+ if(scoreboardOpen){if(document.exitPointerLock)document.exitPointerLock();scoreRender();document.getElementById('scoreClose').focus();}
+ else{
+  if(document.activeElement&&scoreRoot.contains(document.activeElement))document.activeElement.blur();
+  if(gameStarted&&!mapOpen&&!playerDead&&!spectatorActive&&mainMenu.classList.contains('hidden')){try{const lock=canvas.requestPointerLock();if(lock&&lock.catch)lock.catch(()=>{});}catch(_){}}
+ }
+}
+function scoreTick(dt){
+ if(!multiplayer||!gameStarted){if(scoreboardOpen)scoreSetOpen(false);return;}
+ if(isHost){
+  scorePingTimer-=dt;if(scorePingTimer<=0){scorePingTimer=2;
+   for(const conn of peerConnections.values())if(conn.open&&netPlayers.has(conn.peer)){
+    if(conn.scorePingToken!=null&&performance.now()-conn.scorePingSentAt<5000)continue;
+    conn.scorePingToken=++scorePingSerial;conn.scorePingSentAt=performance.now();sendConn(conn,{type:'scorePing',token:conn.scorePingToken});
+   }
+  }
+ }
+ scoreRefreshTimer-=dt;if(scoreRefreshTimer<=0){scoreRefreshTimer=.25;scoreRender();}
+}
+document.getElementById('scoreShuffle').addEventListener('click',scoreRandomize);
+document.getElementById('scoreClose').addEventListener('click',()=>scoreSetOpen(false));
+addEventListener('keydown',e=>{
+ const text=['INPUT','TEXTAREA','SELECT'].includes((e.target?.tagName||'').toUpperCase())||e.target?.isContentEditable;
+ if(e.code==='Tab'&&gameStarted&&multiplayer&&!text&&mainMenu.classList.contains('hidden')){e.preventDefault();e.stopImmediatePropagation();if(!e.repeat)scoreSetOpen(!scoreboardOpen);}
+ else if(e.code==='Escape'&&scoreboardOpen){e.preventDefault();e.stopImmediatePropagation();scoreSetOpen(false);}
+},true);
 
 document.body.classList.add('menu-open');
 showMainMenu();
