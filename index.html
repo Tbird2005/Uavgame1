@@ -6159,6 +6159,11 @@ function addDualWallBox(ax,az,bx,bz,cx,cy,cz,sx,sy,sz,mapHidden=false){
   }
 }
 
+const gunRenderWallBox=addDualWallBox;
+addDualWallBox=function(ax,az,bx,bz,cx,cy,cz,sx,sy,sz,...rest){
+ const previous=gunWallContext;gunWallContext=gunMarkWall(ax,az,bx,bz,cx,cy,cz,sx,sy,sz);
+ try{return gunRenderWallBox(ax,az,bx,bz,cx,cy,cz,sx,sy,sz,...rest);}finally{gunWallContext=previous;}
+};
 function edgeIsExteriorBoundary(ax,az,bx,bz){
   return isFloor(ax,az)!==isFloor(bx,bz);
 }
@@ -7549,7 +7554,7 @@ function setAllPlayersForNewRound(){
     const s=spawnPointForSlot(p.slot);
     p.x=s.x;p.z=s.z;p.yaw=0;
     p.crouch=0;p.jumpOffset=0;p.feetY=FLOOR_TOP+PHYSICS_SKIN;
-    p.gun={hp:100,ammo:GUN_MAG,reloadEnd:0,nextShot:0,lastSeq:0};
+    p.gun=gunCreateState();
     p.alive=true;p.deathT=0;p.deathYaw=0;p.deathX=undefined;p.deathZ=undefined;
   }
   const me=netPlayers.get(localPeerId);
@@ -7615,6 +7620,7 @@ function makeStateSync(){
   return {
     type:'stateSync',
     generation:mapGeneration,
+    decals:gunDecals.slice(),
     glass:glassSnapshot(),
     drawings:serializeDrawings(),
     deaths:deathMarkers,
@@ -7745,7 +7751,7 @@ function handleHostMessage(conn,msg){
 
   const p=netPlayers.get(peerId);
   if(msg.type==='glassTouch'){glassHandleTouch(conn,msg);return;}
-  if(msg.type==='gunFire'||msg.type==='gunReload'){
+  if(msg.type==='gunFire'||msg.type==='gunReload'||msg.type==='gunSwitch'){
     if(msg.motion&&msg.generation===mapGeneration)netAcceptState(conn,msg.motion);
     gunAuthority(peerId,msg);return;
   }
@@ -7815,6 +7821,7 @@ function applyStateSync(msg){
   if(Number(msg.generation)!==mapGeneration)return;
 
   glassApplySnapshot(msg.glass);
+  gunDecals.length=0;gunAddImpacts(msg.decals,false);
   applyDrawSnapshot(msg.drawings||[]);
   deathMarkers=(msg.deaths||[]).map(x=>({...x}));
   rebuildDeathMarkerMesh();
@@ -7830,7 +7837,7 @@ function handleClientMessage(msg){
     if(msg.type==='glassReject'){if(msg.generation===mapGeneration&&!glassBroken.has(msg.id)){glassPredicted.delete(msg.id);glassSetBroken(breakableGlass[msg.id],false);}return;}
     if(msg.type==='positionCorrection'){netApplyCorrection(msg);return;}
     if(msg.type==='gunShot'){gunEvent(msg);return;}
-    if(msg.type==='gunReloaded'){if(msg.generation===mapGeneration){const p=netPlayers.get(msg.shooter);if(p)gunState(p).reloadEnd=gunNow()+GUN_RELOAD;}return;}
+    if(msg.type==='gunStateUpdate'){if(msg.generation===mapGeneration){const p=netPlayers.get(msg.shooter);if(p)gunRead(p,msg.gun);}return;}
     if(msg.type==='scorePing'){sendConn(hostConn,{type:'scorePong',token:msg.token});return;}
     if(msg.type==='heartbeatPing'){
       sendConn(hostConn,{type:'heartbeatPong',sentAt:msg.sentAt});
@@ -8207,6 +8214,7 @@ let physicsRemotePlayers=new Map();
 let physicsUavColliders=[],physicsUavIndex=0;
 
 function physicsBeginWorld(){
+  gunWallSurfaces.clear();gunWallContext=null;gunDecals.length=0;gunImpactBursts.length=0;gunDecalsDirty=true;
   glassReset();
   if(physicsWorld)physicsWorld.free();
   physicsWorld=new RAPIER.World({x:0,y:-PLAYER_GRAVITY,z:0});
@@ -8218,8 +8226,10 @@ function physicsBeginWorld(){
 }
 function physicsAddBox(cx,cy,cz,sx,sy,sz){
   if(Math.min(sx,sy,sz)<=.000001)return;
-  return physicsWorld.createCollider(RAPIER.ColliderDesc.cuboid(sx/2,sy/2,sz/2)
+  const collider=physicsWorld.createCollider(RAPIER.ColliderDesc.cuboid(sx/2,sy/2,sz/2)
     .setTranslation(cx,cy,cz).setFriction(0).setRestitution(0));
+  if(gunWallContext)gunWallSurfaces.set(collider.handle,gunWallContext);
+  return collider;
 }
 function physicsHullPrimitive(fn){
   return function(...args){
@@ -14628,21 +14638,118 @@ joinCodeInput.addEventListener('keydown',e=>{
 });
 joinCodeInput.addEventListener('keyup',stopMenuKeyFromReachingGame);
 
-// Shared world-space sidearm, host-authoritative combat.
-const GUN_DAMAGE=25,GUN_MAG=17,GUN_RELOAD=1.65,GUN_INTERVAL=.18,GUN_RANGE=90;
+// Gameplay penetration units (not real-world ballistic measurements).
+const BULLETS={pistol9:{label:'9mm',penetration:65},rifle762:{label:'7.62',penetration:145}};
+const WEAPONS={
+ ak:{name:'AK',bullet:'rifle762',damage:34,mag:30,reload:2.25,interval:.10,range:140,automatic:true,muzzle:-.70,visualSpeed:900},
+ glock:{name:'GLOCK',bullet:'pistol9',damage:25,mag:17,reload:1.65,interval:.18,range:90,automatic:false,muzzle:-.19,visualSpeed:520}
+};
+const WALL_ABSORPTION=40;
+let gunWallContext=null;
+const gunWallSurfaces=new Map();
+function gunMarkWall(ax,az,bx,bz,cx,cy,cz,sx,sy,sz){
+ return {group:[ax+','+az,bx+','+bz].sort().join('|'),interior:!edgeIsExteriorBoundary(ax,az,bx,bz),axis:ax!==bx?0:2,
+  lo:[cx-sx/2,cy-sy/2,cz-sz/2],hi:[cx+sx/2,cy+sy/2,cz+sz/2],absorption:WALL_ABSORPTION};
+}
+function gunTrace(o,d,shooter,weapon='glock'){
+ const w=WEAPONS[weapon]||WEAPONS.glock,ignored=new Set(),impacts=[];
+ let remaining=BULLETS[w.bullet].penetration,damage=w.damage,walls=0;
+ let victim=null,victimDistance=w.range;
+ for(const p of netPlayers.values())if(p.id!==shooter&&p.alive!==false){const t=gunCapsuleHit(o,d,p);if(t<victimDistance){victim=p;victimDistance=t;}}
+ const point=t=>({x:o.x+d.x*t,y:o.y+d.y*t,z:o.z+d.z*t});
+ for(let step=0;step<12;step++){
+  const hit=physicsWorld.castRayAndGetNormal(new RAPIER.Ray(o,d),w.range,true,undefined,undefined,undefined,undefined,
+   c=>staticGeometry(c)&&!ignored.has(gunWallSurfaces.get(c.handle)?.group));
+  if(!hit||victim&&victimDistance<hit.timeOfImpact)return {target:victim,distance:victimDistance,end:point(victimDistance),impacts,walls,damage,remaining};
+  const at=point(hit.timeOfImpact),pane=glassByHandle.get(hit.collider.handle),surface=gunWallSurfaces.get(hit.collider.handle),n=hit.normal;
+  if(pane)return {target:null,pane,end:at,distance:hit.timeOfImpact,impacts,walls,damage,remaining};
+  impacts.push({point:at,normal:{x:n.x,y:n.y,z:n.z},exit:false});
+  if(!surface||!surface.interior)return {target:null,end:at,distance:hit.timeOfImpact,impacts,walls,damage,remaining};
+  const k=surface.axis,axis=['x','y','z'][k],component=d[axis];
+  if(Math.abs(component)<1e-6)return {target:null,end:at,impacts,walls,damage,remaining};
+  const exitPlane=component>0?surface.hi[k]:surface.lo[k],exit=(exitPlane-o[axis])/component;
+  const thickness=Math.max(0,exit-hit.timeOfImpact),cost=surface.absorption*thickness/WALL_THICKNESS;
+  if(exit>w.range||cost<=0||remaining+1e-5<cost)return {target:null,end:at,distance:hit.timeOfImpact,impacts,walls,damage,remaining};
+  remaining-=cost;damage*=.5;walls++;ignored.add(surface.group);
+  const exitNormal={x:0,y:0,z:0};exitNormal[axis]=Math.sign(component);
+  impacts.push({point:point(exit),normal:exitNormal,exit:true});
+ }
+ return {target:null,end:point(w.range),impacts,walls,damage,remaining};
+}
+const gunDecals=[],gunImpactBursts=[],gunDecalBuffer=gl.createBuffer();let gunDecalsDirty=true,gunDecalVertices=0;
+function gunAddImpacts(impacts,effects=true){
+ for(const hit of (impacts||[]).slice(0,effects?24:180)){
+  if(!hit.point||!hit.normal||![hit.point.x,hit.point.y,hit.point.z,hit.normal.x,hit.normal.y,hit.normal.z].every(Number.isFinite))continue;
+  const len=Math.hypot(hit.normal.x,hit.normal.y,hit.normal.z);if(len<.5)continue;
+  gunDecals.push({point:hit.point,normal:{x:hit.normal.x/len,y:hit.normal.y/len,z:hit.normal.z/len},exit:!!hit.exit});
+  if(effects)gunImpactBursts.push({...hit,at:gunNow()});
+ }
+ if(gunDecals.length>180)gunDecals.splice(0,gunDecals.length-180);
+ if(gunImpactBursts.length>40)gunImpactBursts.splice(0,gunImpactBursts.length-40);gunDecalsDirty=true;
+}
+function gunDecalMesh(out,hit){
+ const n=[hit.normal.x,hit.normal.y,hit.normal.z],u=Math.abs(n[1])>.9?[1,0,0]:[n[2],0,-n[0]],ul=Math.hypot(...u);for(let k=0;k<3;k++)u[k]/=ul;
+ const v=[n[1]*u[2]-n[2]*u[1],n[2]*u[0]-n[0]*u[2],n[0]*u[1]-n[1]*u[0]],p=[hit.point.x,hit.point.y,hit.point.z].map((x,k)=>x+n[k]*.0035),r=hit.exit?.067:.042;
+ const at=(x,y)=>p.map((s,k)=>s+u[k]*x+v[k]*y),vertex=(p,c)=>out.push(...p,...n,...c);
+ const dark=[.018,.023,.027],edge=[.26,.235,.20];
+ for(let i=0;i<12;i++){
+  const a=i*Math.PI/6,b=(i+1)*Math.PI/6,ra=r*(1+Math.sin(i*7.7)*.13),rb=r*(1+Math.sin((i+1)*7.7)*.13);
+  const innerA=at(Math.cos(a)*ra*.53,Math.sin(a)*ra*.53),innerB=at(Math.cos(b)*rb*.53,Math.sin(b)*rb*.53),outerA=at(Math.cos(a)*ra,Math.sin(a)*ra),outerB=at(Math.cos(b)*rb,Math.sin(b)*rb);
+  vertex(p,dark);vertex(innerA,dark);vertex(innerB,dark);
+  for(const q of [innerA,outerA,outerB,innerA,outerB,innerB])vertex(q,edge);
+  if(i%3===0){vertex(at(Math.cos(a)*r*.65,Math.sin(a)*r*.65),dark);vertex(at(Math.cos(a)*r*1.55,Math.sin(a)*r*1.55),dark);vertex(at(Math.cos(a+.12)*r*.7,Math.sin(a+.12)*r*.7),dark);}
+ }
+}
+function gunDrawDecals(mapCamera){
+ if(mapCamera)return;
+ if(gunDecalsDirty){const out=[];for(const hit of gunDecals)gunDecalMesh(out,hit);gunDecalVertices=out.length/9;
+  gl.bindBuffer(gl.ARRAY_BUFFER,gunDecalBuffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(out),gl.DYNAMIC_DRAW);gunDecalsDirty=false;}
+ if(!gunDecalVertices)return;
+ gl.useProgram(uavProg);gl.uniformMatrix4fv(uavProjLoc,false,proj);gl.uniformMatrix4fv(uavViewLoc,false,view);bindUavBuffer(gunDecalBuffer);
+ gl.enable(gl.DEPTH_TEST);gl.depthMask(true);gl.disable(gl.BLEND);gl.enable(gl.CULL_FACE);gl.drawArrays(gl.TRIANGLES,0,gunDecalVertices);
+}
+function gunImpactMesh(out){
+ const now=gunNow();for(let i=gunImpactBursts.length-1;i>=0;i--){const h=gunImpactBursts[i],age=now-h.at;if(age>.22){gunImpactBursts.splice(i,1);continue;}
+  for(let j=0;j<3;j++){const c=[h.point.x+h.normal.x*age*(2+j),h.point.y+h.normal.y*age*(2+j)+age*(j-1),h.point.z+h.normal.z*age*(2+j)],pose={point:(x,y,z)=>[c[0]+x,c[1]+y,c[2]+z],normal:(x,y,z)=>[x,y,z]},size=.024*(1-age/.22);
+   gunBox(out,pose,0,0,0,size,size,size,j===0?[1,.72,.28]:[.55,.49,.40]);}
+ }
+}
+
+const GUN_DAMAGE=25,GUN_MAG=17,GUN_RELOAD=1.65,GUN_INTERVAL=.18,GUN_RANGE=140;
 const gunBuffer=gl.createBuffer(),gunTraces=[],gunFlashes=new Map(),gunSeenEvents=new Map();
-let gunLocal={hp:100,ammo:GUN_MAG,reloadEnd:0,nextShot:0,lastSeq:0},gunSeq=0,gunReloadVisual=0,gunHitUntil=0;
+let gunSeq=0,gunReloadVisual=0,gunHitUntil=0,gunTrigger=false;
 const gunNow=()=>performance.now()/1000;
+function gunCreateState(hp=100){
+ const s={hp,equipped:'ak',slots:{ak:{ammo:30,reloadEnd:0},glock:{ammo:17,reloadEnd:0}},nextShot:0,lastSeq:0,serverAck:-1,pending:[]};
+ Object.defineProperties(s,{ammo:{get(){return this.slots[this.equipped].ammo;},set(v){this.slots[this.equipped].ammo=v;}},reloadEnd:{get(){return this.slots[this.equipped].reloadEnd;},set(v){this.slots[this.equipped].reloadEnd=v;}}});return s;
+}
+let gunLocal=gunCreateState();
 const gunHud=document.createElement('div');gunHud.id='gunHud';
-gunHud.innerHTML='<div id="gunHealthText">100 / 100 HP</div><div id="gunHealthTrack"><div id="gunHealthFill"></div></div><div id="gunAmmo">17 / 17</div><div class="gunHint">LMB FIRE · R RELOAD</div>';
+gunHud.innerHTML='<div id="gunHealthText">100 / 100 HP</div><div id="gunHealthTrack"><div id="gunHealthFill"></div></div><div id="gunWeapon" style="font-size:13px;color:#78e7c5"></div><div id="gunAmmo">30 / 30</div><div class="gunHint">1 AK · 2 GLOCK · R RELOAD</div>';
 document.body.appendChild(gunHud);
 const gunCross=document.createElement('div');gunCross.id='gunCross';gunCross.textContent='+';document.body.appendChild(gunCross);
-function gunState(p){if(!p.gun)p.gun={hp:p.alive===false?0:100,ammo:GUN_MAG,reloadEnd:0,nextShot:0,lastSeq:0};return p.gun;}
-function gunFinishReload(s){if(s.reloadEnd&&gunNow()>=s.reloadEnd){s.ammo=GUN_MAG;s.reloadEnd=0;}}
-function gunSelf(){return multiplayer?(netPlayers.get(localPeerId)?gunState(netPlayers.get(localPeerId)):gunLocal):gunLocal;}
-function gunReset(){gunSeenEvents.clear();gunLocal={hp:100,ammo:GUN_MAG,reloadEnd:0,nextShot:0,lastSeq:0};gunTraces.length=0;gunFlashes.clear();gunReloadVisual=0;gunSeq=0;}
-function gunPack(p){const s=gunState(p);gunFinishReload(s);return {hp:s.hp,ammo:s.ammo,reloadLeft:Math.max(0,s.reloadEnd-gunNow()),lastSeq:s.lastSeq,pitch:p.pitch||0};}
-function gunRead(p,d){if(!d)return;const s=gunState(p);s.hp=Math.max(0,Math.min(100,Number(d.hp)||0));s.ammo=Math.max(0,Math.min(GUN_MAG,Number(d.ammo)||0));s.reloadEnd=d.reloadLeft>0?gunNow()+Math.min(GUN_RELOAD,d.reloadLeft):0;s.lastSeq=d.lastSeq||0;p.pitch=Math.max(-1.5,Math.min(1.5,Number(d.pitch)||0));}
+function gunState(p){if(!p.gun?.slots)p.gun=gunCreateState(p.alive===false?0:(p.gun?.hp??100));return p.gun;}
+function gunFinishReload(s){for(const [id,slot] of Object.entries(s.slots))if(slot.reloadEnd&&gunNow()>=slot.reloadEnd){slot.ammo=WEAPONS[id].mag;slot.reloadEnd=0;}}
+function gunSelf(){return multiplayer&&netPlayers.get(localPeerId)?gunState(netPlayers.get(localPeerId)):gunLocal;}
+function gunReset(){gunLocal=gunCreateState();gunSeenEvents.clear();gunTraces.length=0;gunFlashes.clear();gunDecals.length=0;gunImpactBursts.length=0;gunDecalsDirty=true;gunSeq=0;gunTrigger=false;gunReloadVisual=0;}
+function gunPack(p){const s=gunState(p);gunFinishReload(s);return {hp:s.hp,equipped:s.equipped,lastSeq:s.lastSeq,pitch:p.pitch||0,slots:Object.fromEntries(Object.entries(s.slots).map(([id,v])=>[id,{ammo:v.ammo,reloadLeft:Math.max(0,v.reloadEnd-gunNow())}]))};}
+function gunRead(p,d){
+ if(!d?.slots||!WEAPONS[d.equipped])return;const s=gunState(p);s.hp=netClamp(Number(d.hp)||0,0,100);
+ if((d.lastSeq||0)<s.serverAck)return;s.serverAck=d.lastSeq||0;s.lastSeq=s.serverAck;s.equipped=d.equipped;
+ for(const id of Object.keys(WEAPONS)){const v=d.slots[id];if(v){s.slots[id].ammo=netClamp(Number(v.ammo)||0,0,WEAPONS[id].mag);s.slots[id].reloadEnd=v.reloadLeft>0?gunNow()+Math.min(WEAPONS[id].reload,v.reloadLeft):0;}}
+ s.pending=s.pending.filter(a=>a.seq>s.serverAck);
+ for(const a of s.pending){
+  if(a.type==='gunFire')s.slots[a.weapon].ammo=Math.max(0,s.slots[a.weapon].ammo-1);
+  if(a.type==='gunSwitch'){s.slots[s.equipped].reloadEnd=0;s.equipped=a.weapon;}
+  if(a.type==='gunReload')s.slots[a.weapon].reloadEnd=a.reloadEnd;
+ }
+ p.pitch=netClamp(Number(d.pitch)||0,-1.5,1.5);
+}
+function gunPredict(msg){const s=gunSelf();s.pending.push({...msg,reloadEnd:gunNow()+WEAPONS[msg.weapon].reload});if(s.pending.length>80)s.pending.shift();
+ if(msg.type==='gunFire')s.ammo=Math.max(0,s.ammo-1);
+ else if(msg.type==='gunSwitch'){s.reloadEnd=0;s.equipped=msg.weapon;}
+ else if(msg.type==='gunReload')s.reloadEnd=gunNow()+WEAPONS[msg.weapon].reload;
+}
 function gunEye(p){const c=Math.max(0,Math.min(1,p.crouch||0));return {x:p.x,y:networkPlayerFeetY(p)+PLAYER_EYE+(PLAYER_CROUCH_EYE-PLAYER_EYE)*c,z:p.z};}
 function gunDirection(y,p){return {x:Math.sin(y)*Math.cos(p),y:Math.sin(p),z:-Math.cos(y)*Math.cos(p)};}
 function gunCapsuleHit(o,d,p){
@@ -14657,85 +14764,86 @@ function gunCapsuleHit(o,d,p){
   if(disc>=0){const t=-b-Math.sqrt(disc);if(t>=0)nearest=Math.min(nearest,t);}}
  return nearest;
 }
-function gunRay(o,d,shooter){
- const wall=physicsWorld.castRay(new RAPIER.Ray(o,d),GUN_RANGE,true,undefined,undefined,undefined,undefined,staticGeometry);
- let distance=wall?wall.timeOfImpact:GUN_RANGE,target=null;
- for(const p of netPlayers.values())if(p.id!==shooter&&p.alive!==false){const t=gunCapsuleHit(o,d,p);if(t<distance){distance=t;target=p;}}
- return {target,distance,pane:!target&&wall?glassByHandle.get(wall.collider.handle):null,end:{x:o.x+d.x*distance,y:o.y+d.y*distance,z:o.z+d.z*distance}};
-}
-function gunSound(remote=false){
+function gunRay(o,d,shooter,weapon='glock'){return gunTrace(o,d,shooter,weapon);}
+function gunSound(remote=false,weapon='glock'){
  try{const C=window.AudioContext||window.webkitAudioContext;if(!C)return;const ctx=gunSound.ctx||(gunSound.ctx=new C());if(ctx.state==='suspended')ctx.resume();
-  const n=ctx.createBuffer(1,ctx.sampleRate*.09,ctx.sampleRate),a=n.getChannelData(0);for(let i=0;i<a.length;i++)a[i]=(Math.random()*2-1)*Math.exp(-i/(a.length*.17));
-  const src=ctx.createBufferSource(),gain=ctx.createGain();src.buffer=n;gain.gain.value=remote?.08:.23;src.connect(gain);gain.connect(ctx.destination);src.start();
+  const duration=weapon==='ak'?.14:.09,n=ctx.createBuffer(1,Math.floor(ctx.sampleRate*duration),ctx.sampleRate),a=n.getChannelData(0);
+  for(let i=0;i<a.length;i++)a[i]=(Math.random()*2-1)*Math.exp(-i/(a.length*.18));
+  const src=ctx.createBufferSource(),gain=ctx.createGain(),filter=ctx.createBiquadFilter();src.buffer=n;gain.gain.value=remote?.075:.21;filter.type='lowpass';filter.frequency.value=weapon==='ak'?4800:7800;src.connect(filter);filter.connect(gain);gain.connect(ctx.destination);src.start();
+  if(weapon==='ak'){const osc=ctx.createOscillator(),thump=ctx.createGain();osc.frequency.setValueAtTime(150,ctx.currentTime);osc.frequency.exponentialRampToValueAtTime(45,ctx.currentTime+.10);thump.gain.setValueAtTime(remote?.035:.08,ctx.currentTime);thump.gain.exponentialRampToValueAtTime(.001,ctx.currentTime+.12);osc.connect(thump);thump.connect(ctx.destination);osc.start();osc.stop(ctx.currentTime+.13);}
  }catch(_){}
 }
 function gunEvent(e){
  if(e.generation!==mapGeneration||!Number.isSafeInteger(e.seq)||e.seq<=(gunSeenEvents.get(e.shooter)||0))return;
- gunSeenEvents.set(e.shooter,e.seq);
- gunTraces.push({...e,at:gunNow()});if(gunTraces.length>80)gunTraces.shift();
- if(e.shooter!==localPeerId){gunFlashes.set(e.shooter,gunNow());gunSound(true);}
+ gunSeenEvents.set(e.shooter,e.seq);gunTraces.push({...e,at:gunNow()});if(gunTraces.length>80)gunTraces.shift();gunAddImpacts(e.impacts);
+ const p=netPlayers.get(e.shooter);if(p&&e.gun)gunRead(p,e.gun);
+ if(e.shooter!==localPeerId){gunFlashes.set(e.shooter,gunNow());gunSound(true,e.weapon);}
  if(e.shooter===localPeerId&&e.hit)gunHitUntil=gunNow()+.16;
 }
 function gunAuthority(id,msg){
  if(multiplayer&&!isHost)return false;
- const p=multiplayer?netPlayers.get(id):{id:'single',x:px,z:pz,feetY:playerFeetY,crouch:playerCrouchAmount,alive:!playerDead,gun:gunLocal};
- if(!p||p.alive===false||msg.generation!==mapGeneration)return false;
+ const p=multiplayer?netPlayers.get(id):{id:localPeerId,x:px,z:pz,feetY:playerFeetY,crouch:playerCrouchAmount,alive:!playerDead,gun:gunLocal};
+ if(!p||p.alive===false||msg.generation!==mapGeneration||!WEAPONS[msg.weapon])return false;
  const s=gunState(p);gunFinishReload(s);
+ if(!Number.isSafeInteger(msg.seq)||msg.seq<=s.lastSeq)return false;s.lastSeq=msg.seq;
+ const ack=()=>{if(multiplayer)broadcastHost({type:'gunStateUpdate',generation:mapGeneration,shooter:id,gun:gunPack(p)});};
+ if(msg.type==='gunSwitch'){
+  s.reloadEnd=0;s.equipped=msg.weapon;s.nextShot=Math.max(s.nextShot,gunNow()+.20);ack();return true;
+ }
+ if(msg.weapon!==s.equipped){ack();return false;}const w=WEAPONS[s.equipped];
  if(msg.type==='gunReload'){
-  if(!s.reloadEnd&&s.ammo<GUN_MAG){s.reloadEnd=gunNow()+GUN_RELOAD;const e={type:'gunReloaded',generation:mapGeneration,shooter:id};if(multiplayer)broadcastHost(e);if(id===localPeerId)gunReloadVisual=gunNow();}
-  return true;
+  if(!s.reloadEnd&&s.ammo<w.mag)s.reloadEnd=gunNow()+w.reload;ack();return true;
  }
- if(!Number.isSafeInteger(msg.seq)||msg.seq<=s.lastSeq||!Number.isFinite(msg.yaw)||!Number.isFinite(msg.pitch)||Math.abs(msg.pitch)>1.5)return false;
- s.lastSeq=msg.seq;
- if(s.reloadEnd||s.ammo<=0||gunNow()+.004<s.nextShot)return false;
- s.ammo--;s.nextShot=gunNow()+GUN_INTERVAL;p.yaw=msg.yaw;p.pitch=msg.pitch;
- const o=gunEye(p),d=gunDirection(p.yaw,p.pitch),hit=gunRay(o,d,id);
- // Also require a clear muzzle path, so aiming around an edge cannot shoot
- // through the wall that the visible held gun is touching.
- const muzzle=gunPose(p,false).point(0,.025,-.19);
- const muzzlePoint={x:muzzle[0],y:muzzle[1],z:muzzle[2]};
- const obstruct=(a,b)=>{const delta={x:b.x-a.x,y:b.y-a.y,z:b.z-a.z};return physicsWorld.castRay(new RAPIER.Ray(a,delta),.999,true,undefined,undefined,undefined,undefined,staticGeometry);};
- const mountBlock=obstruct(o,muzzlePoint),flightBlock=obstruct(muzzlePoint,hit.end);
- if(mountBlock||flightBlock){
-  const a=mountBlock?o:muzzlePoint,b=mountBlock?muzzlePoint:hit.end,t=(mountBlock||flightBlock).timeOfImpact;
-  hit.target=null;hit.pane=glassByHandle.get((mountBlock||flightBlock).collider.handle);hit.end={x:a.x+(b.x-a.x)*t,y:a.y+(b.y-a.y)*t,z:a.z+(b.z-a.z)*t};
- }
+ if(!Number.isFinite(msg.yaw)||!Number.isFinite(msg.pitch)||Math.abs(msg.pitch)>1.5||s.reloadEnd||s.ammo<=0||gunNow()+.004<s.nextShot){ack();return false;}
+ s.ammo--;s.nextShot=gunNow()+w.interval;p.yaw=msg.yaw;p.pitch=msg.pitch;
+ const eye=gunEye(p),direction=gunDirection(p.yaw,p.pitch),aim=gunTrace(eye,direction,id,s.equipped);
+ const muzzle=gunPose(p,false).point(0,.025,w.muzzle);let origin={x:muzzle[0],y:muzzle[1],z:muzzle[2]};
+ const mount={x:origin.x-eye.x,y:origin.y-eye.y,z:origin.z-eye.z};
+ if(physicsWorld.castRay(new RAPIER.Ray(eye,mount),1,true,undefined,undefined,undefined,undefined,staticGeometry))origin=eye;
+ const delta={x:aim.end.x-origin.x,y:aim.end.y-origin.y,z:aim.end.z-origin.z},length=Math.hypot(delta.x,delta.y,delta.z)||1;
+ const d={x:delta.x/length,y:delta.y/length,z:delta.z/length},hit=gunTrace(origin,d,id,s.equipped);
  if(hit.pane)glassBreakAuthority(hit.pane.id,hit.end);
- if(hit.target){const victim=gunState(hit.target);victim.hp=Math.max(0,victim.hp-GUN_DAMAGE);if(!victim.hp)hostKillNetworkPlayer(hit.target.id,p.name||'GLOCK');}
- const e={type:'gunShot',generation:mapGeneration,shooter:id,seq:msg.seq,from:{x:muzzle[0],y:muzzle[1],z:muzzle[2]},end:hit.end,hit:!!hit.target};
+ if(hit.target){const victim=gunState(hit.target);victim.hp=Math.max(0,victim.hp-hit.damage);if(victim.hp<=0)hostKillNetworkPlayer(hit.target.id,p.name||w.name);}
+ const e={type:'gunShot',generation:mapGeneration,shooter:id,seq:msg.seq,weapon:s.equipped,from:origin,end:hit.end,hit:!!hit.target,walls:hit.walls,damage:hit.target?hit.damage:0,impacts:hit.impacts,gun:gunPack(p)};
  gunEvent(e);if(multiplayer){broadcastHost(e);hostBroadcastWorld();}return true;
 }
 function gunFire(){
  if(!gameStarted||playerDead||mapOpen||spectatorActive||!locked||isMenuOrTextInputActive())return;
- const s=gunSelf();gunFinishReload(s);if(s.reloadEnd||s.ammo<=0||gunNow()<s.localNext)return;
- s.localNext=gunNow()+GUN_INTERVAL;
- const msg={type:'gunFire',generation:mapGeneration,seq:++gunSeq,yaw,pitch,motion:multiplayer&&!isHost?netMakeState():undefined};
- if(multiplayer&&!isHost)sendConn(hostConn,msg);else if(!gunAuthority(localPeerId,msg))return;
- gunFlashes.set(localPeerId,gunNow());gunSound();
+ const s=gunSelf();gunFinishReload(s);const w=WEAPONS[s.equipped];if(s.reloadEnd||s.ammo<=0||gunNow()<(s.localNext||0))return;
+ s.localNext=gunNow()+w.interval;
+ const msg={type:'gunFire',generation:mapGeneration,seq:++gunSeq,weapon:s.equipped,yaw,pitch,motion:multiplayer&&!isHost?netMakeState():undefined};
+ if(multiplayer&&!isHost){gunPredict(msg);sendConn(hostConn,msg);}else if(!gunAuthority(localPeerId,msg))return;
+ gunFlashes.set(localPeerId,gunNow());gunSound(false,msg.weapon);
+}
+function gunSwitch(weapon){
+ if(!WEAPONS[weapon]||!gameStarted||playerDead||spectatorActive||isMenuOrTextInputActive())return;
+ const s=gunSelf();if(s.equipped===weapon)return;
+ const msg={type:'gunSwitch',generation:mapGeneration,seq:++gunSeq,weapon};s.localNext=gunNow()+.20;
+ if(multiplayer&&!isHost){gunPredict(msg);sendConn(hostConn,msg);}else gunAuthority(localPeerId,msg);
 }
 function gunReload(){
  if(!gameStarted||playerDead||mapOpen||spectatorActive||isMenuOrTextInputActive())return;
- const s=gunSelf();if(s.reloadEnd||s.ammo===GUN_MAG)return;
- const msg={type:'gunReload',generation:mapGeneration};
- if(multiplayer&&!isHost){s.reloadEnd=gunNow()+GUN_RELOAD;sendConn(hostConn,msg);}else gunAuthority(localPeerId,msg);
- gunReloadVisual=gunNow();
+ const s=gunSelf(),w=WEAPONS[s.equipped];if(s.reloadEnd||s.ammo===w.mag)return;
+ const msg={type:'gunReload',generation:mapGeneration,seq:++gunSeq,weapon:s.equipped};
+ if(multiplayer&&!isHost){gunPredict(msg);sendConn(hostConn,msg);}else gunAuthority(localPeerId,msg);gunReloadVisual=gunNow();
 }
 function gunUpdate(){
  if(isHost)for(const p of netPlayers.values())gunFinishReload(gunState(p));
- const s=gunSelf();if(!multiplayer)gunFinishReload(s);if(playerDead)s.hp=0;
+ const s=gunSelf(),w=WEAPONS[s.equipped];if(!multiplayer)gunFinishReload(s);if(playerDead)s.hp=0;
+ if(gunTrigger&&w.automatic)gunFire();
  const show=gameStarted&&!isMenuOrTextInputActive();gunHud.style.display=show?'block':'none';gunCross.style.display=show&&!mapOpen&&!playerDead&&!spectatorActive?'block':'none';
- document.getElementById('gunHealthText').textContent=Math.ceil(s.hp)+' / 100 HP';document.getElementById('gunHealthFill').style.width=s.hp+'%';
- document.getElementById('gunHealthFill').style.background=s.hp<=25?'#ff4e43':'#51e0ad';
- document.getElementById('gunAmmo').textContent=s.reloadEnd?'RELOADING…':s.ammo+' / '+GUN_MAG;
+ document.getElementById('gunHealthText').textContent=Math.ceil(s.hp)+' / 100 HP';document.getElementById('gunHealthFill').style.width=s.hp+'%';document.getElementById('gunHealthFill').style.background=s.hp<=25?'#ff4e43':'#51e0ad';
+ document.getElementById('gunWeapon').textContent=w.name+' · '+BULLETS[w.bullet].label+' · PEN '+BULLETS[w.bullet].penetration;
+ document.getElementById('gunAmmo').textContent=s.reloadEnd?'RELOADING…':s.ammo+' / '+w.mag;
  gunCross.style.color=gunNow()<gunHitUntil?'#ff7155':'#fff';
 }
 function gunPose(p,animate=true){
  const t=gunNow(),shot=animate?Math.max(0,1-(t-(gunFlashes.get(p.id)||-99))/.14):0;
- const s=gunState(p),reload=animate&&s.reloadEnd?Math.max(0,Math.min(1,1-(s.reloadEnd-t)/GUN_RELOAD)):0;
- const dip=Math.sin(reload*Math.PI),y=p.yaw||0,pi=(p.pitch||0)+shot*.12+dip*.32;
+ const s=gunState(p),w=WEAPONS[s.equipped],reload=animate&&s.reloadEnd?Math.max(0,Math.min(1,1-(s.reloadEnd-t)/w.reload)):0;
+ const dip=Math.sin(reload*Math.PI),y=p.yaw||0,pi=(p.pitch||0)+shot*(s.equipped==='ak'?.17:.12)+dip*.32;
  const R=[Math.cos(y),0,Math.sin(y)],U=[-Math.sin(y)*Math.sin(pi),Math.cos(pi),Math.cos(y)*Math.sin(pi)],B=[-Math.sin(y)*Math.cos(pi),-Math.sin(pi),Math.cos(y)*Math.cos(pi)];
- const eye=gunEye(p),aim=gunDirection(y,p.pitch||0),block=physicsWorld.castRay(new RAPIER.Ray(eye,aim),.9,true,undefined,undefined,undefined,undefined,staticGeometry);
- const reach=block?Math.max(.12,Math.min(.46,block.timeOfImpact-.30)):.46;
+ const eye=gunEye(p),aim=gunDirection(y,p.pitch||0),block=physicsWorld.castRay(new RAPIER.Ray(eye,aim),1.5,true,undefined,undefined,undefined,undefined,staticGeometry);
+ const reach=block?Math.max(w.muzzle+.12,Math.min(.46,block.timeOfImpact+w.muzzle-.10)):.46;
  const origin=[eye.x+R[0]*.17-U[0]*(.20-dip*.08)-B[0]*(reach-shot*.035),eye.y+R[1]*.17-U[1]*(.20-dip*.08)-B[1]*(reach-shot*.035),eye.z+R[2]*.17-U[2]*(.20-dip*.08)-B[2]*(reach-shot*.035)];
  return {reload,shot,point:(x,y,z)=>origin.map((v,i)=>v+R[i]*x+U[i]*y+B[i]*z),normal:(x,y,z)=>R.map((v,i)=>v*x+U[i]*y+B[i]*z)};
 }
@@ -14745,7 +14853,7 @@ function gunBox(out,pose,x,y,z,w,h,d,col){
   const normal=pose.normal(...n);for(const k of [0,1,2,0,2,3])out.push(...ps[ids[k]],...normal,...col);
  }
 }
-function gunModel(out,p){
+function gunGlockModel(out,p){
  const pose=gunPose(p),box=(x,y,z,w,h,d,c)=>gunBox(out,pose,x,y,z,w,h,d,c),metal=[.18,.20,.22],poly=[.065,.073,.082];
  box(0,.035,-pose.shot*.024,.055,.055,.235,metal);box(0,-.002,0,.054,.024,.22,poly);
  box(0,-.081,.07,.05,.15,.065,poly);box(0,.026,-.123,.026,.027,.018,[.025,.025,.027]);
@@ -14762,17 +14870,50 @@ function gunModel(out,p){
  box(-.038,-.063-magDrop*.5,.029,.046,.057,.096,[.115,.12,.13]);
  if(pose.shot>.45){box(0,.025,-.19,.07*pose.shot,.07*pose.shot,.12,[1,.65,.13]);box(0,.025,-.23,.025,.025,.15,[1,.94,.57]);}
 }
+function gunCylinder(out,pose,x,y,z,r,len,color){
+ const points=[];for(let i=0;i<10;i++){const a=i*Math.PI/5;points.push([x+Math.cos(a)*r,y+Math.sin(a)*r]);}
+ const emit=(p,n)=>out.push(...pose.point(...p),...pose.normal(...n),...color);
+ for(let i=0;i<10;i++){const j=(i+1)%10,a=points[i],b=points[j],angle=(i+.5)*Math.PI/5,n=[Math.cos(angle),Math.sin(angle),0];
+  for(const q of [[a[0],a[1],z-len/2],[b[0],b[1],z-len/2],[b[0],b[1],z+len/2],[a[0],a[1],z-len/2],[b[0],b[1],z+len/2],[a[0],a[1],z+len/2]])emit(q,n);
+  for(const sign of [-1,1]){const edge=sign===1?[a,b]:[b,a];emit([x,y,z+sign*len/2],[0,0,sign]);for(const p of edge)emit([p[0],p[1],z+sign*len/2],[0,0,sign]);}
+ }
+}
+function gunAKModel(out,p){
+ const pose=gunPose(p),box=(x,y,z,w,h,d,c)=>gunBox(out,pose,x,y,z,w,h,d,c),metal=[.11,.125,.14],steel=[.23,.25,.27],wood=[.40,.19,.065],dark=[.045,.05,.06];
+ box(0,.015,-.09,.074,.093,.29,metal);box(0,.073,-.075,.070,.027,.26,steel);
+ box(0,-.058,.055,.061,.15,.073,dark);box(0,-.028,.20,.067,.085,.22,wood);box(0,-.075,.335,.077,.16,.062,wood);box(0,-.075,.37,.080,.16,.012,dark);
+ box(0,.018,-.315,.078,.078,.17,wood);box(0,.065,-.318,.062,.035,.16,[.30,.12,.04]);
+ for(let i=0;i<4;i++)box(.041,.055,-.25-i*.037,.008,.035,.010,dark);
+ gunCylinder(out,pose,0,.025,-.505,.018,.29,steel);gunCylinder(out,pose,0,.070,-.46,.014,.18,metal);
+ gunCylinder(out,pose,0,.025,-.68,.025,.075,dark);gunCylinder(out,pose,0,.025,-.720,.010,.004,[.004,.005,.006]);
+ box(0,.075,-.615,.027,.095,.036,metal);box(-.018,.119,-.615,.009,.032,.021,steel);box(.018,.119,-.615,.009,.032,.021,steel);box(0,.117,-.615,.007,.026,.01,dark);
+ box(0,.110,-.195,.052,.035,.031,metal);box(.052,.025,-.045,.058,.014,.028,steel);
+ box(-.029,-.084,-.018,.012,.045,.092,metal);box(.029,-.084,-.018,.012,.045,.092,metal);box(0,-.106,-.018,.065,.012,.092,metal);box(0,-.08,-.014,.012,.045,.009,steel);
+ const drop=pose.reload?Math.sin(pose.reload*Math.PI)*.25:0;
+ // Segmented arc gives the AK its characteristic curved magazine silhouette.
+ for(let i=0;i<3;i++){
+  const angle=-.10-i*.16-drop*.7,cy=-.075-i*.064-drop,cz=-.137-i*.018;
+  const sub={point:(x,y,z)=>pose.point(x,cy+y*Math.cos(angle)-z*Math.sin(angle),cz+y*Math.sin(angle)+z*Math.cos(angle)),normal:(x,y,z)=>pose.normal(x,y*Math.cos(angle)-z*Math.sin(angle),y*Math.sin(angle)+z*Math.cos(angle))};
+  gunBox(out,sub,0,0,0,.051,.075,.105,dark);for(const side of [-1,1])gunBox(out,sub,side*.027,0,0,.003,.061,.073,[.17,.18,.19]);
+ }
+ box(.015,-.08,.106,.08,.075,.10,[.13,.14,.15]);box(.02,-.14,.17,.08,.085,.17,[.42,.27,.18]);
+ box(-.016,-.045-drop*.25,-.30,.10,.065,.11,[.13,.14,.15]);box(-.055,-.096-drop*.15,-.21,.074,.082,.16,[.42,.27,.18]);
+ if(pose.shot>.4){box(0,.025,-.775,.11*pose.shot,.09*pose.shot,.14,[1,.60,.12]);box(0,.025,-.81,.025,.025,.19,[1,.96,.63]);}
+}
+function gunModel(out,p){if(gunState(p).equipped==='ak')gunAKModel(out,p);else gunGlockModel(out,p);}
 function renderGuns(mapCamera){
+ gunDrawDecals(mapCamera);
  const out=[];
+ if(!mapCamera)gunImpactMesh(out);
  if(!mapCamera)glassShardMesh(out);
  if(multiplayer){for(const p of netPlayers.values())if(p.alive!==false){
   const local=p.id===localPeerId;if(local&&!mapCamera&&(playerDead||spectatorActive))continue;
   gunModel(out,local?{...p,x:px,z:pz,feetY:playerFeetY,yaw,pitch,crouch:playerCrouchAmount}:netRenderPlayer(p));
  }}else if(!playerDead&&!spectatorActive)gunModel(out,{id:localPeerId,x:px,z:pz,feetY:playerFeetY,yaw,pitch,crouch:playerCrouchAmount,gun:gunLocal});
  const now=gunNow();
- for(let i=gunTraces.length-1;i>=0;i--){const e=gunTraces[i],age=now-e.at;if(age>.16){gunTraces.splice(i,1);continue;}
+ for(let i=gunTraces.length-1;i>=0;i--){const e=gunTraces[i],age=now-e.at;if(age>Math.max(.22,Math.hypot(e.end.x-e.from.x,e.end.y-e.from.y,e.end.z-e.from.z)/(WEAPONS[e.weapon]?.visualSpeed||520)+.06)){gunTraces.splice(i,1);continue;}
   const a=e.from,b=e.end,dx=b.x-a.x,dy=b.y-a.y,dz=b.z-a.z,len=Math.hypot(dx,dy,dz)||1;
-  const center=Math.min(len,age*750),start=Math.max(0,center-4),end=Math.min(len,center+.4);
+  const center=Math.min(len,age*(WEAPONS[e.weapon]?.visualSpeed||520)),start=Math.max(0,center-4),end=Math.min(len,center+.4);
   const B=[dx/len,dy/len,dz/len],R=Math.abs(B[1])>.95?[1,0,0]:[B[2],0,-B[0]],rl=Math.hypot(...R);for(let k=0;k<3;k++)R[k]/=rl;
   const U=[B[1]*R[2]-B[2]*R[1],B[2]*R[0]-B[0]*R[2],B[0]*R[1]-B[1]*R[0]],c=[a.x+B[0]*(start+end)/2,a.y+B[1]*(start+end)/2,a.z+B[2]*(start+end)/2];
   const pose={point:(x,y,z)=>c.map((v,k)=>v+R[k]*x+U[k]*y+B[k]*z),normal:(x,y,z)=>R.map((v,k)=>v*x+U[k]*y+B[k]*z)};
@@ -14783,10 +14924,13 @@ function renderGuns(mapCamera){
  gl.bindBuffer(gl.ARRAY_BUFFER,gunBuffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(out),gl.DYNAMIC_DRAW);bindUavBuffer(gunBuffer);
  gl.enable(gl.DEPTH_TEST);gl.depthMask(true);gl.enable(gl.CULL_FACE);gl.disable(gl.BLEND);gl.drawArrays(gl.TRIANGLES,0,out.length/9);
 }
-canvas.addEventListener('mousedown',e=>{if(e.button===0)gunFire();});
-addEventListener('keydown',e=>{if(e.code==='KeyR'&&!e.repeat){gunReload();}});
+canvas.addEventListener('mousedown',e=>{if(e.button===0){gunTrigger=true;gunFire();}});
+addEventListener('mouseup',e=>{if(e.button===0)gunTrigger=false;});
+addEventListener('blur',()=>gunTrigger=false);
+document.addEventListener('pointerlockchange',()=>{if(document.pointerLockElement!==canvas)gunTrigger=false;});
+addEventListener('keydown',e=>{if(e.repeat)return;if(e.code==='KeyR')gunReload();if(e.code==='Digit1')gunSwitch('ak');if(e.code==='Digit2')gunSwitch('glock');});
 
-const NET_PROTOCOL='gridlock-scoreboard-9';
+const NET_PROTOCOL='gridlock-arsenal-10';
 function netVersionError(){stopClientHandshakeRetry();clientHandshakeComplete=false;try{if(hostConn)hostConn.close();}catch(_){}showMainMenu();showMenuStatus('Game versions differ. Everyone must open the same updated HTML file.');}
 let netMoveSeq=0,netWorldSeq=0,netLastWorldSeq=-1,netCorrectionSeq=-1,netLocalEpoch=0,netMotionTimer=0;
 const netPoseHistory=new Map(),netLocalSamples=[];
@@ -14918,7 +15062,7 @@ function netApplyCorrection(msg){
 function netInstallTransport(conn){
  if(!conn||conn.gridlockFast||!conn.peerConnection)return;
  try{
-  const dc=conn.peerConnection.createDataChannel('gridlock-motion-9',{negotiated:true,id:2,ordered:false,maxRetransmits:0});conn.gridlockFast=dc;
+  const dc=conn.peerConnection.createDataChannel('gridlock-motion-10',{negotiated:true,id:2,ordered:false,maxRetransmits:0});conn.gridlockFast=dc;
   dc.onmessage=e=>{try{
    const msg=JSON.parse(e.data);if(!msg||typeof msg!=='object')return;
    if(isHost){if(conn.gridlockProtocol===NET_PROTOCOL&&msg.type==='playerState')handleHostMessage(conn,msg);}
