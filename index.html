@@ -383,7 +383,7 @@ const PLAYER_CROUCH_SPEED=9.0;
 const PLAYER_JUMP_SPEED=5.35;
 const PLAYER_GRAVITY=14.5;
 
-// Blue cylinder follower: no damage, no attack, no interaction. It only follows.
+// Blue cylinder survivor: follows or evades UAVs and can take gunfire damage.
 const FOLLOWER_RADIUS=0.30;
 const FOLLOWER_HEIGHT=1.70;
 const FOLLOWER_SPEED=3.65;
@@ -537,7 +537,7 @@ function makeEntityId(slot){return 1000+slot;}
 function makeStrokeId(){return localPeerId+'-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,7);}
 
 function isMenuOrTextInputActive(target=document.activeElement){
-  if(scoreboardOpen)return true;
+  if(routeChatOpen||scoreboardOpen)return true;
   if(!gameStarted)return true;
   if(!mainMenu.classList.contains('hidden'))return true;
 
@@ -579,6 +579,9 @@ function buildSpectatorTargets(){
       });
     }
   }else{
+    for(const p of routePlayers.values())if(p.alive){
+      out.push({key:'recording:'+p.record.id,kind:'RECORDING',label:p.name,recordingId:p.record.id});
+    }
     // Rebuild this list on every spectator click/resolve. P-spawned bots are
     // therefore immediately spectatable; no stale spawn-time target snapshot.
     if(
@@ -783,6 +786,10 @@ function getSpectatorCameraPose(){
     const jump=Math.max(0,Number(p.jumpOffset)||0);
     const centerHeight=1.02+(0.67-1.02)*crouch;
     center=[p.x,ground+centerHeight,p.z];
+  }else if(target.key.startsWith('recording:')){
+    const p=routePlayers.get(target.recordingId);
+    if(!p||!p.alive)return null;
+    center=[p.x,p.feetY+1.02+(0.67-1.02)*p.crouch,p.z];
   }else if(target.key.startsWith('npc:')){
     const a=survivorAgentById(target.npcId);
     if(!a||!survivorIsAlive(a))return null;
@@ -818,7 +825,12 @@ function getSpectatorCameraPose(){
   // Player/follower spectator cameras still stop at architecture instead of
   // freely orbiting through walls. UAV cameras are above the building and can
   // orbit freely in the sky.
-  if(kind!=='UAV')desired=spectatorSafeEye(center,desired);
+  if(kind==='RECORDING'&&physicsWorld){
+    const from={x:center[0],y:center[1],z:center[2]},delta={x:desired[0]-center[0],y:desired[1]-center[1],z:desired[2]-center[2]};
+    const hit=physicsWorld.castShape(from,PHYSICS_ROT,delta,new RAPIER.Ball(.12),.01,1,true,
+      undefined,undefined,undefined,undefined,staticGeometry);
+    if(hit){const t=Math.max(0,hit.time_of_impact-.005);desired=center.map((v,i)=>v+(desired[i]-v)*t);}
+  }else if(kind!=='UAV')desired=spectatorSafeEye(center,desired);
 
   const dx=center[0]-desired[0],dz=center[2]-desired[2];
   const cameraYaw=Math.atan2(dx,-dz);
@@ -839,7 +851,7 @@ function updateSpectatorHud(){
   }
 
   spectatorHud.innerHTML=spectatorFreecamActive
-    ? '<b>SPECTATOR FREECAM</b>'+
+    ? '<b>SPECTATOR FREECAM'+(routeUseMapFreecam()?' · MAP':'')+'</b>'+
       '<br>WASD move · Space/C up/down · Shift fast · Mouse look · Wheel speed · 0 target cam'
     : '<b>SPECTATING '+pose.label+'</b> · '+pose.kind+
       '<br>Mouse orbit · Left/Right click target · Wheel zoom · 0 freecam · V exit'+
@@ -2209,7 +2221,7 @@ function addTargetedGlowCapsule(p,scale=1.18){
 function rebuildTargetedPlayerGlowMesh(mapCamera){
   targetedPlayerGlowVerts.length=0;
 
-  if(!multiplayer||!worldGeometryReady){
+  if(!worldGeometryReady){
     targetedPlayerGlowVertexCount=0;
   }else{
     const targetedEntityIds=new Set();
@@ -2218,7 +2230,7 @@ function rebuildTargetedPlayerGlowMesh(mapCamera){
       if(d.targetId!=null)targetedEntityIds.add(Number(d.targetId));
     }
 
-    for(const p of netPlayers.values()){
+    for(const p of (multiplayer?netPlayers:routePlayers).values()){
       if(p.alive===false)continue;
       if(!targetedEntityIds.has(Number(p.entityId)))continue;
 
@@ -2226,7 +2238,7 @@ function rebuildTargetedPlayerGlowMesh(mapCamera){
       // with that rule. Tactical map renders every capsule including yourself.
       if(!mapCamera&&p.id===localPeerId)continue;
 
-      addTargetedGlowCapsule(netRenderPlayer(p),1.20);
+      addTargetedGlowCapsule(multiplayer?netRenderPlayer(p):p,1.20);
     }
 
     targetedPlayerGlowVertexCount=targetedPlayerGlowVerts.length/3;
@@ -2332,7 +2344,7 @@ function rebuildSinglePlayerMapCapsule(){
     alive:!dead,
     deathYaw:bodyYaw,
     deathT:dead?1:0,
-    color:{rgb:[1.0,0.92,0.02]}
+    color:{rgb:routeGhost?[.25,.88,1]:[1.0,0.92,0.02]}
   };
 
   // In single-player the multiplayer capsule scratch array is otherwise unused.
@@ -2545,6 +2557,19 @@ function updatePlayerNameLabels(mapCamera){
       p.z
     );
     if(!s||s.x<-80||s.x>innerWidth+80||s.y<-50||s.y>innerHeight+50){el.style.display='none';continue;}
+    // DOM labels have no depth test. Use the rendered camera (including spectator
+    // and map views) and the interpolated player pose to test actual map solids.
+    const eye={
+      x:-(view[0]*view[12]+view[1]*view[13]+view[2]*view[14]),
+      y:-(view[4]*view[12]+view[5]*view[13]+view[6]*view[14]),
+      z:-(view[8]*view[12]+view[9]*view[13]+view[10]*view[14])
+    };
+    const feet=networkPlayerFeetY(p);
+    const head={x:p.x,y:feet+(p.alive===false?.45:1.60-.58*crouch),z:p.z};
+    const tag={x:p.x,y:feet+(p.alive===false?.8:standingTagHeight),z:p.z};
+    if(!staticUavLosFromTo(eye,head)||!staticUavLosFromTo(eye,tag)){
+      el.style.display='none';continue;
+    }
     el.style.display='block';el.style.left=s.x+'px';el.style.top=s.y+'px';
   }
 }
@@ -7022,6 +7047,7 @@ function showMenuStatus(msg,bad=true){
 }
 function showMainMenu(){
   gameStarted=false;gameMode='menu';
+  routeRecording=null;routeGhost=false;routeStopPlayers();routeSetChat(false,false);routeHud();
   worldGeometryReady=false;
   clearAllGameKeys();
   clearPhysicalGameplayKeys();
@@ -8155,43 +8181,60 @@ function updateMultiplayerFrame(dt){
 let px=0,pz=0,yaw=0,pitch=0,locked=false,last=performance.now();
 const keys={};
 
-// Raw physical movement-key state is captured in the CAPTURE phase, before
-// menu text fields call stopPropagation(). This fixes the rapid menu->game race
-// where W/A/S/D could be pressed while the menu was still technically active
-// and therefore never generated a second keydown after gameplay began.
+// One capture-phase held-key source for gameplay, map and spectator movement.
+// Focus transitions invalidate held keys; releases always clear every consumer.
 const physicalGameplayKeys=new Set();
 const PHYSICAL_GAMEPLAY_CODES=new Set([
-  'KeyW','KeyA','KeyS','KeyD',
-  'ShiftLeft','ShiftRight',
-  'KeyC','Space'
+  'KeyW','KeyA','KeyS','KeyD','ShiftLeft','ShiftRight','KeyC','Space'
 ]);
-
 function capturePhysicalGameplayKeyDown(e){
-  if(PHYSICAL_GAMEPLAY_CODES.has(e.code))physicalGameplayKeys.add(e.code);
+  // Browser shortcuts may swallow keyup (especially Windows/Meta chords).
+  if(e.ctrlKey||e.altKey||e.metaKey){
+    clearPhysicalGameplayKeys();clearAllGameKeys();return;
+  }
+  if(!PHYSICAL_GAMEPLAY_CODES.has(e.code))return;
+  if(isMenuOrTextInputActive(e.target)||document.hidden){
+    physicalGameplayKeys.delete(e.code);return;
+  }
+  physicalGameplayKeys.add(e.code);
+  e.preventDefault();
 }
 function capturePhysicalGameplayKeyUp(e){
-  if(PHYSICAL_GAMEPLAY_CODES.has(e.code))physicalGameplayKeys.delete(e.code);
-}
-function clearPhysicalGameplayKeys(){
-  physicalGameplayKeys.clear();
-}
-function syncGameplayKeysFromPhysicalState(){
-  const gameplayOwnsKeyboard=
-    gameStarted &&
-    mainMenu.classList.contains('hidden') &&
-    !mapOpen &&
-    !spectatorActive &&
-    !playerDead &&
-    !isMenuOrTextInputActive(document.activeElement);
-
-  for(const code of PHYSICAL_GAMEPLAY_CODES){
-    keys[code]=gameplayOwnsKeyboard && physicalGameplayKeys.has(code);
+  physicalGameplayKeys.delete(e.code);
+  if(e.code in keys)keys[e.code]=false;
+  if(e.code in mapKeys)mapKeys[e.code]=false;
+  if(e.code==='MetaLeft'||e.code==='MetaRight'){
+    clearPhysicalGameplayKeys();clearAllGameKeys();
   }
 }
-
-// Capture phase is intentional: input/textarea key handlers later stop bubbling.
+function clearPhysicalGameplayKeys(){physicalGameplayKeys.clear();}
+function syncGameplayKeysFromPhysicalState(){
+  const ownsKeyboard=!document.hidden&&!isMenuOrTextInputActive(document.activeElement);
+  const gameplayOwnsKeyboard=ownsKeyboard&&!mapOpen&&!spectatorActive&&!playerDead;
+  for(const code of PHYSICAL_GAMEPLAY_CODES){
+    keys[code]=gameplayOwnsKeyboard&&physicalGameplayKeys.has(code);
+  }
+  for(const code in mapKeys){
+    mapKeys[code]=ownsKeyboard&&mapOpen&&physicalGameplayKeys.has(code);
+  }
+}
 window.addEventListener('keydown',capturePhysicalGameplayKeyDown,true);
 window.addEventListener('keyup',capturePhysicalGameplayKeyUp,true);
+// A key pressed in one focus context must not remain held in another.
+document.addEventListener('focusin',()=>{
+  clearPhysicalGameplayKeys();clearAllGameKeys();
+});
+canvas.setAttribute('tabindex','-1');
+canvas.addEventListener('pointerdown',()=>{
+  if(!gameStarted||routeChatOpen||scoreboardOpen||!mainMenu.classList.contains('hidden'))return;
+  if(document.activeElement!==canvas)canvas.focus({preventScroll:true});
+});
+window.addEventListener('focus',()=>{
+  clearPhysicalGameplayKeys();clearAllGameKeys();
+});
+window.addEventListener('pagehide',()=>{
+  clearPhysicalGameplayKeys();clearAllGameKeys();
+});
 
 let playerCrouchAmount=0;
 let playerVerticalOffset=0;
@@ -9059,6 +9102,7 @@ function pathCellsToFollowerWaypoints(cells){
 
 function makeSurvivorBrain(id,label,color,primary=false){
   return {
+    hp:100,
     id,label,color,primary,
     alive:true,
     x:0,z:0,baseY:FLOOR_TOP,
@@ -13370,7 +13414,7 @@ function uavHasLineOfSight(drone,entity){
 function currentUavEntities(){
   return Array.from(uavEntities.values())
     .filter(e=>e&&e.isAlive&&e.isAlive())
-    .sort((a,b)=>scorePriority(a)-scorePriority(b)||Number(a.id)-Number(b.id));
+    .sort(routeCompareUavTargets);
 }
 
 function updateUavStatusHud(){
@@ -13471,7 +13515,7 @@ function updateUavKillFlash(dt){
   uavKillFlash.style.opacity=String(opacity);
 }
 function updateLavaHazard(){
-  if(playerDead||!usingElevatedTurretTileset())return;
+  if(playerDead||routeGhost||!usingElevatedTurretTileset())return;
   if(!lavaGapAtWorld(px,pz))return;
 
   const feet=playerAbsoluteFeetY();
@@ -13486,6 +13530,7 @@ function updateLavaHazard(){
 }
 
 function beginPlayerDeath(killerId){
+  if(routeBecomeGhost(killerId))return;
   if(playerDead)return;
   playerDead=true;
 
@@ -13632,7 +13677,7 @@ function resetUavEntityRegistryForMode(){
       y:playerSurfaceYAt(px,pz)+playerVerticalOffset+localPlayerTargetHeight(),
       z:pz
     }),
-    ()=>!playerDead,
+    ()=>!playerDead&&!routeGhost,
     drone=>beginPlayerDeath(drone.id)
   );
   registerUavEntity(2,'npc','BLUE MAN',
@@ -13651,6 +13696,7 @@ function resetUavEntityRegistryForMode(){
       drone=>killExtraSurvivorByUav(a.id,drone)
     );
   }
+  routeRegisterPlayers();
 }
 function resetUavSystemForMap(){
   uavDrones=[];uavElapsed=0;uavSpawnGrace=UAV_SPAWN_GRACE_SEC;
@@ -13977,6 +14023,7 @@ function updateGeneratorHud(){
     : 'WASD move · Shift sprint · C crouch · Space jump · M map · left click draw · right click erase';
 }
 function loadBuildingSeed(forcedSeed,allowFollower){
+  routeMapChanging(Number(forcedSeed)>>>0);
   worldGeometryReady=false;
   resetDeathForNewMap();
 
@@ -14184,6 +14231,7 @@ function renderWorldWithCamera(mapCamera,mapVisual){
   // after the tactical map is closed.
   renderPersistentMapDrawings();
 
+  if(!multiplayer)renderTargetedPlayerGlow(mapCamera);
   renderNetPlayers(mapCamera);
 
   if(mapCamera){
@@ -14193,6 +14241,8 @@ function renderWorldWithCamera(mapCamera,mapVisual){
 
   renderFollower(mapCamera);
   renderExtraSurvivors();
+  routeRender();
+  renderGhostHeldGun();
 
   if(mapCamera&&mapOverlayVertexCount){
     gl.useProgram(prog);
@@ -14216,7 +14266,9 @@ function renderWorldWithCamera(mapCamera,mapVisual){
   }
 }
 function frame(now){
-  const dt=Math.min(0.10,Math.max(0,(now-last)/1000));last=now;
+  let dt=Math.min(0.10,Math.max(0,(now-last)/1000));last=now;
+  if(!multiplayer&&(routeChatOpen||document.hidden))dt=0;
+  routeHud();
 
   if(!gameStarted){
     gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
@@ -14230,10 +14282,12 @@ function frame(now){
   syncGameplayKeysFromPhysicalState();
 
   updatePlayerPhysics(dt);
+  routeTick(dt);
   updateLavaHazard();
   if(!playerDead&&playerFeetY<outsideGroundY()-12)beginPlayerDeath("FALL");
   glassFlush();
   gunUpdate();
+  routeHud();
   updateMultiplayerFrame(dt);
   scoreTick(dt);
   updateUavs(dt);
@@ -14268,7 +14322,8 @@ function frame(now){
       spectatorCameraPose=pose;
       perspective(proj,75*Math.PI/180,canvas.width/canvas.height,0.08,260);
       lookAt(view,pose.eye,pose.center,[0,1,0]);
-      renderWorldWithCamera(false,false);
+      const tacticalFreecam=routeUseMapFreecam();
+      renderWorldWithCamera(tacticalFreecam,tacticalFreecam);
       updatePlayerNameLabels(false);
       updateSpectatorHud();
 
@@ -14312,7 +14367,7 @@ function frame(now){
 
 addEventListener('keydown',e=>{
   // Text typed into menu fields must NEVER leak into M/N/WASD/Space shortcuts.
-  if(isMenuOrTextInputActive(e.target))return;
+  if(isMenuOrTextInputActive(e.target)||e.ctrlKey||e.altKey||e.metaKey)return;
 
   if(!multiplayer&&e.code==='KeyL'){
     e.preventDefault();
@@ -14445,7 +14500,7 @@ addEventListener('keydown',e=>{
     }
 
     if(e.code in mapKeys){
-      mapKeys[e.code]=true;
+      // Held state comes from capture-phase input, including releases in menus.
       e.preventDefault();
     }
     return;
@@ -14592,6 +14647,7 @@ document.addEventListener('pointerlockchange',()=>{
   locked=document.pointerLockElement===canvas;
   overlay.style.display='none';
   if(locked)resumeUavAudio();
+  else if(!mapOpen){clearPhysicalGameplayKeys();clearAllGameKeys();}
 });
 
 window.addEventListener('blur',()=>{
@@ -14656,6 +14712,19 @@ function gunTrace(o,d,shooter,weapon='glock'){
  let remaining=BULLETS[w.bullet].penetration,damage=w.damage,walls=0;
  let victim=null,victimDistance=w.range;
  for(const p of netPlayers.values())if(p.id!==shooter&&p.alive!==false){const t=gunCapsuleHit(o,d,p);if(t<victimDistance){victim=p;victimDistance=t;}}
+ // NPCs share the same nearest-hit and penetration trace as players.
+ for(const a of allSurvivorAgents()){
+  const p={npc:a,x:survivorX(a),z:survivorZ(a),feetY:survivorBaseYOf(a)};
+  const t=gunCapsuleHit(o,d,p,FOLLOWER_HEIGHT,FOLLOWER_RADIUS);
+  if(t<victimDistance){victim=p;victimDistance=t;}
+ }
+ if(!multiplayer)for(const p of routePlayers.values())if(p.alive&&p.id!==shooter){
+  const t=gunCapsuleHit(o,d,p);if(t<victimDistance){victim={...p,replay:p};victimDistance=t;}
+ }
+ if(!multiplayer&&shooter!==localPeerId&&String(shooter).startsWith('route:')&&!playerDead&&!routeGhost){
+  const p={id:localPeerId,livePlayer:true,x:px,z:pz,feetY:playerFeetY,crouch:playerCrouchAmount};
+  const t=gunCapsuleHit(o,d,p);if(t<victimDistance){victim=p;victimDistance=t;}
+ }
  const point=t=>({x:o.x+d.x*t,y:o.y+d.y*t,z:o.z+d.z*t});
  for(let step=0;step<12;step++){
   const hit=physicsWorld.castRayAndGetNormal(new RAPIER.Ray(o,d),w.range,true,undefined,undefined,undefined,undefined,
@@ -14752,8 +14821,7 @@ function gunPredict(msg){const s=gunSelf();s.pending.push({...msg,reloadEnd:gunN
 }
 function gunEye(p){const c=Math.max(0,Math.min(1,p.crouch||0));return {x:p.x,y:networkPlayerFeetY(p)+PLAYER_EYE+(PLAYER_CROUCH_EYE-PLAYER_EYE)*c,z:p.z};}
 function gunDirection(y,p){return {x:Math.sin(y)*Math.cos(p),y:Math.sin(p),z:-Math.cos(y)*Math.cos(p)};}
-function gunCapsuleHit(o,d,p){
- const h=PLAYER_CAPSULE_HEIGHT+(PLAYER_CROUCH_CAPSULE_HEIGHT-PLAYER_CAPSULE_HEIGHT)*(p.crouch||0),r=PLAYER_RADIUS;
+function gunCapsuleHit(o,d,p,h=PLAYER_CAPSULE_HEIGHT+(PLAYER_CROUCH_CAPSULE_HEIGHT-PLAYER_CAPSULE_HEIGHT)*(p.crouch||0),r=PLAYER_RADIUS){
  const bottom=networkPlayerFeetY(p)+r,top=networkPlayerFeetY(p)+h-r;
  const ox=o.x-p.x,oz=o.z-p.z;let nearest=Infinity;
  const A=d.x*d.x+d.z*d.z,B=2*(ox*d.x+oz*d.z),C=ox*ox+oz*oz-r*r;
@@ -14780,6 +14848,40 @@ function gunEvent(e){
  if(e.shooter!==localPeerId){gunFlashes.set(e.shooter,gunNow());gunSound(true,e.weapon);}
  if(e.shooter===localPeerId&&e.hit)gunHitUntil=gunNow()+.16;
 }
+// Shared live-scene shot resolution for players and recorded actors.
+function gunShootWorld(p,id,seq){
+ const s=gunState(p),w=WEAPONS[s.equipped];
+ const eye=gunEye(p),direction=gunDirection(p.yaw,p.pitch),aim=gunTrace(eye,direction,id,s.equipped);
+ const muzzle=gunPose(p,false).point(0,.025,w.muzzle);let origin={x:muzzle[0],y:muzzle[1],z:muzzle[2]};
+ const mount={x:origin.x-eye.x,y:origin.y-eye.y,z:origin.z-eye.z};
+ if(physicsWorld.castRay(new RAPIER.Ray(eye,mount),1,true,undefined,undefined,undefined,undefined,staticGeometry))origin=eye;
+ const delta={x:aim.end.x-origin.x,y:aim.end.y-origin.y,z:aim.end.z-origin.z},length=Math.hypot(delta.x,delta.y,delta.z)||1;
+ const d={x:delta.x/length,y:delta.y/length,z:delta.z/length},hit=gunTrace(origin,d,id,s.equipped);
+ if(hit.pane)glassBreakAuthority(hit.pane.id,hit.end);
+ if(hit.target){
+  const a=hit.target.npc,replay=hit.target.replay;
+  if(replay){
+   replay.gun.hp=Math.max(0,replay.gun.hp-hit.damage);
+   if(replay.gun.hp<=0)routeKill(replay,p.name||'PLAYER');
+  }else if(a){
+   a.hp=Math.max(0,(a.hp??100)-hit.damage);
+   if(a.hp<=0){
+    const killer={id:p.name||'PLAYER',x:p.x,z:p.z};
+    nav3Pending.delete(a.id);
+    if(a.primary)killFollowerByUav(killer);else killExtraSurvivorByUav(a.id,killer);
+   }
+  }else if(hit.target.livePlayer){
+   gunLocal.hp=Math.max(0,gunLocal.hp-hit.damage);
+   if(gunLocal.hp<=0){beginPlayerDeath(p.name);if(!routeGhost)addDeathFeed('YOU',p.name);}
+  }else{
+   const victim=gunState(hit.target);victim.hp=Math.max(0,victim.hp-hit.damage);
+   if(victim.hp<=0)hostKillNetworkPlayer(hit.target.id,p.name||w.name);
+  }
+ }
+ const e={type:'gunShot',generation:mapGeneration,shooter:id,seq,weapon:s.equipped,from:origin,end:hit.end,hit:!!hit.target,walls:hit.walls,damage:hit.target?hit.damage:0,impacts:hit.impacts,gun:gunPack(p)};
+ gunEvent(e);if(multiplayer){broadcastHost(e);hostBroadcastWorld();}return e;
+}
+
 function gunAuthority(id,msg){
  if(multiplayer&&!isHost)return false;
  const p=multiplayer?netPlayers.get(id):{id:localPeerId,x:px,z:pz,feetY:playerFeetY,crouch:playerCrouchAmount,alive:!playerDead,gun:gunLocal};
@@ -14788,24 +14890,15 @@ function gunAuthority(id,msg){
  if(!Number.isSafeInteger(msg.seq)||msg.seq<=s.lastSeq)return false;s.lastSeq=msg.seq;
  const ack=()=>{if(multiplayer)broadcastHost({type:'gunStateUpdate',generation:mapGeneration,shooter:id,gun:gunPack(p)});};
  if(msg.type==='gunSwitch'){
-  s.reloadEnd=0;s.equipped=msg.weapon;s.nextShot=Math.max(s.nextShot,gunNow()+.20);ack();return true;
+  s.reloadEnd=0;s.equipped=msg.weapon;s.nextShot=Math.max(s.nextShot,gunNow()+.20);routeRecordAction(msg,p);ack();return true;
  }
  if(msg.weapon!==s.equipped){ack();return false;}const w=WEAPONS[s.equipped];
  if(msg.type==='gunReload'){
-  if(!s.reloadEnd&&s.ammo<w.mag)s.reloadEnd=gunNow()+w.reload;ack();return true;
+  if(!s.reloadEnd&&s.ammo<w.mag){s.reloadEnd=gunNow()+w.reload;routeRecordAction(msg,p);}ack();return true;
  }
  if(!Number.isFinite(msg.yaw)||!Number.isFinite(msg.pitch)||Math.abs(msg.pitch)>1.5||s.reloadEnd||s.ammo<=0||gunNow()+.004<s.nextShot){ack();return false;}
  s.ammo--;s.nextShot=gunNow()+w.interval;p.yaw=msg.yaw;p.pitch=msg.pitch;
- const eye=gunEye(p),direction=gunDirection(p.yaw,p.pitch),aim=gunTrace(eye,direction,id,s.equipped);
- const muzzle=gunPose(p,false).point(0,.025,w.muzzle);let origin={x:muzzle[0],y:muzzle[1],z:muzzle[2]};
- const mount={x:origin.x-eye.x,y:origin.y-eye.y,z:origin.z-eye.z};
- if(physicsWorld.castRay(new RAPIER.Ray(eye,mount),1,true,undefined,undefined,undefined,undefined,staticGeometry))origin=eye;
- const delta={x:aim.end.x-origin.x,y:aim.end.y-origin.y,z:aim.end.z-origin.z},length=Math.hypot(delta.x,delta.y,delta.z)||1;
- const d={x:delta.x/length,y:delta.y/length,z:delta.z/length},hit=gunTrace(origin,d,id,s.equipped);
- if(hit.pane)glassBreakAuthority(hit.pane.id,hit.end);
- if(hit.target){const victim=gunState(hit.target);victim.hp=Math.max(0,victim.hp-hit.damage);if(victim.hp<=0)hostKillNetworkPlayer(hit.target.id,p.name||w.name);}
- const e={type:'gunShot',generation:mapGeneration,shooter:id,seq:msg.seq,weapon:s.equipped,from:origin,end:hit.end,hit:!!hit.target,walls:hit.walls,damage:hit.target?hit.damage:0,impacts:hit.impacts,gun:gunPack(p)};
- gunEvent(e);if(multiplayer){broadcastHost(e);hostBroadcastWorld();}return true;
+ routeRecordAction(msg,p);gunShootWorld(p,id,msg.seq);return true;
 }
 function gunFire(){
  if(!gameStarted||playerDead||mapOpen||spectatorActive||!locked||isMenuOrTextInputActive())return;
@@ -14901,6 +14994,32 @@ function gunAKModel(out,p){
  if(pose.shot>.4){box(0,.025,-.775,.11*pose.shot,.09*pose.shot,.14,[1,.60,.12]);box(0,.025,-.81,.025,.025,.19,[1,.96,.63]);}
 }
 function gunModel(out,p){if(gunState(p).equipped==='ak')gunAKModel(out,p);else gunGlockModel(out,p);}
+// Separate translucent pass keeps the live ghost's item from fading replay guns,
+// bullet tracers or map effects. Draw after all opaque actors and glass.
+const ghostGunBuffer=gl.createBuffer(),ghostGunProg=gl.createProgram();
+gl.attachShader(ghostGunProg,shader(gl.VERTEX_SHADER,uavVs));
+gl.attachShader(ghostGunProg,shader(gl.FRAGMENT_SHADER,uavFs.replace('0.42*d),1.0)', '0.42*d),0.32)')));
+gl.linkProgram(ghostGunProg);
+if(!gl.getProgramParameter(ghostGunProg,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(ghostGunProg));
+const ghostGunPos=gl.getAttribLocation(ghostGunProg,'aPos'),ghostGunNormal=gl.getAttribLocation(ghostGunProg,'aNormal'),ghostGunColor=gl.getAttribLocation(ghostGunProg,'aColor');
+const ghostGunProj=gl.getUniformLocation(ghostGunProg,'uProj'),ghostGunView=gl.getUniformLocation(ghostGunProg,'uView');
+function renderGhostHeldGun(){
+ if(multiplayer||!routeGhost||playerDead||spectatorActive)return;
+ const out=[];gunModel(out,{id:localPeerId,x:px,z:pz,feetY:playerFeetY,yaw,pitch,crouch:playerCrouchAmount,gun:gunLocal});
+ gl.useProgram(ghostGunProg);gl.uniformMatrix4fv(ghostGunProj,false,proj);gl.uniformMatrix4fv(ghostGunView,false,view);
+ gl.bindBuffer(gl.ARRAY_BUFFER,ghostGunBuffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(out),gl.DYNAMIC_DRAW);
+ for(const [loc,offset] of [[ghostGunPos,0],[ghostGunNormal,12],[ghostGunColor,24]]){gl.enableVertexAttribArray(loc);gl.vertexAttribPointer(loc,3,gl.FLOAT,false,36,offset);}
+ gl.enable(gl.DEPTH_TEST);gl.enable(gl.CULL_FACE);gl.disable(gl.BLEND);
+ // Only the nearest gun surface blends, so overlapping model parts do not build
+ // up into an opaque silhouette. Scene color behind the gun remains untouched.
+ gl.colorMask(false,false,false,false);gl.depthMask(true);gl.depthFunc(gl.LESS);
+ gl.drawArrays(gl.TRIANGLES,0,out.length/9);
+ gl.colorMask(true,true,true,true);gl.depthMask(false);gl.depthFunc(gl.EQUAL);
+ gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
+ gl.drawArrays(gl.TRIANGLES,0,out.length/9);
+ gl.disable(gl.BLEND);gl.depthMask(true);gl.depthFunc(gl.LESS);
+}
+
 function renderGuns(mapCamera){
  gunDrawDecals(mapCamera);
  const out=[];
@@ -14909,7 +15028,7 @@ function renderGuns(mapCamera){
  if(multiplayer){for(const p of netPlayers.values())if(p.alive!==false){
   const local=p.id===localPeerId;if(local&&!mapCamera&&(playerDead||spectatorActive))continue;
   gunModel(out,local?{...p,x:px,z:pz,feetY:playerFeetY,yaw,pitch,crouch:playerCrouchAmount}:netRenderPlayer(p));
- }}else if(!playerDead&&!spectatorActive)gunModel(out,{id:localPeerId,x:px,z:pz,feetY:playerFeetY,yaw,pitch,crouch:playerCrouchAmount,gun:gunLocal});
+ }}else if(!playerDead&&!spectatorActive&&!routeGhost)gunModel(out,{id:localPeerId,x:px,z:pz,feetY:playerFeetY,yaw,pitch,crouch:playerCrouchAmount,gun:gunLocal});
  const now=gunNow();
  for(let i=gunTraces.length-1;i>=0;i--){const e=gunTraces[i],age=now-e.at;if(age>Math.max(.22,Math.hypot(e.end.x-e.from.x,e.end.y-e.from.y,e.end.z-e.from.z)/(WEAPONS[e.weapon]?.visualSpeed||520)+.06)){gunTraces.splice(i,1);continue;}
   const a=e.from,b=e.end,dx=b.x-a.x,dy=b.y-a.y,dz=b.z-a.z,len=Math.hypot(dx,dy,dz)||1;
@@ -15306,6 +15425,393 @@ addEventListener('keydown',e=>{
  if(e.code==='Tab'&&gameStarted&&multiplayer&&!text&&mainMenu.classList.contains('hidden')){e.preventDefault();e.stopImmediatePropagation();if(!e.repeat)scoreSetOpen(!scoreboardOpen);}
  else if(e.code==='Escape'&&scoreboardOpen){e.preventDefault();e.stopImmediatePropagation();scoreSetOpen(false);}
 },true);
+
+// Session-only, seed-scoped movement recordings. Playback bodies have no colliders
+// and are never submitted to the autonomous survivor planner.
+const routeRecordings=new Map(),routePlayers=new Map();
+let routeSeed=null,routeRecording=null,routeGhost=false,routeChatOpen=false,routeNextEntity=1000000;
+const ROUTE_STRIDE=8,routeBuffer=gl.createBuffer();
+const routeStyle=document.createElement('style');
+routeStyle.textContent=`
+#routeChat{position:fixed;left:18px;bottom:145px;width:min(510px,calc(100vw - 36px));z-index:1250;background:rgba(7,15,22,.96);border:1px solid #59d9d0;border-radius:9px;padding:12px;color:#e6ffff;font:14px system-ui;display:none}
+#routeLog{max-height:220px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.45;margin-bottom:9px}#routeLog>div{margin-bottom:5px}
+#routeInput{box-sizing:border-box;width:100%;background:#102936;border:1px solid #64bcbe;border-radius:5px;color:white;padding:10px;font:15px monospace}#routeChat small{display:block;margin-top:7px;color:#a7b8c4}
+#routeNotice{position:fixed;left:18px;bottom:152px;max-width:min(510px,calc(100vw - 36px));max-height:36vh;overflow:hidden;white-space:pre-wrap;overflow-wrap:anywhere;z-index:1190;pointer-events:none;background:rgba(7,15,22,.9);border-left:3px solid #59d9d0;padding:10px;color:#e6ffff;font:13px/1.4 system-ui;display:none}
+#routeStatus{position:fixed;left:18px;bottom:108px;max-width:calc(100vw - 36px);z-index:1100;color:#b3e9e8;background:rgba(4,15,20,.85);padding:6px 10px;border-radius:5px;font:13px system-ui;pointer-events:none;display:none}
+#routeGhostDeath{position:fixed;top:32%;left:50%;transform:translate(-50%,-50%);z-index:1300;max-width:90vw;padding:14px 22px;border:1px solid rgba(125,234,255,.65);border-radius:8px;background:rgba(3,19,29,.86);color:#c8f7ff;text-align:center;font:600 clamp(20px,3vw,32px) system-ui;pointer-events:none;display:none}
+#routeGhostFrame{position:fixed;inset:0;z-index:900;pointer-events:none;box-shadow:inset 0 0 70px rgba(30,225,255,.25);border:3px solid rgba(89,224,255,.45);display:none}
+.routeLabel{position:fixed;transform:translate(-50%,-100%);z-index:105;pointer-events:none;background:rgba(0,12,20,.8);border:1px solid;border-radius:4px;padding:3px 6px;color:white;font:12px system-ui;white-space:nowrap}
+`;
+document.head.appendChild(routeStyle);
+const routeChat=document.createElement('div');routeChat.id='routeChat';routeChat.setAttribute('role','dialog');routeChat.setAttribute('aria-label','Single-player command chat');
+routeChat.innerHTML='<div id="routeLog" role="log" aria-live="polite"></div><input id="routeInput" autocomplete="off" spellcheck="false" aria-label="Chat command" placeholder="/record 1"><small>Enter: submit & return to game · Simulation pauses while typing</small>';
+document.body.appendChild(routeChat);
+const routeInput=document.getElementById('routeInput'),routeLog=document.getElementById('routeLog');
+const routeNameLayer=document.createElement('div');routeNameLayer.id='routeNameLayer';routeNameLayer.style.cssText='position:fixed;inset:0;z-index:17;pointer-events:none;overflow:hidden';document.body.appendChild(routeNameLayer);
+const routeStatus=document.createElement('div');routeStatus.id='routeStatus';document.body.appendChild(routeStatus);
+const routeGhostFrame=document.createElement('div');routeGhostFrame.id='routeGhostFrame';document.body.appendChild(routeGhostFrame);
+const routeNotice=document.createElement('div');routeNotice.id='routeNotice';document.body.appendChild(routeNotice);let routeNoticeUntil=0;
+function routeSay(message){
+ routeNotice.textContent=message;routeNoticeUntil=performance.now()+8000;
+ const row=document.createElement('div');row.textContent=message;routeLog.appendChild(row);
+ while(routeLog.children.length>60)routeLog.children[0].remove();
+ routeLog.scrollTop=routeLog.scrollHeight;
+}
+function routeSetChat(open,restore=true){
+ routeChatOpen=!!open&&!multiplayer&&gameStarted;
+ routeChat.style.display=routeChatOpen?'block':'none';clearPhysicalGameplayKeys();clearAllGameKeys();gunTrigger=false;
+ if(routeChatOpen){
+  // Keyboard focus can move to the chat input while canvas pointer lock stays on.
+  routeInput.value='/';routeInput.focus({preventScroll:true});
+  if(routeInput.setSelectionRange)routeInput.setSelectionRange(1,1);
+ }else{
+  if(document.activeElement===routeInput)routeInput.blur();
+  if(restore&&gameStarted&&mainMenu.classList.contains('hidden')){
+   canvas.focus({preventScroll:true});
+   if(!mapOpen&&!playerDead&&!spectatorActive&&document.pointerLockElement!==canvas){try{const p=canvas.requestPointerLock();if(p?.catch)p.catch(()=>{});}catch(_){}}
+  }
+ }
+}
+function routeKey(id){return /^\d+$/.test(id||'')?id.replace(/^0+(?=\d)/,''):null;}
+function routeSnapshot(t){return [t,px,playerFeetY,pz,yaw,pitch,playerCrouchAmount,gunSelf().equipped==='glock'?1:0];}
+function routeSample(force=false){
+ const r=routeRecording;if(!r)return;
+ const n=r.frames.length;
+ if(!force&&n&&r.time-r.frames[n-ROUTE_STRIDE]<1/60-1e-7)return;
+ const sample=routeSnapshot(r.time);
+ if(n&&Math.abs(r.frames[n-ROUTE_STRIDE]-r.time)<1e-8)r.frames.splice(n-ROUTE_STRIDE,ROUTE_STRIDE,...sample);
+ else r.frames.push(...sample);
+}
+function routeStart(id,name=''){
+ if(routeRecording){routeSay('Finish the current route with /endrecording first.');return false;}
+ if(playerDead||spectatorActive){routeSay('Press T to respawn before starting a recording.');return false;}
+ routeSeed=seed;routeGhost=false;
+ routeResetOrbit();
+ routeRecording={id,name:name?safeName(name):'Recording #'+id,seed,time:0,frames:[],actions:[],initialGun:gunPack({gun:gunSelf()}),synced:routeSyncEnabled,ghostAt:null,start:routeSnapshot(0)};
+ routeShowOthers();
+ routeSample(true);
+ if(mapOpen)setMapVisible(false);
+ routeSay('Recording #'+id+'. /endrecording saves it and returns you to its start. UAV death becomes ghost mode.');return true;
+}
+const routeGhostDeath=document.createElement('div');routeGhostDeath.id='routeGhostDeath';routeGhostDeath.textContent='Your current recording has died';document.body.appendChild(routeGhostDeath);let routeGhostDiedUntil=0;
+function routeBecomeGhost(killer){
+ if(multiplayer||!routeRecording)return false;
+ if(!routeGhost){
+  routeGhost=true;routeRecording.ghostAt=routeRecording.time;routeGhostDiedUntil=performance.now()+1000;
+  routeSay('Ghost at '+routeRecording.time.toFixed(2)+'s ('+killer+'). Keep moving; the rest of the route is still recording.');
+  for(const d of uavDrones)if(d.targetId===1){d.targetId=null;d.glare=0;}
+ }
+ return true;
+}
+function routeEnd(){
+ if(!routeRecording){routeSay('No recording is running.');return false;}
+ routeSample(true);const r=routeRecording;
+ const saved={id:r.id,name:r.name,seed:r.seed,duration:r.time,frames:new Float64Array(r.frames),actions:r.actions,initialGun:r.initialGun,synced:r.synced,ghostAt:r.ghostAt};
+ routeRecordings.set(r.id,saved);routeRecording=null;routeGhost=false;
+ // Return the live player to the route's starting pose without resetting the map,
+ // replay squad, glass, decals, UAV orbit or other survivors.
+ const s=r.start;px=s[1];pz=s[3];yaw=s[4];pitch=s[5];playerCrouchAmount=s[6];resetPlayerPhysics(s[2]);gunSelf().hp=100;
+ for(const d of uavDrones){d.timers.set(1,UAV_TIME_MAX);if(d.targetId===1){d.targetId=null;d.glare=0;}}
+ routeSay('Saved #'+r.id+' · '+r.time.toFixed(2)+'s. Returned to start. Use /playrecord '+r.id+' or /playall.');return true;
+}
+function routeRemovePlayer(key){
+ const p=routePlayers.get(key);if(!p)return;
+ unregisterUavEntity(p.entityId);p.labelElement?.remove();routePlayers.delete(key);gunFlashes.delete(p.id);gunSeenEvents.delete(p.id);
+ deathMarkers=deathMarkers.filter(m=>m.peerId!==p.id);rebuildDeathMarkerMesh();
+ for(const d of uavDrones){d.timers.delete(p.entityId);if(d.targetId===p.entityId){d.targetId=null;d.glare=0;}}
+}
+function routeStopPlayers(){for(const key of [...routePlayers.keys()])routeRemovePlayer(key);}
+function routeKill(p,killer='UAV'){
+ if(!p.alive)return;
+ p.alive=false;p.gun.hp=0;p.deathT=0;p.deathYaw=p.yaw;
+ addDeathMarker({peerId:p.id,x:p.x,z:p.z,yaw:p.yaw,name:p.name,npc:true,color:p.color.rgb});
+ addDeathFeed(p.name,killer);
+}
+function routeRegister(p){
+ registerUavEntity(p.entityId,'npc',p.name,
+  ()=>p.alive?{x:p.x,y:p.feetY+(PLAYER_EYE+(PLAYER_CROUCH_EYE-PLAYER_EYE)*p.crouch)*.82,z:p.z}:null,
+  ()=>p.alive,drone=>routeKill(p,drone.id));
+ uavEntities.get(p.entityId).recordingKey=p.record.id;
+}
+function routeRegisterPlayers(){if(!multiplayer)for(const p of routePlayers.values())routeRegister(p);}
+function routeApplyPose(p,t){
+ const f=p.record.frames,last=f.length-ROUTE_STRIDE;t=Math.min(p.record.duration,Math.max(0,t));
+ while(p.cursor+ROUTE_STRIDE<=last&&f[p.cursor+ROUTE_STRIDE]<=t)p.cursor+=ROUTE_STRIDE;
+ const i=p.cursor,j=Math.min(last,i+ROUTE_STRIDE),span=f[j]-f[i],u=span>0?Math.max(0,Math.min(1,(t-f[i])/span)):0;
+ const lerp=k=>f[i+k]+(f[j+k]-f[i+k])*u;
+ p.x=lerp(1);p.feetY=lerp(2);p.z=lerp(3);p.yaw=lerp(4);p.pitch=lerp(5);p.crouch=lerp(6);
+ p.gun.equipped=f[i+7]===1?'glock':'ak';
+}
+function routeSpawn(record){
+ routeRemovePlayer(record.id);
+ const entityId=routeNextEntity++,color=playerColorForSlot(entityId-1000000);
+ const p={id:'route:'+entityId,entityId,name:record.name||'Recording #'+record.id,record,cursor:0,actionCursor:0,shotSeq:0,reloadTimes:{ak:0,glock:0},time:0,alive:true,finished:false,deathT:0,gun:gunCreateState(),color};
+ routeApplyPose(p,0);routeReadGun(p,record.initialGun,0);routePlayers.set(record.id,p);routeRegister(p);routeDeprioritizeSelf();
+ return p;
+}
+function routePlay(id){
+ const r=routeRecordings.get(id);
+ if(!r||r.seed!==seed){routeSay('No recording #'+id+' for this map. Use /recordings to list saved routes.');return false;}
+ if(routeRecording){
+  if(id===routeRecording.id){routeSay('This is the route you are currently recording.');return false;}
+  routeShowRecordings=true;routeSeek(routeSpawn(r),routeRecording.time);
+ }else{
+  if(routeSyncEnabled){const other=[...routePlayers.values()].filter(p=>p.record.id!==id).map(p=>p.record);routeStopPlayers();routeResetOrbit();for(const record of other)routeSpawn(record);}
+  routeSpawn(r);
+ }
+ routeSay('Playing #'+id+(routeSyncEnabled?' · shared UAV timing.':'.'));return true;
+}
+function routePlayAll(){
+ const records=[...routeRecordings.values()].filter(r=>r.seed===seed&&r.id!==routeRecording?.id);
+ if(!records.length){routeSay('No recordings for this map yet. Start with /record 1.');return false;}
+ routeStopPlayers();if(!routeRecording)routeResetOrbit();
+ for(const r of records){const p=routeSpawn(r);if(routeRecording)routeSeek(p,routeRecording.time);}
+ if(routeRecording)routeShowRecordings=true;
+ routeSay('Started all '+records.length+' routes together.');return true;
+}
+function routeMapChanging(nextSeed){
+ const changed=routeSeed!==null&&routeSeed!==nextSeed;
+ routeRecording=null;routeGhost=false;routeStopPlayers();routeSetChat(false,false);
+ if(changed){routeRecordings.clear();routeSay('New map seed: prior recordings cleared.');}
+ routeSeed=nextSeed;
+}
+function routeRender(){
+ if(multiplayer||!worldGeometryReady||!routePlayers.size)return;
+ netPlayerVerts.length=0;
+ const eye={x:-(view[0]*view[12]+view[1]*view[13]+view[2]*view[14]),y:-(view[4]*view[12]+view[5]*view[13]+view[6]*view[14]),z:-(view[8]*view[12]+view[9]*view[13]+view[10]*view[14])};
+ for(const p of routePlayers.values()){
+  addNetCapsule(p);if(p.alive){routeUpdateGun(p);gunModel(netPlayerVerts,p);}
+  if(!p.labelElement){p.labelElement=document.createElement('div');p.labelElement.className='playerNameTag';routeNameLayer.appendChild(p.labelElement);}
+  const el=p.labelElement,head={x:p.x,y:p.feetY+(p.alive?1.6-.58*p.crouch:.45),z:p.z},tag={x:p.x,y:p.feetY+(p.alive?1.95-.67*p.crouch:.8),z:p.z};
+  const screen=projectWorldToScreen(tag.x,tag.y,tag.z);
+  const visible=screen&&screen.x>=-80&&screen.x<=innerWidth+80&&screen.y>=-50&&screen.y<=innerHeight+50&&staticUavLosFromTo(eye,head)&&staticUavLosFromTo(eye,tag);
+  el.style.display=visible?'block':'none';
+  if(visible){el.textContent=(p.alive?'':'☠ ')+p.name;el.style.left=screen.x+'px';el.style.top=screen.y+'px';el.style.borderColor=p.color.css;}
+ }
+ gl.bindBuffer(gl.ARRAY_BUFFER,routeBuffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(netPlayerVerts),gl.DYNAMIC_DRAW);
+ gl.useProgram(uavProg);gl.uniformMatrix4fv(uavProjLoc,false,proj);gl.uniformMatrix4fv(uavViewLoc,false,view);bindUavBuffer(routeBuffer);
+ gl.enable(gl.DEPTH_TEST);gl.depthMask(true);gl.enable(gl.CULL_FACE);gl.disable(gl.BLEND);gl.drawArrays(gl.TRIANGLES,0,netPlayerVerts.length/9);
+}
+function routeHud(){
+ const show=gameStarted&&!multiplayer&&worldGeometryReady;
+ routeNameLayer.style.display=show?'block':'none';
+ routeStatus.style.display=show?'block':'none';routeGhostFrame.style.display=show&&routeGhost?'block':'none';
+ routeGhostDeath.style.display=show&&routeGhost&&performance.now()<routeGhostDiedUntil?'block':'none';
+ routeNotice.style.display=show&&!routeChatOpen&&performance.now()<routeNoticeUntil?'block':'none';
+ if(!show)return;
+ const alive=[...routePlayers.values()].filter(p=>p.alive).length;
+ routeStatus.textContent=routeRecording
+  ?(routeGhost?'GHOST · ':'RECORDING · ')+routeRecording.name+' · '+routeRecording.time.toFixed(1)+'s · /endrecording'
+  :'/ command chat · '+routeRecordings.size+' saved · '+alive+'/'+routePlayers.size+' replays alive';
+ routeStatus.textContent+=' · SYNC '+(routeSyncEnabled?'ON':'OFF')+' · SHOW '+(routeShowRecordings?'ON':'OFF')+' · LAST '+(routeLastDuringPlay?'ON':'OFF');
+ if(routeGhost){document.getElementById('gunHealthText').textContent='GHOST · Recording continues';document.getElementById('gunHealthFill').style.background='#56dfff';}
+}
+function routeCancelTake(){
+ const r=routeRecording;if(!r)return;
+ routeRecording=null;routeGhost=false;
+ const s=r.start;px=s[1];pz=s[3];yaw=s[4];pitch=s[5];playerCrouchAmount=s[6];resetPlayerPhysics(s[2]);gunSelf().hp=100;
+ for(const d of uavDrones){d.timers.set(1,UAV_TIME_MAX);if(d.targetId===1){d.targetId=null;d.glare=0;}}
+}
+function routeDeleteRecording(id){
+ if(!routeRecordings.has(id)&&routeRecording?.id!==id&&!routePlayers.has(id)){routeSay('No recording #'+id+' to delete.');return false;}
+ if(routeRecording?.id===id)routeCancelTake();
+ routeRemovePlayer(id);routeRecordings.delete(id);routeSay('Deleted recording #'+id+'.');return true;
+}
+function routeDeleteAll(){
+ routeCancelTake();routeStopPlayers();routeRecordings.clear();routeSay('All recordings and replay bodies deleted.');return true;
+}
+function routeCommand(text){
+ if(multiplayer||!gameStarted)return false;
+ const parts=String(text).trim().split(/\s+/),cmd='/'+parts[0].replace(/^\//,'').toLowerCase(),id=routeKey(parts[1]);
+ if(cmd==='/deleterec'){
+  if(parts.length!==2||id===null){routeSay('Use /deleterec followed by a recording number.');return false;}
+  return routeDeleteRecording(id);
+ }
+ if(cmd==='/record'||cmd==='/playrecord'){
+  if(id===null||(cmd==='/playrecord'&&parts.length!==2)){routeSay('Use /record 1 optional name, or /playrecord 1.');return false;}
+  return cmd==='/record'?routeStart(id,parts.slice(2).join(' ')):routePlay(id);
+ }
+ if(parts.length!==1){routeSay('Unknown command. Use /help.');return false;}
+ if(cmd==='/lastduringplay')return routeToggleLast();
+ if(cmd==='/removenpcs')return routeRemoveNpcs();
+ if(cmd==='/sync')return routeToggleSync();
+ if(cmd==='/recordingshow')return routeToggleShow();
+ if(cmd==='/freecammap')return routeToggleFreecamMap();
+ if(cmd==='/deleteall')return routeDeleteAll();
+ if(cmd==='/endrecording')return routeEnd();
+ if(cmd==='/playall')return routePlayAll();
+ if(cmd==='/stopplayback'||cmd==='/stopplay'){routeStopPlayers();routeSay('Replay NPCs cleared. Saved routes kept.');return true;}
+ if(cmd==='/recordings'){
+  routeSay(routeRecordings.size?[...routeRecordings.values()].map(r=>'#'+r.id+' · '+(r.name||'Recording #'+r.id)+' · '+r.duration.toFixed(2)+'s · '+(r.actions||[]).filter(a=>a.type==='gunFire').length+' shots · '+(r.synced?'SYNC':'UNSYNC')+(r.ghostAt!==null?' · ghost at '+r.ghostAt.toFixed(2)+'s':'')).join('\n'):'No saved routes for this map.');return false;
+ }
+ if(cmd==='/help'||cmd==='/'){
+  routeSay('/record # [name] — start a named route\n/endrecording — save and return to start\n/playrecord # — start/restart one replay\n/playall — restart all routes together\n/stopplay — stop replays and clear their bodies\n/recordings — list routes\n/deleterec # — delete one recording\n/deleteall — delete all recordings\n/removenpcs — remove default AI survivors\n/sync — toggle shared UAV start timing\n/recordingshow — toggle other replays during recording\n/freecammap — toggle flat map style in dead freecam\n/lastduringplay — toggle live player last during playback\nReplays repeat movement and gun actions against the current scene. Same-seed resets keep saved routes; a different seed clears them.');return false;
+ }
+ routeSay('Unknown command. Use /help.');return false;
+}
+function routeInputKeyDown(e){
+ e.stopPropagation();
+ if(e.code==='Enter'){e.preventDefault();const value=routeInput.value;routeSay('> '+value);routeCommand(value);routeSetChat(false);}
+ else if(e.code==='Escape'){e.preventDefault();routeSetChat(false);}
+}
+routeInput.addEventListener('keydown',routeInputKeyDown);
+routeInput.addEventListener('keyup',e=>e.stopPropagation());
+addEventListener('keydown',e=>{
+ if(routeChatOpen)return;
+ if((e.code==='Slash'||e.key==='/')&&!e.repeat&&!e.ctrlKey&&!e.altKey&&!e.metaKey&&!multiplayer&&gameStarted&&!isMenuOrTextInputActive(e.target)){
+  e.preventDefault();e.stopImmediatePropagation();routeSetChat(true);
+ }
+},true);
+routeSay('Press / for commands. Try /record 1, then /endrecording and /playrecord 1. /help lists all commands.');
+
+// Replay gun actions use recorded times/aim, but never recorded victims or hits.
+let routeSyncEnabled=false,routeShowRecordings=true,routeFreecamMap=false,routeLastDuringPlay=false;
+function routeRecordAction(msg,p){
+ if(multiplayer||!routeRecording)return;
+ routeSample(true);
+ routeRecording.actions.push({time:routeRecording.time,type:msg.type,weapon:msg.weapon,
+  x:p.x,feetY:networkPlayerFeetY(p),z:p.z,yaw:p.yaw||0,pitch:p.pitch||0,crouch:p.crouch||0,
+  gun:gunPack(p)});
+}
+function routeReadGun(p,pack,time){
+ if(!pack)return;
+ p.gun.equipped=pack.equipped;
+ for(const id of Object.keys(WEAPONS)){
+  const s=pack.slots[id];if(!s)continue;
+  p.gun.slots[id].ammo=s.ammo;
+  p.reloadTimes[id]=s.reloadLeft>0?time+s.reloadLeft:0;
+ }
+ routeUpdateGun(p);
+}
+function routeUpdateGun(p){
+ for(const id of Object.keys(WEAPONS)){
+  const until=p.reloadTimes[id];
+  if(until&&p.time>=until){p.gun.slots[id].ammo=WEAPONS[id].mag;p.reloadTimes[id]=0;}
+  p.gun.slots[id].reloadEnd=p.reloadTimes[id]?gunNow()+Math.max(0,p.reloadTimes[id]-p.time):0;
+ }
+}
+function routeGunAction(p,action,fire=true){
+ if(!p.alive)return;
+ routeReadGun(p,action.gun,action.time);
+ if(action.type==='gunFire'&&fire){
+  // The muzzle uses the exact pose at the original shot, including frames where
+  // a quick turn fell between ordinary movement samples.
+  Object.assign(p,{x:action.x,feetY:action.feetY,z:action.z,yaw:action.yaw,pitch:action.pitch,crouch:action.crouch});
+  p.gun.equipped=action.weapon;gunShootWorld(p,p.id,++p.shotSeq);
+ }
+}
+function routeSeek(p,time){
+ p.time=Math.max(0,time);routeApplyPose(p,p.time);
+ const actions=p.record.actions||[];
+ while(p.actionCursor<actions.length&&actions[p.actionCursor].time<p.time-1e-8){
+  routeGunAction(p,actions[p.actionCursor++],false);
+ }
+ routeUpdateGun(p);p.finished=p.time>=p.record.duration;
+}
+function routeMoveActor(p,time){
+ if(!p.alive)return;
+ const previous={x:p.x,y:p.feetY,z:p.z},oldTime=p.time;
+ p.time=Math.max(0,time);routeApplyPose(p,p.time);routeUpdateGun(p);p.finished=p.time>=p.record.duration;
+ if(p.time>oldTime&&Math.hypot(p.x-previous.x,p.feetY-previous.y,p.z-previous.z)>1e-8){
+  const steps=Math.max(1,Math.ceil(Math.hypot(p.x-previous.x,p.feetY-previous.y,p.z-previous.z)/.15));
+  const height=PLAYER_CAPSULE_HEIGHT+(PLAYER_CROUCH_CAPSULE_HEIGHT-PLAYER_CAPSULE_HEIGHT)*p.crouch;
+  for(let k=1;k<=steps;k++){
+   const u=k/steps,q={x:previous.x+(p.x-previous.x)*u,y:previous.y+(p.feetY-previous.y)*u,z:previous.z+(p.z-previous.z)*u};
+   for(const pane of breakableGlass)if(!pane.broken&&glassTouches(pane,q,height,.02))glassBreakAuthority(pane.id,q);
+  }
+ }
+ if(usingElevatedTurretTileset()&&lavaGapAtWorld(p.x,p.z)&&p.feetY<=lavaSurfaceY()+.16)routeKill(p,'LAVA');
+ else if(p.feetY<outsideGroundY()-12)routeKill(p,'FALL');
+}
+function routeTick(dt){
+ if(multiplayer||!worldGeometryReady)return;
+ if(routeRecording&&dt>0){routeRecording.time+=dt;routeSample();}
+ const actors=[...routePlayers.values()],events=[];
+ for(const p of actors){
+  if(!p.alive){p.deathT=Math.min(1,p.deathT+dt/0.86);continue;}
+  routeUpdateGun(p);if(dt<=0)continue;
+  p.stepStart=p.time;p.stepEnd=p.time+dt;
+  const actions=p.record.actions||[];
+  while(p.actionCursor<actions.length&&actions[p.actionCursor].time<=p.stepEnd+1e-8){
+   const action=actions[p.actionCursor++];events.push({p,action,offset:Math.max(0,action.time-p.stepStart)});
+  }
+ }
+ // Advance all actors to each shot's time before finding its victim. This makes
+ // a moving replay's hitbox independent of frame rate and iteration order.
+ events.sort((a,b)=>a.offset-b.offset||routeCompareKeys(a.p.record.id,b.p.record.id));
+ for(const e of events){
+  for(const p of actors)if(p.alive)routeMoveActor(p,p.stepStart+e.offset);
+  if(e.p.alive)routeGunAction(e.p,e.action);
+ }
+ if(dt>0)for(const p of actors)if(p.alive)routeMoveActor(p,p.stepEnd);
+}
+function routeResetOrbit(){
+ if(!routeSyncEnabled)return;
+ uavElapsed=0;uavSpawnGrace=0;
+ for(const d of uavDrones){
+  d.timers.clear();d.targetId=null;d.glare=0;
+  if(d.stationary){d.x=d.cx;d.z=d.cz;}
+  else{d.x=d.cx+Math.cos(d.phase)*d.radius;d.z=d.cz+Math.sin(d.phase)*d.radius;d.yaw=d.phase+Math.PI/2;}
+ }
+ rebuildUavDynamicMeshes();updateUavStatusHud();
+}
+function routeToggleSync(){
+ if(routeRecording){routeSay('End this recording before changing /sync, so its UAV timing stays consistent.');return false;}
+ routeSyncEnabled=!routeSyncEnabled;
+ if(routeSyncEnabled){
+  const active=[...routePlayers.values()].map(p=>p.record);routeStopPlayers();routeResetOrbit();for(const r of active)routeSpawn(r);
+ }
+ routeSay('UAV sync '+(routeSyncEnabled?'ON. Each recording and playback starts at the same orbit phase with fresh targeting timers. Re-record older routes to match this timing.':'OFF. UAVs keep their current orbit when starting a take.'));
+ return true;
+}
+function routeCompareKeys(a,b){return a.length-b.length||(a<b?-1:a>b?1:0);}
+function routeTargetKey(e){return e.id===1&&routeRecording?routeRecording.id:e.recordingKey;}
+function routeCompareUavTargets(a,b){
+ if(multiplayer)return scorePriority(a)-scorePriority(b)||Number(a.id)-Number(b.id);
+ if(routeLastDuringPlay&&!routeRecording&&routePlayers.size){if(a.id===1&&b.id!==1)return 1;if(b.id===1&&a.id!==1)return -1;}
+ const ak=routeTargetKey(a),bk=routeTargetKey(b);
+ if(ak!=null&&bk!=null)return routeCompareKeys(ak,bk)||Number(a.id)-Number(b.id);
+ if(ak!=null)return 1;if(bk!=null)return -1;
+ return Number(a.id)-Number(b.id);
+}
+function routeShowOthers(time=0){
+ routeStopPlayers();if(!routeRecording||!routeShowRecordings)return;
+ for(const r of routeRecordings.values())if(r.seed===seed&&r.id!==routeRecording.id){
+  const p=routeSpawn(r);if(time>0)routeSeek(p,time);
+ }
+}
+function routeToggleShow(){
+ routeShowRecordings=!routeShowRecordings;
+ if(routeRecording)routeShowOthers(routeRecording.time);
+ routeSay('Other recordings '+(routeShowRecordings?'ON. They move, shoot, and attract UAVs during your takes.':'OFF during recording. They are removed from the scene and UAV target list.'));
+ return true;
+}
+function routeRemoveNpcs(){
+ const ids=new Set([2,...extraSurvivors.map(a=>a.id)]);
+ followerAlive=false;primarySurvivorBrain=null;extraSurvivors=[];followerWaypoints=[];followerWaypointIndex=0;
+ nav3Pending.clear();survivorGroupPlan=null;survivorGroupDecisionMade=false;
+ for(const id of ids){unregisterUavEntity(id);for(const d of uavDrones){d.timers.delete(id);if(d.targetId===id){d.targetId=null;d.glare=0;}}}
+ deathMarkers=deathMarkers.filter(m=>!String(m.peerId).startsWith('npc:'));
+ rebuildFollowerMesh();rebuildExtraSurvivorMesh();rebuildDeathMarkerMesh();
+ routeSay('Default AI survivors removed. Replay NPCs and saved recordings kept.');return true;
+}
+function routeUseMapFreecam(){return routeFreecamMap&&playerDead&&spectatorActive&&spectatorFreecamActive;}
+function routeToggleFreecamMap(){
+ routeFreecamMap=!routeFreecamMap;
+ if(routeFreecamMap&&playerDead){if(!spectatorActive)startSpectating(true);if(spectatorActive&&!spectatorFreecamActive)enterSpectatorFreecam();}
+ routeSay('Freecam map style '+(routeFreecamMap?'ON: flat map colors and map markers.':'OFF: normal textured view.'));
+ return true;
+}
+
+function routeDeprioritizeSelf(){
+ if(!routeLastDuringPlay||routeRecording||!routePlayers.size)return;
+ for(const d of uavDrones)if(d.targetId===1){d.targetId=null;d.glare=0;}
+}
+function routeToggleLast(){
+ routeLastDuringPlay=!routeLastDuringPlay;routeDeprioritizeSelf();
+ routeSay('Player last during playback '+(routeLastDuringPlay?'ON. UAVs prioritize the other actors while you watch. Recording takes keep their numbered priority.':'OFF. Normal player priority restored.'));
+ return true;
+}
 
 document.body.classList.add('menu-open');
 showMainMenu();
