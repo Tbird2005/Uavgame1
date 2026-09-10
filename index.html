@@ -7013,8 +7013,7 @@ function rebuildMesh(){
       if(upperDeckSurfaceExistsAt(cx,cz))addElevatedCenterSupport(cx,cz);
     }
     for(const access of exteriorRamps){
-      addExteriorLanding(access);
-      for(const ramp of access.ramps)addExteriorRamp(ramp);
+      addModularRamp(access);
     }
   }
   // Decorative/structural seam caps come last so their slightly wider faces cover
@@ -15085,7 +15084,7 @@ addEventListener('blur',()=>gunTrigger=false);
 document.addEventListener('pointerlockchange',()=>{if(document.pointerLockElement!==canvas)gunTrigger=false;});
 addEventListener('keydown',e=>{if(e.repeat)return;if(e.code==='KeyR')gunReload();if(e.code==='Digit1')gunSwitch('ak');if(e.code==='Digit2')gunSwitch('glock');});
 
-const NET_PROTOCOL='gridlock-stadium-23';
+const NET_PROTOCOL='gridlock-ramps-25';
 function netVersionError(){stopClientHandshakeRetry();clientHandshakeComplete=false;try{if(hostConn)hostConn.close();}catch(_){}showMainMenu();showMenuStatus('Game versions differ. Everyone must open the same updated HTML file.');}
 let netMoveSeq=0,netWorldSeq=0,netLastWorldSeq=-1,netCorrectionSeq=-1,netLocalEpoch=0,netMotionTimer=0;
 const netPoseHistory=new Map(),netLocalSamples=[];
@@ -15217,7 +15216,7 @@ function netApplyCorrection(msg){
 function netInstallTransport(conn){
  if(!conn||conn.gridlockFast||!conn.peerConnection)return;
  try{
-  const dc=conn.peerConnection.createDataChannel('gridlock-motion-23',{negotiated:true,id:2,ordered:false,maxRetransmits:0});conn.gridlockFast=dc;
+  const dc=conn.peerConnection.createDataChannel('gridlock-motion-25',{negotiated:true,id:2,ordered:false,maxRetransmits:0});conn.gridlockFast=dc;
   dc.onmessage=e=>{try{
    const msg=JSON.parse(e.data);if(!msg||typeof msg!=='object')return;
    if(isHost){if(conn.gridlockProtocol===NET_PROTOCOL&&msg.type==='playerState')handleHostMessage(conn,msg);}
@@ -15903,8 +15902,10 @@ function uavSetTtk(drones,value){
 }
 function uavSightAllowed(c,from,delta){
  if(!staticGeometry(c))return false;
+ const rule=uavSightRules.get(c.handle);
+ if(rule?.alwaysTransparent)return false;
  if(uavFunMode)return true;
- const rule=uavSightRules.get(c.handle);if(!rule)return true;
+ if(!rule)return true;
  if(rule.transparent)return false;
  // Clip the sight ray to the upper section of the solid. The render mesh and
  // swept player hull remain continuous: no seam or duplicate surface is added.
@@ -16219,12 +16220,18 @@ function stadiumFixedModel(d){
  const box=(...args)=>stadiumBox(out,shapes,pose,...args);
  const round=(r,lo,hi,c)=>stadiumPrism(out,shapes,pose,Array.from({length:16},(_,i)=>[r*Math.cos(i*Math.PI/8),r*Math.sin(i*Math.PI/8)]),lo,hi,c);
  // Preserve the accepted circular plinth and its below-ground implantation.
- round(.62,-.78,.40,[.32,.35,.36]);round(.70,-.035,.11,[.20,.23,.24]);round(.67,.18,.27,[.38,.41,.42]);round(.72,.40,.50,[.20,.23,.24]);round(.59,.50,.55,[.29,.31,.30]);
+ round(.62,-.78,.40,[.32,.35,.36]);round(.70,-.035,.11,[.20,.23,.24]);round(.67,.18,.27,[.38,.41,.42]);
+ // Only these plinth hulls participate in UAV sight. Upper structure and gun
+ // keep their player/bullet collision but never obstruct targeting rays.
+ for(const part of shapes)part.blocksUavSight=true;
+ // The raised lip and top trim are visible/physical only; the scanner at the
+ // front of the drum must be able to see upward past its own overhang.
+ round(.72,.40,.50,[.20,.23,.24]);round(.59,.50,.55,[.29,.31,.30]);
  // Two beveled uprights follow the SAME radius as the round base and canopy.
  // They are radial bars, not the corners of a rectangular cage.
  const supportProfile=[[.53,.53,.61],[.59,.49,.66],[1.79,.49,.66],[1.86,.53,.61]];
  for(const sign of [-1,1])stadiumRadialShell(out,shapes,pose,sign*Math.PI/2-.19,sign*Math.PI/2+.19,supportProfile,steel,3);
- // Curved rear armor leaves the gun bay open at the front, while blocking rear LOS.
+ // Curved rear armor leaves the gun bay open at the front.
  stadiumRadialShell(out,shapes,pose,Math.PI*.61,Math.PI*1.39,[[.54,.49,.58],[.60,.47,.64],[1.79,.47,.64],[1.85,.49,.58]],edge,12);
  // The mounting axle spans the two bars. A central fixed saddle supports the
  // limited yaw bearing; the receiver pivots on it rather than floating in space.
@@ -16269,11 +16276,13 @@ function stadiumCreateHulls(shapes){
   const desc=RAPIER.ColliderDesc.convexHull(new Float32Array(s.points.flat()));
   if(!desc)throw new Error('Invalid stadium turret hull');
   const c=physicsWorld.createCollider(desc.setTranslation(s.pose.x,s.pose.y,s.pose.z).setRotation(stadiumRotation(s.pose)).setFriction(0));
-  physicsStaticHandles.add(c.handle);return c;
+  physicsStaticHandles.add(c.handle);
+  if(!s.blocksUavSight)uavSightRules.set(c.handle,{alwaysTransparent:true,kind:'stadium-upper'});
+  return c;
  });
 }
 function stadiumRemoveEntry(entry){
- for(const c of entry.fixedColliders.concat(entry.gunColliders)){physicsStaticHandles.delete(c.handle);physicsWorld.removeCollider(c,false);}
+ for(const c of entry.fixedColliders.concat(entry.gunColliders)){physicsStaticHandles.delete(c.handle);uavSightRules.delete(c.handle);physicsWorld.removeCollider(c,false);}
 }
 function stadiumSyncGeometry(){
  if(!physicsWorld)return;
@@ -16319,7 +16328,145 @@ function stadiumCanAim(d,point){
  return Math.abs(angle)<=STADIUM_YAW_LIMIT+1e-8&&pitch>=STADIUM_PITCH_MIN-1e-8&&pitch<=STADIUM_PITCH_MAX+1e-8;
 }
 function uavTrackPoint(d,point,origin=uavScannerOrigin(d)){
- return stadiumCanAim(d,point)&&staticUavLosFromTo(origin,point);
+ // The invisible scanner works independently of the decorative gun mount.
+ // Mechanical animation stops must not impose an artificial sight cone.
+ return staticUavLosFromTo(origin,point);
+}
+
+// Modular exterior banks. The same planar tile pieces drive rendering,
+// capsule collision, surface heights, navigation and UAV cover.
+function bankPoint(a,u,y,v){return [a.doorX+a.outDx*u+a.sideX*v,y,a.doorZ+a.outDz*u+a.sideZ*v];}
+function bankDistance(a,u,v){
+ let dist=Infinity;for(const r of a.plateauRects)dist=Math.min(dist,Math.max(r[0]-u,0,u-r[1])+Math.max(r[2]-v,0,v-r[3]));return dist;
+}
+function bankHeight(a,u,v,clamp=true){const y=a.topY-(a.topY-a.bottomY)*bankDistance(a,u,v)/a.bankRun;return clamp?Math.max(a.bottomY,y):y;}
+function bankArea(poly){let n=0;for(let i=0;i<poly.length;i++){const p=poly[i],q=poly[(i+1)%poly.length];n+=p[0]*q[1]-q[0]*p[1];}return Math.abs(n)*.5;}
+function bankClip2(poly,axis,value,above){
+ const out=[];for(let i=0;i<poly.length;i++){
+  const p=poly[i],q=poly[(i+1)%poly.length],ap=above?p[axis]-value:value-p[axis],aq=above?q[axis]-value:value-q[axis];
+  if(ap>=-1e-9)out.push(p);if((ap>1e-9&&aq<-1e-9)||(ap<-1e-9&&aq>1e-9)){const t=ap/(ap-aq);out.push(p.map((v,k)=>v+(q[k]-v)*t));}
+ }return out;
+}
+function bankPolygonOverlap(a,b){
+ let poly=a;
+ // Convex clipping against each CCW edge of b.
+ let signed=0;for(let i=0;i<b.length;i++){const p=b[i],q=b[(i+1)%b.length];signed+=p[0]*q[1]-q[0]*p[1];}
+ const sign=signed>=0?1:-1;
+ for(let i=0;i<b.length&&poly.length;i++){
+  const p=b[i],q=b[(i+1)%b.length],side=r=>sign*((q[0]-p[0])*(r[1]-p[1])-(q[1]-p[1])*(r[0]-p[0])),next=[];
+  for(let j=0;j<poly.length;j++){const x=poly[j],y=poly[(j+1)%poly.length],sx=side(x),sy=side(y);if(sx>=-1e-8)next.push(x);if(sx*sy<0){const t=sx/(sx-sy);next.push(x.map((v,k)=>v+(y[k]-v)*t));}}
+  poly=next;
+ }return poly.length>=3&&bankArea(poly)>1e-5;
+}
+function bankPiece(a,top,ix,iz,part){
+ if(top.every(p=>p[1]<=a.bottomY+1e-7))return null;
+ const n=triNormal(...top.slice(0,3)),kind=Math.abs(n[0])<1e-7&&Math.abs(n[2])<1e-7?'deck':Math.abs(n[0])>1e-7&&Math.abs(n[2])>1e-7?'corner':'straight';
+ const foot=top.map(p=>{const q=bankPoint(a,p[0],p[1],p[2]);return [q[0],q[2]];});
+ return {id:ix+','+iz+':'+part,ix,iz,kind,top,foot,bounds:[Math.min(...foot.map(p=>p[0])),Math.max(...foot.map(p=>p[0])),Math.min(...foot.map(p=>p[1])),Math.max(...foot.map(p=>p[1]))],colliderHandles:[]};
+}
+function bankMake(exit,style,turn=1,compact=false){
+ const a={...exit,style,ramps:[],pieces:[],pieceCells:new Map(),modular:true};
+ const unit=exit.landing.width/2;a.unit=unit;a.bankRun=unit*Math.ceil((a.topY-a.bottomY)/(unit*.74));a.splitY=(a.topY+a.bottomY)*.5;
+ a.plateauRects=[[0,2*unit,-unit,unit]];
+ if(style==='corner-bank')a.plateauRects.push([2*unit,4*unit,-unit,unit],[2*unit,4*unit,turn>0?unit:-3*unit,turn>0?3*unit:-unit]);
+ const far=Math.max(...a.plateauRects.map(r=>r[1])),left=Math.min(...a.plateauRects.map(r=>r[2])),right=Math.max(...a.plateauRects.map(r=>r[3]));
+ const imin=Math.floor((left-a.bankRun)/unit),imax=Math.ceil((right+a.bankRun)/unit),umax=Math.ceil((far+a.bankRun)/unit);
+ for(let ix=0;ix<umax;ix++)for(let iz=imin;iz<imax;iz++){
+  if(compact&&ix<2&&(iz< -1||iz>=1))continue;
+  const top=[[ix,iz],[ix+1,iz],[ix+1,iz+1],[ix,iz+1]].map(([u,v])=>[u*unit,bankHeight(a,u*unit,v*unit,false),v*unit]);
+  const polygons=Math.abs(top[0][1]+top[2][1]-top[1][1]-top[3][1])<1e-7?[top]:[[top[0],top[1],top[2]],[top[0],top[2],top[3]]];
+  for(let k=0;k<polygons.length;k++){const poly=bankClean(bankClip2(polygons[k],1,a.bottomY,true));if(poly.length<3)continue;const p=bankPiece(a,poly,ix,iz,k);if(!p)continue;if(polygons.length>1&&p.kind!=='deck')p.kind='corner';a.pieces.push(p);const key=ix+','+iz;if(!a.pieceCells.has(key))a.pieceCells.set(key,[]);a.pieceCells.get(key).push(p);}
+ }
+ // Keep cardinal slope descriptors for existing route entry/drop planning.
+ // The sampled planes below remain authoritative at corners and the elbow.
+ const core=new Set();for(let ix=0;ix<umax;ix++)for(let iz=imin;iz<imax;iz++)if(bankDistance(a,(ix+.5)*unit,(iz+.5)*unit)<1e-7)core.add(ix+','+iz);
+ for(const key of core){const [ix,iz]=key.split(',').map(Number);for(const [du,dv] of [[1,0],[0,-1],[0,1]]){
+  if(core.has((ix+du)+','+(iz+dv)))continue;
+  const u=(ix+.5+du*.5)*unit,v=(iz+.5+dv*.5)*unit;
+  if(compact&&u<2*unit-.001&&dv)continue;
+  if([.25,.5,.75,1].some(t=>Math.abs(bankHeight(a,u+du*a.bankRun*t,v+dv*a.bankRun*t)-(a.topY+(a.bottomY-a.topY)*t))>.001))continue;
+  const p=bankPoint(a,u,a.topY,v);
+  a.ramps.push({x:p[0],z:p[2],dx:a.outDx*du+a.sideX*dv,dz:a.outDz*du+a.sideZ*dv,run:a.bankRun,widthTop:unit,widthBottom:unit,topY:a.topY,bottomY:a.bottomY,modular:true});
+ }}
+ a.bounds=[Math.min(...a.pieces.map(p=>p.bounds[0])),Math.max(...a.pieces.map(p=>p.bounds[1])),Math.min(...a.pieces.map(p=>p.bounds[2])),Math.max(...a.pieces.map(p=>p.bounds[3]))];
+ return a;
+}
+function bankValid(a,occupied){
+ for(const p of a.pieces){const b=p.bounds;for(let gz=Math.floor(b[2]/TILE);gz<=Math.floor(b[3]/TILE);gz++)for(let gx=Math.floor(b[0]/TILE);gx<=Math.floor(b[1]/TILE);gx++){
+  if(inb(gx,gz)&&isFloor(gx,gz)){
+   let q=p.foot;for(const [axis,value,above] of [[0,gx*TILE,true],[0,(gx+1)*TILE,false],[1,gz*TILE,true],[1,(gz+1)*TILE,false]])q=bankClip2(q,axis,value,above);
+   if(q.length>=3&&bankArea(q)>1e-5)return false;
+  }
+  for(const other of occupied.get(gx+','+gz)||[])if(bankPolygonOverlap(p.foot,other.foot))return false;
+ }}return a.ramps.length>0;
+}
+function bankOccupy(a,occupied){for(const p of a.pieces){const b=p.bounds;for(let gz=Math.floor(b[2]/TILE);gz<=Math.floor(b[3]/TILE);gz++)for(let gx=Math.floor(b[0]/TILE);gx<=Math.floor(b[1]/TILE);gx++){const key=gx+','+gz;if(!occupied.has(key))occupied.set(key,[]);occupied.get(key).push(p);}}}
+rebuildExteriorRamps=function(){
+ exteriorRamps=[];if(!usingElevatedTurretTileset())return;const occupied=new Map();
+ for(const k of externalDoorways){
+  const [ax,az,bx,bz]=parseEdge(k),aFloor=isFloor(ax,az),bFloor=isFloor(bx,bz);if(aFloor===bFloor)continue;
+  const ix=aFloor?ax:bx,iz=aFloor?az:bz,ox=aFloor?bx:ax,oz=aFloor?bz:az,outDx=ox-ix,outDz=oz-iz,sideX=-outDz,sideZ=outDx;
+  const {opening,offset}=openingProfile(doorways.get(k)||'single-center');let doorX=(ix+ox+1)*TILE*.5,doorZ=(iz+oz+1)*TILE*.5;if(ix!==ox)doorZ+=offset;else doorX+=offset;
+  const size=Math.max(opening+.48,2.35),exit={exitKey:k,doorX,doorZ,outDx,outDz,sideX,sideZ,topY:FLOOR_TOP,bottomY:outsideGroundY(),landing:{x:doorX+outDx*size/2,z:doorZ+outDz*size/2,width:size,depth:size}};
+  let hash=(seed>>>0)^0x6d2b79f5;for(let i=0;i<k.length;i++)hash=Math.imul(hash^k.charCodeAt(i),16777619);
+  hash=Math.imul(hash^(hash>>>16),0x85ebca6b);hash^=hash>>>13;
+  const turn=(hash&2)?1:-1,choices=(hash&1)?[['corner-bank',turn,false],['corner-bank',-turn,false],['straight-bank',1,false]]:[['straight-bank',1,false],['corner-bank',turn,false],['corner-bank',-turn,false]];
+  choices.push(['straight-bank',1,true]);
+  for(const [style,side,compact] of choices){const bank=bankMake(exit,style,side,compact);if(!bankValid(bank,occupied))continue;bank.compact=compact;exteriorRamps.push(bank);bankOccupy(bank,occupied);break;}
+ }
+};
+function bankTopAt(a,x,z){
+ const rx=x-a.doorX,rz=z-a.doorZ,u=rx*a.outDx+rz*a.outDz,v=rx*a.sideX+rz*a.sideZ,eps=1e-7;
+ const ix=Math.floor(u/a.unit),iz=Math.floor(v/a.unit);
+ for(const dx of [0,-1])for(const dz of [0,-1])for(const piece of a.pieceCells.get((ix+dx)+','+(iz+dz))||[]){
+  const poly=piece.top;
+  for(let i=1;i<poly.length-1;i++){
+   const p=poly[0],q=poly[i],r=poly[i+1],den=(q[2]-r[2])*(p[0]-r[0])+(r[0]-q[0])*(p[2]-r[2]);if(Math.abs(den)<eps)continue;
+   const s=((q[2]-r[2])*(u-r[0])+(r[0]-q[0])*(v-r[2]))/den,t=((r[2]-p[2])*(u-r[0])+(p[0]-r[0])*(v-r[2]))/den;
+   if(s>=-eps&&t>=-eps&&s+t<=1+eps)return s*p[1]+t*q[1]+(1-s-t)*r[1];
+  }
+ }return null;
+}
+landingSurfaceYAt=function(x,z){if(!usingElevatedTurretTileset())return null;for(const a of exteriorRamps){const y=bankTopAt(a,x,z);if(y!=null&&Math.abs(y-a.topY)<1e-6)return y;}return null;};
+rampSurfaceYAt=function(x,z){if(!usingElevatedTurretTileset())return null;for(const a of exteriorRamps){const y=bankTopAt(a,x,z);if(y!=null)return y;}return null;};
+function bankUnique(poly){const out=[];for(const p of poly)if(!out.some(q=>Math.hypot(...p.map((v,k)=>v-q[k]))<1e-7))out.push(p);return out;}
+function bankClean(poly){
+ const out=bankUnique(poly);let changed=true;
+ while(changed&&out.length>=3){changed=false;for(let i=0;i<out.length;i++){const a=out[(i+out.length-1)%out.length],b=out[i],c=out[(i+1)%out.length],u=b.map((v,k)=>v-a[k]),v=c.map((n,k)=>n-b[k]);if(Math.hypot(u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0])<1e-8){out.splice(i,1);changed=true;break;}}}return out;
+}
+function bankClipSolid(faces,y,above){
+ const out=[],cap=[];
+ for(const face of faces){const poly=[];for(let i=0;i<face.length;i++){
+  const p=face[i],q=face[(i+1)%face.length],ap=above?p[1]-y:y-p[1],aq=above?q[1]-y:y-q[1];
+  if(ap>=-1e-8)poly.push(p);if(ap*aq< -1e-16){const t=ap/(ap-aq),v=p.map((v,k)=>v+(q[k]-v)*t);poly.push(v);cap.push(v);}
+ }const clean=bankClean(poly);if(clean.length>=3)out.push(clean);}
+ const ring=bankUnique(cap);if(ring.length>=3){const cx=ring.reduce((s,p)=>s+p[0],0)/ring.length,cz=ring.reduce((s,p)=>s+p[2],0)/ring.length;ring.sort((a,b)=>Math.atan2(a[2]-cz,a[0]-cx)-Math.atan2(b[2]-cz,b[0]-cx));out.push(bankClean(ring));}
+ return out;
+}
+function bankPieceFaces(piece,bottom){
+ const top=piece.top,lo=top.map(p=>[p[0],bottom,p[2]]),faces=[top,lo];
+ for(let i=0;i<top.length;i++){const j=(i+1)%top.length,face=bankClean([lo[i],lo[j],top[j],top[i]]);if(face.length>=3)faces.push(face);}return faces;
+}
+function bankEmitSolid(a,piece,faces,tier){
+ const points=bankUnique(faces.flat());if(points.length<4||Math.max(...points.map(p=>p[1]))-Math.min(...points.map(p=>p[1]))<1e-7)return;
+ const center=[0,1,2].map(k=>points.reduce((s,p)=>s+p[k],0)/points.length),world=points.map(p=>bankPoint(a,p[0],p[1],p[2]));
+ if(physicsCapture){
+  const origin=bankPoint(a,...[center[0],center[1],center[2]]),local=new Float32Array(world.flatMap(p=>p.map((v,k)=>v-origin[k]))),desc=RAPIER.ColliderDesc.convexHull(local);
+  if(!desc)return;const collider=physicsWorld.createCollider(desc.setTranslation(...origin).setFriction(0));
+  if(tier==='lower'&&piece.kind!=='corner')uavSightRules.set(collider.handle,{transparent:true,kind:'ramp-lower-straight'});
+  piece.colliderHandles.push({handle:collider.handle,tier,blocksSight:tier==='upper'||piece.kind==='corner'});
+ }
+ const shade=((piece.ix+piece.iz)&1)? .018 : 0,light=tier==='upper'?.38:.285;
+ physicsCaptureDepth++;
+ try{for(let poly of faces){
+  if(poly.length<3)continue;let n=triNormal(...poly.slice(0,3));if(Math.hypot(...n)<.5)continue;
+  const c=[0,1,2].map(k=>poly.reduce((s,p)=>s+p[k],0)/poly.length);if(n.reduce((s,v,k)=>s+v*(c[k]-center[k]),0)<0){poly=poly.slice().reverse();n=triNormal(...poly.slice(0,3));}
+  const color=n[1]>.3?rampMapColor([light+shade,light+.015+shade,light+.035+shade]):[light*.77,light*.80,light*.85];
+  const ps=poly.map(p=>bankPoint(a,p[0],p[1],p[2]));if(ps.length===4)addQuadCol(...ps,color);else for(let i=1;i<ps.length-1;i++)addTriCol(ps[0],ps[i],ps[i+1],color);
+ }}finally{physicsCaptureDepth--;}
+}
+function addModularRamp(a){
+ for(const piece of a.pieces){piece.colliderHandles=[];const faces=bankPieceFaces(piece,a.bottomY);bankEmitSolid(a,piece,bankClipSolid(faces,a.splitY,false),'lower');bankEmitSolid(a,piece,bankClipSolid(faces,a.splitY,true),'upper');}
 }
 
 document.body.classList.add('menu-open');
