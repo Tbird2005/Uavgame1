@@ -91,6 +91,12 @@ body.map-open #spectatorHud,body.menu-open #spectatorHud{display:none!important}
     <button class="menuButton primary" id="singlePlayerBtn">Single Player</button>
     <button class="menuButton secondary" id="hostGameBtn">Host Multiplayer Game</button>
     <button class="menuButton" id="joinGameBtn">Join Game</button>
+    <details id="funOptions" style="margin-top:14px;color:#b9d5e2;font:12px/1.6 Arial,sans-serif">
+      <summary style="cursor:pointer">Funmode options</summary>
+      <label style="display:block;margin-top:8px"><input type="checkbox" id="swatVanOption" checked> SWAT van + ARGUS · 0.866s lock</label>
+      <label style="display:block"><input type="checkbox" id="funModeOption"> Funmode · all solid cover blocks UAV sight</label>
+      <div style="font-size:11px;color:#91a7b4">Default: realism. Vans, lower ramps and center supports under the raised floor do not block UAV sight. Single player / host settings.</div>
+    </details>
     <div id="menuFormArea" style="display:none">
       <div id="menuFormTitle"></div>
       <input class="menuField" id="displayNameInput" maxlength="20" placeholder="Display name" autocomplete="off">
@@ -1281,7 +1287,7 @@ function updateUavAudio(dt){
     //   outside -> audible
     //   exit-connected room/semantic area -> smoothly audible
     //   deeper room with no direct outside exit -> smoothly fades away
-    if(!flightWhirrAllowed){
+    if(!flightWhirrAllowed||d.stationary||!uavEnabled){
       n.flightGain.gain.setTargetAtTime(0,t,0.42);
     }else{
       const dist01=Math.max(0,1-Math.min(1,dist/420.0));
@@ -1321,8 +1327,8 @@ function updateUavAudio(dt){
       continue;
     }
 
-    const left=d.timers.get(d.targetId)??UAV_TIME_MAX;
-    const progress=Math.max(0,Math.min(1,1-left/UAV_TIME_MAX));
+    const left=d.timers.get(d.targetId)??uavTimeMax(d);
+    const progress=Math.max(0,Math.min(1,1-left/uavTimeMax(d)));
 
     const pulseHz=3.2+progress*8.5;
     const pulse=Math.sin((uavElapsed+n.phase)*Math.PI*2*pulseHz);
@@ -2567,7 +2573,7 @@ function updatePlayerNameLabels(mapCamera){
     const feet=networkPlayerFeetY(p);
     const head={x:p.x,y:feet+(p.alive===false?.45:1.60-.58*crouch),z:p.z};
     const tag={x:p.x,y:feet+(p.alive===false?.8:standingTagHeight),z:p.z};
-    if(!staticUavLosFromTo(eye,head)||!staticUavLosFromTo(eye,tag)){
+    if(!staticWorldLosFromTo(eye,head)||!staticWorldLosFromTo(eye,tag)){
       el.style.display='none';continue;
     }
     el.style.display='block';el.style.left=s.x+'px';el.style.top=s.y+'px';
@@ -2750,6 +2756,7 @@ function addUavBeam(a,b){
 
 function rebuildUavDynamicMeshes(){
   uavBodyVerts.length=0;
+  for(const n of swatVanVerts)uavBodyVerts.push(n);
   uavBeamVerts.length=0;
   uavConeVerts.length=0;
   uavSpotVerts.length=0;
@@ -2764,7 +2771,20 @@ function rebuildUavDynamicMeshes(){
     const eyePulse=Math.max(0,Math.min(1,d.glare||0));
     let origin=null;
 
-    if(d.turret){
+    if(d.argus){
+      const target=uavEntities.get(d.targetId)?.getPoint();
+      const heading=target?Math.atan2(target.z-d.z,target.x-d.x):d.yaw;
+      const pose={...d,yaw:heading};
+      const box=(x,y,z,sx,sy,sz,col)=>{const q=uavLocalToWorld(pose,x,y,z,0);addUavBox(...q,sx,sy,sz,heading,col);};
+      box(0,-.39,0,.58,.27,.76,[.10,.12,.13]);
+      box(0,-.12,0,.27,.35,.30,[.27,.29,.28]);
+      box(0,.05,0,.70,.36,.62,[.16,.19,.18]);
+      box(-.25,.27,0,.20,.12,.60,[.10,.12,.13]);
+      box(.58,.04,-.13,.88,.10,.10,[.25,.28,.27]);
+      box(.24,.13,.26,.20,.18,.20,[.055,.065,.07]);
+      box(.35,.13,.26,.025,.11,.12,[.85,.045,.025]);
+      origin={x:d.x,y:d.y,z:d.z};
+    }else if(d.turret){
       const bank=0;
       const addLocalBox=(lx,ly,lz,sx,sy,sz,col)=>{
         const center=uavLocalToWorld(d,lx,ly,lz,bank);
@@ -7184,19 +7204,22 @@ function applyPlayerSnapshot(list,preserveSelf=true){
   if(multiplayer&&uavDrones.length)resetUavEntityRegistryForMode();
 }
 function serializeUavs(){
-  return uavDrones.map(d=>({id:d.id,phase:d.phase,cx:d.cx,cz:d.cz,radius:d.radius,y:d.y,x:d.x,z:d.z,yaw:d.yaw,stationary:!!d.stationary,turret:!!d.turret,pitchDown:d.pitchDown||0,
+  return uavDrones.map(d=>({id:d.id,phase:d.phase,cx:d.cx,cz:d.cz,radius:d.radius,y:d.y,x:d.x,z:d.z,yaw:d.yaw,stationary:!!d.stationary,turret:!!d.turret,argus:!!d.argus,ttk:uavTimeMax(d),pitchDown:d.pitchDown||0,
     targetId:d.targetId,glare:d.glare,timers:[...d.timers.entries()]}));
 }
 function applyUavSnapshot(data){
   if(!data)return;
+  uavApplyRules(data.rules);
   uavElapsed=Number(data.elapsed)||0;uavSpawnGrace=Number(data.grace)||0;
   if(Array.isArray(data.drones)){
     for(let i=0;i<data.drones.length;i++){
       const s=data.drones[i];let d=uavDrones[i];
       if(!d){d={id:s.id,phase:s.phase,cx:s.cx,cz:s.cz,radius:s.radius,y:s.y,x:s.x,z:s.z,yaw:s.yaw,stationary:!!s.stationary,turret:!!s.turret,pitchDown:s.pitchDown||0,targetId:null,timers:new Map(),glare:0};uavDrones[i]=d;}
-      d.id=s.id;d.phase=s.phase;d.cx=s.cx;d.cz=s.cz;d.radius=s.radius;d.y=s.y;d.x=s.x;d.z=s.z;d.yaw=s.yaw;d.stationary=!!s.stationary;d.turret=!!s.turret;d.pitchDown=s.pitchDown||0;d.targetId=s.targetId;d.glare=s.glare||0;d.timers=new Map(s.timers||[]);
+      d.argus=!!s.argus;d.ttk=Number(s.ttk);d.id=s.id;d.phase=s.phase;d.cx=s.cx;d.cz=s.cz;d.radius=s.radius;d.y=s.y;d.x=s.x;d.z=s.z;d.yaw=s.yaw;d.stationary=!!s.stationary;d.turret=!!s.turret;d.pitchDown=s.pitchDown||0;d.targetId=s.targetId;d.glare=s.glare||0;d.timers=new Map(s.timers||[]);
     }
+    uavDrones.length=data.drones.length;
   }
+  ensureUavAudioNodeCount();
   rebuildUavDynamicMeshes();updateUavStatusHud();
 }
 function serializeDrawings(){return mapDrawStrokes.map(s=>({id:s.strokeId||'',ownerId:s.ownerId||'single',points:s.map(p=>({x:p.x,z:p.z}))}));}
@@ -7614,7 +7637,7 @@ function applyRemoteDeath(msg){
   if(String(msg.peerId)===localPeerId)beginPlayerDeath(msg.killer);
   rebuildNetPlayerMesh();
 }
-function serializeWorldState(){return{type:'world',generation:mapGeneration,seq:++netWorldSeq,glass:glassSnapshot(),players:serializePlayers(),uav:{elapsed:uavElapsed,grace:uavSpawnGrace,drones:serializeUavs()}};}
+function serializeWorldState(){return{type:'world',generation:mapGeneration,seq:++netWorldSeq,glass:glassSnapshot(),players:serializePlayers(),uav:{elapsed:uavElapsed,grace:uavSpawnGrace,drones:serializeUavs(),rules:uavRulesSnapshot()}};}
 function hostBroadcastWorld(){broadcastHost(serializeWorldState());}
 function hostRemovePlayer(peerId){
   peerConnections.delete(peerId);
@@ -7637,6 +7660,7 @@ function makeWelcomeCore(peerId){
     protocol:NET_PROTOCOL,
     code:joinCode,
     selfId:peerId,
+    rules:uavRulesSnapshot(),
     seed,
     generation:mapGeneration,
     players:serializePlayers()
@@ -7650,7 +7674,7 @@ function makeStateSync(){
     glass:glassSnapshot(),
     drawings:serializeDrawings(),
     deaths:deathMarkers,
-    uav:{elapsed:uavElapsed,grace:uavSpawnGrace,drones:serializeUavs()}
+    uav:{elapsed:uavElapsed,grace:uavSpawnGrace,drones:serializeUavs(),rules:uavRulesSnapshot()}
   };
 }
 function hostEnsurePlayerForConnection(conn,requestedName){
@@ -7821,7 +7845,9 @@ function applyWelcomeCore(msg){
   // rebuildNetPlayerMesh -> mapSurfaceYAt -> isFloor -> floor[z] undefined.
   netPlayers.clear();
   worldGeometryReady=false;
+  if(msg.rules){uavFunMode=!!msg.rules.fun;swatVanEnabled=msg.rules.vanEnabled!==false;}
   loadBuildingSeed(Number(msg.seed)>>>0,false);
+  uavApplyRules(msg.rules);
   applyPlayerSnapshot(msg.players||[],false);
 
   const me=netPlayers.get(localPeerId);
@@ -8012,7 +8038,7 @@ function respawnSinglePlayer(){
 
   // Reset only YOUR two UAV timers. Survivor timers/plans remain untouched.
   for(const d of uavDrones){
-    d.timers.set(1,UAV_TIME_MAX);
+    d.timers.set(1,uavTimeMax(d));
     if(d.targetId===1){
       d.targetId=null;
       d.glare=0;
@@ -8138,7 +8164,7 @@ function hostStartNewMap(){
   const newSeed=(Date.now()^Math.floor(Math.random()*0xffffffff))>>>0;
   loadBuildingSeed(newSeed,false);setAllPlayersForNewRound();clearRoundDeathVisuals();
   mapDrawStrokes=[];currentDrawStroke=null;currentDrawStrokeId='';rebuildMapOverlayMesh();resetUavSystemForMap();
-  broadcastHost({type:'newMap',generation:mapGeneration,seed:newSeed,players:serializePlayers(),uav:{elapsed:uavElapsed,grace:uavSpawnGrace,drones:serializeUavs()}});
+  broadcastHost({type:'newMap',generation:mapGeneration,seed:newSeed,players:serializePlayers(),uav:{elapsed:uavElapsed,grace:uavSpawnGrace,drones:serializeUavs(),rules:uavRulesSnapshot()}});
   hostBroadcastWorld();
 }
 function updateMultiplayerFrame(dt){
@@ -8257,6 +8283,7 @@ let physicsRemotePlayers=new Map();
 let physicsUavColliders=[],physicsUavIndex=0;
 
 function physicsBeginWorld(){
+  uavSightRules.clear();uavSightContext=null;swatVan=null;swatVanHandles=[];swatVanVerts=[];
   gunWallSurfaces.clear();gunWallContext=null;gunDecals.length=0;gunImpactBursts.length=0;gunDecalsDirty=true;
   glassReset();
   if(physicsWorld)physicsWorld.free();
@@ -8272,6 +8299,7 @@ function physicsAddBox(cx,cy,cz,sx,sy,sz){
   const collider=physicsWorld.createCollider(RAPIER.ColliderDesc.cuboid(sx/2,sy/2,sz/2)
     .setTranslation(cx,cy,cz).setFriction(0).setRestitution(0));
   if(gunWallContext)gunWallSurfaces.set(collider.handle,gunWallContext);
+  if(uavSightContext)uavSightRules.set(collider.handle,uavSightContext);
   return collider;
 }
 function physicsHullPrimitive(fn){
@@ -8292,7 +8320,8 @@ function physicsHullPrimitive(fn){
         const local=new Float32Array(points.flatMap(p=>p.map((v,k)=>v-center[k])));
         const desc=RAPIER.ColliderDesc.convexHull(local);
         if(!desc)throw new Error('Could not build a solid map collision hull.');
-        physicsWorld.createCollider(desc.setTranslation(...center).setFriction(0));
+        const hull=physicsWorld.createCollider(desc.setTranslation(...center).setFriction(0));
+        if(uavSightContext)uavSightRules.set(hull.handle,uavSightContext);
       }
     }
   };
@@ -9712,7 +9741,7 @@ function uavRayBlockedByExteriorAccess(from,target){
   return false;
 }
 
-function staticUavLosFromTo(from,target){
+function staticWorldLosFromTo(from,target){
   if(!physicsWorld)return false;
   const delta={x:target.x-from.x,y:target.y-from.y,z:target.z-from.z};
   if(Math.hypot(delta.x,delta.y,delta.z)<1e-7)return true;
@@ -9721,7 +9750,15 @@ function staticUavLosFromTo(from,target){
   return !hit;
 }
 
+function staticUavLosFromTo(from,target){
+  if(!physicsWorld)return false;
+  const delta={x:target.x-from.x,y:target.y-from.y,z:target.z-from.z};
+  if(Math.hypot(delta.x,delta.y,delta.z)<1e-7)return true;
+  return !physicsWorld.castRay(new RAPIER.Ray(from,delta),.9999,true,
+    undefined,undefined,undefined,undefined,c=>uavSightAllowed(c,from,delta));
+}
 function survivorSpotVisibleToDrone(drone,spot,futureSec=0){
+  if(!uavEnabled)return false;
   const from=futureSec>0
     ? predictedDroneOrigin(drone,futureSec)
     : {x:drone.x,y:drone.y,z:drone.z};
@@ -9741,7 +9778,7 @@ function survivorEstimateDroneHandoffSeconds(agent,drone){
 
   const currentTargetId=drone.targetId;
   const currentLeft=
-    drone.timers.get(currentTargetId)??UAV_TIME_MAX;
+    drone.timers.get(currentTargetId)??uavTimeMax(drone);
 
   let deadline=currentLeft;
   const targetAgent=survivorAgentById(currentTargetId);
@@ -9827,7 +9864,7 @@ function survivorDroneStates(agent){
     out.push({
       index:i,
       drone:d,
-      timer:d.timers.has(agent.id)?d.timers.get(agent.id):UAV_TIME_MAX,
+      timer:d.timers.has(agent.id)?d.timers.get(agent.id):uavTimeMax(d),
       targeted:d.targetId===agent.id,
       busyWithOther:d.targetId!=null&&d.targetId!==agent.id,
       handoffSec:
@@ -9845,9 +9882,9 @@ function survivorDroneStates(agent){
   return out;
 }
 function survivorMinTimer(agent){
-  let m=UAV_TIME_MAX;
-  for(const d of uavDrones)m=Math.min(m,d.timers.get(agent.id)??UAV_TIME_MAX);
-  return m;
+  let m=Infinity;
+  for(const d of uavDrones)m=Math.min(m,d.timers.get(agent.id)??uavTimeMax(d));
+  return Number.isFinite(m)?m:UAV_TIME_MAX;
 }
 
 function survivorPathLengthFrom(agent,path){
@@ -9957,9 +9994,9 @@ function survivorEvaluateRouteRisk(agent,path,spot,states,mode){
         }
       }else{
         streak[i]=0;
-        if(timers[i]<UAV_TIME_MAX){
+        if(timers[i]<uavTimeMax(s.drone)){
           timers[i]=Math.min(
-            UAV_TIME_MAX,
+            uavTimeMax(s.drone),
             timers[i]+UAV_REGAIN_RATE*dt
           );
         }
@@ -10176,8 +10213,8 @@ function survivorFindDecoyRequest(agent,agents){
 
     for(let i=0;i<uavDrones.length;i++){
       const d=uavDrones[i];
-      const otherTimer=d.timers.get(other.id)??UAV_TIME_MAX;
-      const myTimer=d.timers.get(agent.id)??UAV_TIME_MAX;
+      const otherTimer=d.timers.get(other.id)??uavTimeMax(d);
+      const myTimer=d.timers.get(agent.id)??uavTimeMax(d);
 
       if(d.targetId===other.id && otherTimer<0.88 && myTimer>1.42){
         return {droneIndex:i,protecting:other.id};
@@ -10278,7 +10315,7 @@ function survivorSpotScore(agent,spot,states,mode,decoyRequest){
     if(!otherVisible)score+=28;
 
     const ownTimer=
-      uavDrones[i].timers.get(agent.id)??UAV_TIME_MAX;
+      uavDrones[i].timers.get(agent.id)??uavTimeMax(uavDrones[i]);
 
     if(ownTimer<1.0)score-=85;
   }
@@ -10489,7 +10526,7 @@ function survivorPredictiveSafetyAtSpot(agent,spot,locks,arrivalSec){
     locks.length
       ? Math.min(
           ...locks.map(
-            d=>d.timers.get(agent.id)??UAV_TIME_MAX
+            d=>d.timers.get(agent.id)??uavTimeMax(d)
           )
         )
       : UAV_TIME_MAX;
@@ -10516,7 +10553,7 @@ function survivorPredictiveSafetyAtSpot(agent,spot,locks,arrivalSec){
         if(rel===0&&!lockIds.has(d.id)){
           otherVisibleAtArrival++;
           const otherTimer=
-            d.timers.get(agent.id)??UAV_TIME_MAX;
+            d.timers.get(agent.id)??uavTimeMax(d);
 
           // If A is nearly burned but B is fresh, stepping far enough around a
           // corner to trade A's LOS for B's is often the correct survival move.
@@ -10839,7 +10876,7 @@ function survivorUpdateEmergencyEvasion(agent,dt){
   if(locks.length){
     const minTimer=Math.min(
       ...locks.map(
-        d=>d.timers.get(agent.id)??UAV_TIME_MAX
+        d=>d.timers.get(agent.id)??uavTimeMax(d)
       )
     );
 
@@ -11225,7 +11262,7 @@ function survivorGroupRouteFinished(agent){
 }
 function survivorGroupTimerReady(agent,min=1.45){
   for(const d of uavDrones){
-    if((d.timers.get(agent.id)??UAV_TIME_MAX)<min)return false;
+    if((d.timers.get(agent.id)??uavTimeMax(d))<min)return false;
   }
   return true;
 }
@@ -11744,7 +11781,7 @@ function survivorUpdateAbsorptionPlan(plan,dt){
 
       const minTimer=Math.min(
         ...locks.map(d=>
-          d.timers.get(primary.id)??UAV_TIME_MAX
+          d.timers.get(primary.id)??uavTimeMax(d)
         )
       );
 
@@ -11836,7 +11873,7 @@ function survivorUpdateAbsorptionPlan(plan,dt){
 
       const minTimer=Math.min(
         ...locks.map(d=>
-          d.timers.get(primary.id)??UAV_TIME_MAX
+          d.timers.get(primary.id)??uavTimeMax(d)
         )
       );
 
@@ -11921,7 +11958,7 @@ function survivorUpdateAbsorptionPlan(plan,dt){
 
       const minTimer=Math.min(
         ...locks.map(d=>
-          d.timers.get(a.id)??UAV_TIME_MAX
+          d.timers.get(a.id)??uavTimeMax(d)
         )
       );
 
@@ -12305,12 +12342,12 @@ function survivorFollowLivingPlayer(agent,dt){
   const dist=Math.hypot(px-ax,pz-az);
 
   let targeted=false;
-  let minTimer=UAV_TIME_MAX;
+  let minTimer=Infinity;
   for(const d of uavDrones){
     if(d.targetId===agent.id)targeted=true;
     minTimer=Math.min(
       minTimer,
-      d.timers.get(agent.id)??UAV_TIME_MAX
+      d.timers.get(agent.id)??uavTimeMax(d)
     );
   }
 
@@ -12887,13 +12924,13 @@ function nav3TimedSamples(from,path){
 }
 function nav3Exposure(from,path,states,startTime=0,startTimers=null,margin=.16){
   const timers=startTimers?startTimers.slice():states.map(s=>s.timer),samples=nav3TimedSamples(from,path);
-  let exposure=0,min=UAV_TIME_MAX,lethal=false;
+  let exposure=0,min=Infinity,lethal=false;
   for(const p of samples)for(let i=0;i<states.length;i++){
     // Assume a visible turret may acquire this NPC immediately. Another NPC's
     // current lock is never treated as guaranteed free exposure time.
     const visible=nav3Sight(states[i].drone,p,startTime+p.time);
     const locked=visible&&startTime+p.time>=(states[i].holdUntil||0);
-    timers[i]=Math.min(UAV_TIME_MAX,timers[i]+(locked?-UAV_DRAIN_RATE:UAV_REGAIN_RATE)*p.dt);
+    timers[i]=Math.min(uavTimeMax(states[i].drone),timers[i]+(locked?-UAV_DRAIN_RATE:UAV_REGAIN_RATE)*p.dt);
     if(visible)exposure+=p.dt;
     min=Math.min(min,timers[i]);if(timers[i]<margin)lethal=true;
   }
@@ -13090,6 +13127,7 @@ function survivorSettleHeight(agent,dt){survivorMoveRoute(agent,dt,0);}
 // Long 3D searches share a frame budget; no search owns another NPC's movement.
 function nav3Here(a){return {x:survivorX(a),y:survivorBaseYOf(a),z:survivorZ(a)};}
 function nav3Sight(d,p,t=0){
+  if(!uavEnabled)return false;
   if(d.navClock==null)return survivorSpotVisibleToDrone(d,p,t);
   const angle=d.phase+((d.navClock+t)/UAV_ORBIT_PERIOD_SEC)*Math.PI*2;
   const from=d.stationary?d:{x:d.cx+Math.cos(angle)*d.radius,y:d.y,z:d.cz+Math.sin(angle)*d.radius};
@@ -13098,7 +13136,7 @@ function nav3Sight(d,p,t=0){
 function nav3States(a,snapshot=false){
   const p=nav3Here(a);
   return uavDrones.map(drone=>({drone:snapshot?{...drone,navClock:uavElapsed}:drone,
-    timer:drone.timers.get(a.id)??UAV_TIME_MAX,targeted:drone.targetId===a.id,
+    timer:drone.timers.get(a.id)??uavTimeMax(drone),targeted:drone.targetId===a.id,
     visible:nav3Sight(drone,p),holdUntil:0}));
 }
 function nav3Trajectory(from,path){
@@ -13135,7 +13173,7 @@ function nav3LiveStates(a){
     const mate=survivorAgentById(s.drone.targetId);
     if(!mate||mate===a||!survivorIsAlive(mate)||!mate.tacticalCommitted)continue;
     const route=nav3Trajectory(nav3Here(mate),nav3RemainingPath(mate));
-    const limit=Math.min(.9,(s.drone.timers.get(mate.id)??UAV_TIME_MAX)-.14,route.duration);
+    const limit=Math.min(.9,(s.drone.timers.get(mate.id)??uavTimeMax(s.drone))-.14,route.duration);
     for(let t=.04;t<limit;t+=.04){
       if(!nav3Sight(s.drone,nav3At(route,t),t))break;s.holdUntil=Math.max(0,t-.06);
     }
@@ -13276,11 +13314,11 @@ function nav3WaveRisk(entries,cache=new Map()){
   const rows=entries.map(e=>{
     let memo=cache.get(e.agent);
     if(!memo||memo.plan!==e.plan){memo={plan:e.plan,route:nav3Trajectory(nav3Here(e.agent),e.plan.path),seen:[]};cache.set(e.agent,memo);}
-    return {a:e.agent,...memo,timers:uavDrones.map(d=>d.timers.get(e.agent.id)??UAV_TIME_MAX)};
+    return {a:e.agent,...memo,timers:uavDrones.map(d=>d.timers.get(e.agent.id)??uavTimeMax(d))};
   }).sort((a,b)=>a.a.id-b.a.id);
   const targets=uavDrones.map(d=>rows.findIndex(r=>r.a.id===d.targetId));
   const duration=Math.max(...rows.map(r=>r.route.duration))+.8;
-  let min=UAV_TIME_MAX;
+  let min=Infinity;
   for(let k=0;k<Math.ceil(duration/.05);k++){
     const step=.05,t=(k+1)*step;
     for(const r of rows)if(!r.seen[k]){const p=nav3At(r.route,t);r.seen[k]=uavDrones.map(d=>nav3Sight(d,p,t));}
@@ -13288,7 +13326,7 @@ function nav3WaveRisk(entries,cache=new Map()){
       const seen=rows.map(r=>r.seen[k][d]);
       if(targets[d]<0||!seen[targets[d]])targets[d]=seen.findIndex(Boolean);
       for(let i=0;i<rows.length;i++){
-        rows[i].timers[d]=Math.min(UAV_TIME_MAX,rows[i].timers[d]+(i===targets[d]?-UAV_DRAIN_RATE:UAV_REGAIN_RATE)*step);
+        rows[i].timers[d]=Math.min(uavTimeMax(uavDrones[d]),rows[i].timers[d]+(i===targets[d]?-UAV_DRAIN_RATE:UAV_REGAIN_RATE)*step);
         min=Math.min(min,rows[i].timers[d]);if(min<.10)return {lethal:true,min};
       }
     }
@@ -13370,7 +13408,7 @@ function nav3AgentTick(agent,dt){
     }
   }else if(!agent.motion&&!agent.readyPlan&&!nav3Pending.has(agent.id)&&agent.planTimer<=0){
     const safe=nav3Cover(here),autonomous=survivorAutonomyActive();
-    const recovered=states.every(s=>s.timer>UAV_TIME_MAX-.10);
+    const recovered=states.every(s=>s.timer>uavTimeMax(s.drone)-.10);
     if(safe&&((autonomous&&nav3EscapeGoal(here,agent,false))||survivorAiClock<(agent.recoveryUntil||0)||!recovered)){
       agent.waypoints=[];agent.waypointIndex=0;agent.sprinting=false;agent.planType='HOLD-DEEP-COVER';agent.planTimer=.4;
     }else if(autonomous||states.some(s=>s.visible)||!safe){
@@ -13407,6 +13445,7 @@ function rayHitsAabb3D(a,b,x0,y0,z0,x1,y1,z1){
   return slab(a.x,dx,x0,x1)&&slab(a.y,dy,y0,y1)&&slab(a.z,dz,z0,z1)&&t1>0.0005&&t0<0.9995;
 }
 function uavHasLineOfSight(drone,entity){
+  if(!uavEnabled)return false;
   const target=entity.getPoint();
   return !!target&&staticUavLosFromTo({x:drone.x,y:drone.y,z:drone.z},target);
 }
@@ -13420,12 +13459,12 @@ function currentUavEntities(){
 function updateUavStatusHud(){
   const rows=[];
   let playerLockCount=0;
-  let playerMin=UAV_TIME_MAX;
+  let playerMin=Infinity;
   for(const d of uavDrones){
     if(d.targetId==null)continue;
     const ent=uavEntities.get(d.targetId);
     if(!ent||!ent.isAlive())continue;
-    const left=d.timers.get(d.targetId)??UAV_TIME_MAX;
+    const left=d.timers.get(d.targetId)??uavTimeMax(d);
     rows.push('<div class="uavStatusRow">'+d.id+' → '+ent.label+' &nbsp; <span class="time">'+left.toFixed(2)+'s</span></div>');
     if(d.targetId===localUavEntityId){playerLockCount++;playerMin=Math.min(playerMin,left);}
   }
@@ -13699,7 +13738,7 @@ function resetUavEntityRegistryForMode(){
   routeRegisterPlayers();
 }
 function resetUavSystemForMap(){
-  uavDrones=[];uavElapsed=0;uavSpawnGrace=UAV_SPAWN_GRACE_SEC;
+  uavDrones=[];uavElapsed=0;uavSpawnGrace=UAV_SPAWN_GRACE_SEC;uavEnabled=true;
   let minX=GRID,maxX=0,minZ=GRID,maxZ=0,found=false;
   for(let z=0;z<GRID;z++)for(let x=0;x<GRID;x++)if(isFloor(x,z)){found=true;minX=Math.min(minX,x);maxX=Math.max(maxX,x+1);minZ=Math.min(minZ,z);maxZ=Math.max(maxZ,z+1);}
   if(!found){minX=minZ=0;maxX=maxZ=GRID;}
@@ -13733,6 +13772,7 @@ function resetUavSystemForMap(){
       uavDrones.push({id:'UAV_'+(i+1),phase,cx,cz,radius,y,x:cx+Math.cos(phase)*radius,z:cz+Math.sin(phase)*radius,yaw:0,targetId:null,timers:new Map(),glare:0,stationary:false,turret:false,pitchDown:0});
     }
   }
+  swatSpawnForMap();
   rebuildUavDynamicMeshes();
   ensureUavAudioNodeCount();
 }
@@ -13785,7 +13825,7 @@ function updateUavs(dt){
 
     let target=null;
 
-    if(uavSpawnGrace<=0){
+    if(uavEnabled&&uavSpawnGrace<=0){
       if(d.targetId!=null){
         const existing=uavEntities.get(d.targetId);
         if(existing&&existing.isAlive()&&uavHasLineOfSight(d,existing))target=existing;
@@ -13801,18 +13841,18 @@ function updateUavs(dt){
     }
 
     for(const e of entities){
-      let t=d.timers.has(e.id)?d.timers.get(e.id):UAV_TIME_MAX;
+      let t=d.timers.has(e.id)?d.timers.get(e.id):uavTimeMax(d);
       if(target&&e.id===target.id){
         t=Math.max(0,t-UAV_DRAIN_RATE*dt);
-      }else if(t<UAV_TIME_MAX){
-        t=Math.min(UAV_TIME_MAX,t+UAV_REGAIN_RATE*dt);
+      }else if(t<uavTimeMax(d)){
+        t=Math.min(uavTimeMax(d),t+UAV_REGAIN_RATE*dt);
       }
       d.timers.set(e.id,t);
     }
 
     if(target){
       d.glare=Math.min(1,d.glare+dt/0.5);
-      const left=d.timers.get(target.id)??UAV_TIME_MAX;
+      const left=d.timers.get(target.id)??uavTimeMax(d);
       if(left<=0&&target.isAlive()){
         triggerUavKillEffects(d,target);
         target.onKilled(d);
@@ -15049,7 +15089,7 @@ addEventListener('blur',()=>gunTrigger=false);
 document.addEventListener('pointerlockchange',()=>{if(document.pointerLockElement!==canvas)gunTrigger=false;});
 addEventListener('keydown',e=>{if(e.repeat)return;if(e.code==='KeyR')gunReload();if(e.code==='Digit1')gunSwitch('ak');if(e.code==='Digit2')gunSwitch('glock');});
 
-const NET_PROTOCOL='gridlock-arsenal-10';
+const NET_PROTOCOL='gridlock-argus-19';
 function netVersionError(){stopClientHandshakeRetry();clientHandshakeComplete=false;try{if(hostConn)hostConn.close();}catch(_){}showMainMenu();showMenuStatus('Game versions differ. Everyone must open the same updated HTML file.');}
 let netMoveSeq=0,netWorldSeq=0,netLastWorldSeq=-1,netCorrectionSeq=-1,netLocalEpoch=0,netMotionTimer=0;
 const netPoseHistory=new Map(),netLocalSamples=[];
@@ -15181,7 +15221,7 @@ function netApplyCorrection(msg){
 function netInstallTransport(conn){
  if(!conn||conn.gridlockFast||!conn.peerConnection)return;
  try{
-  const dc=conn.peerConnection.createDataChannel('gridlock-motion-10',{negotiated:true,id:2,ordered:false,maxRetransmits:0});conn.gridlockFast=dc;
+  const dc=conn.peerConnection.createDataChannel('gridlock-motion-19',{negotiated:true,id:2,ordered:false,maxRetransmits:0});conn.gridlockFast=dc;
   dc.onmessage=e=>{try{
    const msg=JSON.parse(e.data);if(!msg||typeof msg!=='object')return;
    if(isHost){if(conn.gridlockProtocol===NET_PROTOCOL&&msg.type==='playerState')handleHostMessage(conn,msg);}
@@ -15486,6 +15526,7 @@ function routeStart(id,name=''){
  if(routeRecording){routeSay('Finish the current route with /endrecording first.');return false;}
  if(playerDead||spectatorActive){routeSay('Press T to respawn before starting a recording.');return false;}
  routeSeed=seed;routeGhost=false;
+ routeRestoreWindows();
  routeResetOrbit();
  routeRecording={id,name:name?safeName(name):'Recording #'+id,seed,time:0,frames:[],actions:[],initialGun:gunPack({gun:gunSelf()}),synced:routeSyncEnabled,ghostAt:null,start:routeSnapshot(0)};
  routeShowOthers();
@@ -15511,7 +15552,7 @@ function routeEnd(){
  // Return the live player to the route's starting pose without resetting the map,
  // replay squad, glass, decals, UAV orbit or other survivors.
  const s=r.start;px=s[1];pz=s[3];yaw=s[4];pitch=s[5];playerCrouchAmount=s[6];resetPlayerPhysics(s[2]);gunSelf().hp=100;
- for(const d of uavDrones){d.timers.set(1,UAV_TIME_MAX);if(d.targetId===1){d.targetId=null;d.glare=0;}}
+ for(const d of uavDrones){d.timers.set(1,uavTimeMax(d));if(d.targetId===1){d.targetId=null;d.glare=0;}}
  routeSay('Saved #'+r.id+' · '+r.time.toFixed(2)+'s. Returned to start. Use /playrecord '+r.id+' or /playall.');return true;
 }
 function routeRemovePlayer(key){
@@ -15556,6 +15597,8 @@ function routePlay(id){
   if(id===routeRecording.id){routeSay('This is the route you are currently recording.');return false;}
   routeShowRecordings=true;routeSeek(routeSpawn(r),routeRecording.time);
  }else{
+  // Reset only when starting a fresh timeline, never halfway through other takes.
+  if(routeSyncEnabled||routePlayers.size===0||(routePlayers.size===1&&routePlayers.has(id)))routeRestoreWindows();
   if(routeSyncEnabled){const other=[...routePlayers.values()].filter(p=>p.record.id!==id).map(p=>p.record);routeStopPlayers();routeResetOrbit();for(const record of other)routeSpawn(record);}
   routeSpawn(r);
  }
@@ -15564,7 +15607,7 @@ function routePlay(id){
 function routePlayAll(){
  const records=[...routeRecordings.values()].filter(r=>r.seed===seed&&r.id!==routeRecording?.id);
  if(!records.length){routeSay('No recordings for this map yet. Start with /record 1.');return false;}
- routeStopPlayers();if(!routeRecording)routeResetOrbit();
+ routeStopPlayers();if(!routeRecording){routeRestoreWindows();routeResetOrbit();}
  for(const r of records){const p=routeSpawn(r);if(routeRecording)routeSeek(p,routeRecording.time);}
  if(routeRecording)routeShowRecordings=true;
  routeSay('Started all '+records.length+' routes together.');return true;
@@ -15584,7 +15627,7 @@ function routeRender(){
   if(!p.labelElement){p.labelElement=document.createElement('div');p.labelElement.className='playerNameTag';routeNameLayer.appendChild(p.labelElement);}
   const el=p.labelElement,head={x:p.x,y:p.feetY+(p.alive?1.6-.58*p.crouch:.45),z:p.z},tag={x:p.x,y:p.feetY+(p.alive?1.95-.67*p.crouch:.8),z:p.z};
   const screen=projectWorldToScreen(tag.x,tag.y,tag.z);
-  const visible=screen&&screen.x>=-80&&screen.x<=innerWidth+80&&screen.y>=-50&&screen.y<=innerHeight+50&&staticUavLosFromTo(eye,head)&&staticUavLosFromTo(eye,tag);
+  const visible=screen&&screen.x>=-80&&screen.x<=innerWidth+80&&screen.y>=-50&&screen.y<=innerHeight+50&&staticWorldLosFromTo(eye,head)&&staticWorldLosFromTo(eye,tag);
   el.style.display=visible?'block':'none';
   if(visible){el.textContent=(p.alive?'':'☠ ')+p.name;el.style.left=screen.x+'px';el.style.top=screen.y+'px';el.style.borderColor=p.color.css;}
  }
@@ -15603,14 +15646,14 @@ function routeHud(){
  routeStatus.textContent=routeRecording
   ?(routeGhost?'GHOST · ':'RECORDING · ')+routeRecording.name+' · '+routeRecording.time.toFixed(1)+'s · /endrecording'
   :'/ command chat · '+routeRecordings.size+' saved · '+alive+'/'+routePlayers.size+' replays alive';
- routeStatus.textContent+=' · SYNC '+(routeSyncEnabled?'ON':'OFF')+' · SHOW '+(routeShowRecordings?'ON':'OFF')+' · LAST '+(routeLastDuringPlay?'ON':'OFF');
+ routeStatus.textContent+=' · SYNC '+(routeSyncEnabled?'ON':'OFF')+' · SHOW '+(routeShowRecordings?'ON':'OFF')+' · LAST '+(routeLastDuringPlay?'ON':'OFF')+' · '+(uavFunMode?'FUNMODE':'REALISM')+' · UAV '+(uavEnabled?'ON':'OFF');
  if(routeGhost){document.getElementById('gunHealthText').textContent='GHOST · Recording continues';document.getElementById('gunHealthFill').style.background='#56dfff';}
 }
 function routeCancelTake(){
  const r=routeRecording;if(!r)return;
  routeRecording=null;routeGhost=false;
  const s=r.start;px=s[1];pz=s[3];yaw=s[4];pitch=s[5];playerCrouchAmount=s[6];resetPlayerPhysics(s[2]);gunSelf().hp=100;
- for(const d of uavDrones){d.timers.set(1,UAV_TIME_MAX);if(d.targetId===1){d.targetId=null;d.glare=0;}}
+ for(const d of uavDrones){d.timers.set(1,uavTimeMax(d));if(d.targetId===1){d.targetId=null;d.glare=0;}}
 }
 function routeDeleteRecording(id){
  if(!routeRecordings.has(id)&&routeRecording?.id!==id&&!routePlayers.has(id)){routeSay('No recording #'+id+' to delete.');return false;}
@@ -15623,6 +15666,16 @@ function routeDeleteAll(){
 function routeCommand(text){
  if(multiplayer||!gameStarted)return false;
  const parts=String(text).trim().split(/\s+/),cmd='/'+parts[0].replace(/^\//,'').toLowerCase(),id=routeKey(parts[1]);
+ if(cmd==='/ttk'){
+  if(parts.length!==3){routeSay('Use /ttk UAV_1 2.5. /uavlist shows names.');return false;}
+  const d=uavDrones.find(d=>d.id.toLowerCase()===parts[1].toLowerCase());
+  if(!d){routeSay('Unknown UAV. Use /uavlist for names.');return false;}
+  return uavSetTtk([d],parts[2]);
+ }
+ if(cmd==='/ttkall'){
+  if(parts.length!==2){routeSay('Use /ttkall 2.5 (seconds).');return false;}
+  return uavSetTtk(uavDrones,parts[1]);
+ }
  if(cmd==='/deleterec'){
   if(parts.length!==2||id===null){routeSay('Use /deleterec followed by a recording number.');return false;}
   return routeDeleteRecording(id);
@@ -15632,6 +15685,13 @@ function routeCommand(text){
   return cmd==='/record'?routeStart(id,parts.slice(2).join(' ')):routePlay(id);
  }
  if(parts.length!==1){routeSay('Unknown command. Use /help.');return false;}
+ if(cmd==='/retry')return routeRetry();
+ if(cmd==='/novan')return swatRemove();
+ if(cmd==='/funmode')return uavSetFunMode(!uavFunMode);
+ if(cmd==='/realism')return uavSetFunMode(false);
+ if(cmd==='/uavoff')return uavSetEnabled(false);
+ if(cmd==='/uavon')return uavSetEnabled(true);
+ if(cmd==='/uavlist'){routeSay(uavDrones.map(d=>d.id+' · '+uavTimeMax(d)+'s'+(d.argus?' · van-mounted ARGUS':d.stationary?' · stationary turret':' · sky UAV')).join('\n')+'\nUAVs '+(uavEnabled?'ON':'OFF'));return true;}
  if(cmd==='/lastduringplay')return routeToggleLast();
  if(cmd==='/removenpcs')return routeRemoveNpcs();
  if(cmd==='/sync')return routeToggleSync();
@@ -15645,7 +15705,7 @@ function routeCommand(text){
   routeSay(routeRecordings.size?[...routeRecordings.values()].map(r=>'#'+r.id+' · '+(r.name||'Recording #'+r.id)+' · '+r.duration.toFixed(2)+'s · '+(r.actions||[]).filter(a=>a.type==='gunFire').length+' shots · '+(r.synced?'SYNC':'UNSYNC')+(r.ghostAt!==null?' · ghost at '+r.ghostAt.toFixed(2)+'s':'')).join('\n'):'No saved routes for this map.');return false;
  }
  if(cmd==='/help'||cmd==='/'){
-  routeSay('/record # [name] — start a named route\n/endrecording — save and return to start\n/playrecord # — start/restart one replay\n/playall — restart all routes together\n/stopplay — stop replays and clear their bodies\n/recordings — list routes\n/deleterec # — delete one recording\n/deleteall — delete all recordings\n/removenpcs — remove default AI survivors\n/sync — toggle shared UAV start timing\n/recordingshow — toggle other replays during recording\n/freecammap — toggle flat map style in dead freecam\n/lastduringplay — toggle live player last during playback\nReplays repeat movement and gun actions against the current scene. Same-seed resets keep saved routes; a different seed clears them.');return false;
+  routeSay('/record # [name] — start a named route\n/retry — restart the current take from its original start\n/endrecording — save and return to start\n/playrecord # — start/restart one replay\n/playall — restart all routes together\n/stopplay — stop replays and clear their bodies\n/recordings — list routes\n/deleterec # — delete one recording\n/deleteall — delete all recordings\n/removenpcs — remove default AI survivors\n/sync — toggle shared UAV start timing\n/recordingshow — toggle other replays during recording\n/freecammap — toggle flat map style in dead freecam\n/lastduringplay — toggle live player last during playback\n/funmode — toggle solid cover for all UAV sight\n/realism — return to realism sight rules\n/novan — remove the van and ARGUS for this map\n/uavlist — list UAV names and kill times\n/ttk UAV_1 2.5 — set one UAV kill time in seconds\n/ttkall 2.5 — set all UAV kill times\n/uavoff / /uavon — disable / enable UAV targeting\nReplays repeat movement and gun actions against the current scene. Fresh recordings, retries and playback from the start restore all windows; replay shots and contact break them again. Same-seed resets keep saved routes; a different seed clears them.');return false;
  }
  routeSay('Unknown command. Use /help.');return false;
 }
@@ -15759,7 +15819,7 @@ function routeToggleSync(){
  if(routeRecording){routeSay('End this recording before changing /sync, so its UAV timing stays consistent.');return false;}
  routeSyncEnabled=!routeSyncEnabled;
  if(routeSyncEnabled){
-  const active=[...routePlayers.values()].map(p=>p.record);routeStopPlayers();routeResetOrbit();for(const r of active)routeSpawn(r);
+  const active=[...routePlayers.values()].map(p=>p.record);routeStopPlayers();routeRestoreWindows();routeResetOrbit();for(const r of active)routeSpawn(r);
  }
  routeSay('UAV sync '+(routeSyncEnabled?'ON. Each recording and playback starts at the same orbit phase with fresh targeting timers. Re-record older routes to match this timing.':'OFF. UAVs keep their current orbit when starting a take.'));
  return true;
@@ -15812,6 +15872,153 @@ function routeToggleLast(){
  routeSay('Player last during playback '+(routeLastDuringPlay?'ON. UAVs prioritize the other actors while you watch. Recording takes keep their numbered priority.':'OFF. Normal player priority restored.'));
  return true;
 }
+
+// Scenario controls. Visibility masks never change physical or bullet collision.
+let uavFunMode=false,swatVanEnabled=true,uavEnabled=true;
+let swatVan=null,swatVanHandles=[],swatVanVerts=[];
+let uavSightRules=new Map(),uavSightContext=null;
+function uavTimeMax(d){return Number.isFinite(d?.ttk)&&d.ttk>0?d.ttk:(d?.argus ? .866 : UAV_TIME_MAX);}
+function uavInvalidatePlans(){
+ nav3Pending.clear();survivorGroupPlan=null;survivorGroupDecisionMade=false;
+ for(const a of allSurvivorAgents()){
+  a.planTimer=0;a.tacticalCommitted=false;a.recoveryUntil=0;
+  if(!a.motion){a.waypoints=[];a.waypointIndex=0;}
+ }
+}
+function uavFreshTimers(d){d.timers.clear();d.targetId=null;d.glare=0;}
+function uavSetEnabled(enabled){
+ uavEnabled=enabled;for(const d of uavDrones)uavFreshTimers(d);
+ uavInvalidatePlans();rebuildUavDynamicMeshes();updateUavStatusHud();updateUavAudio(0);
+ routeSay('UAVs '+(enabled?'ON. All targets have fresh countdowns.':'OFF. Targeting and kills disabled; positions keep their timing.'));return true;
+}
+function uavSetFunMode(enabled){
+ uavFunMode=enabled;document.getElementById('funModeOption').checked=enabled;
+ for(const d of uavDrones)uavFreshTimers(d);uavInvalidatePlans();
+ routeSay(enabled?'FUNMODE: solid cover, including vans, lower ramps and center supports, blocks UAV sight.':'REALISM: vans, center supports under the raised floor, and ramp sections below the deck are transparent to UAV sight.');return true;
+}
+function uavSetTtk(drones,value){
+ const time=Number(value);
+ if(!Number.isFinite(time)||time<=0){routeSay('Time must be a positive number of seconds, for example /ttk ARGUS 0.866 or /ttkall 2.5.');return false;}
+ for(const d of drones){d.ttk=time;uavFreshTimers(d);}uavInvalidatePlans();
+ routeSay(drones.map(d=>d.id+' = '+uavTimeMax(d)+'s').join('\n')+'\nFresh countdowns for every target. Applies to this map only.');return true;
+}
+function uavSightAllowed(c,from,delta){
+ if(!staticGeometry(c))return false;
+ if(uavFunMode)return true;
+ const rule=uavSightRules.get(c.handle);if(!rule)return true;
+ if(rule.transparent)return false;
+ // Clip the sight ray to the upper section of the solid. The render mesh and
+ // swept player hull remain continuous: no seam or duplicate surface is added.
+ const y=rule.minY;let lo=0,hi=.9999;
+ if(Math.abs(delta.y)<1e-9){if(from.y<y)return false;}
+ else if(delta.y>0)lo=Math.max(lo,(y-from.y)/delta.y);
+ else hi=Math.min(hi,(y-from.y)/delta.y);
+ if(lo>hi||hi<0||lo>.9999)return false;
+ const start={x:from.x+delta.x*lo,y:from.y+delta.y*lo,z:from.z+delta.z*lo};
+ return c.castRay(new RAPIER.Ray(start,delta),Math.max(0,hi-lo),true)>=0;
+}
+function withUavSightRule(fn,rule){return function(...args){const previous=uavSightContext;uavSightContext=rule;try{return fn(...args);}finally{uavSightContext=previous;}};}
+// A horizontal split at the underside of the raised floor also covers the solid
+// landing pedestal. Upper jungle ramps remain ordinary solid sight blockers.
+addExteriorRamp=withUavSightRule(addExteriorRamp,{minY:FLOOR_TOP-FLOOR_THICKNESS});
+addExteriorLanding=withUavSightRule(addExteriorLanding,{minY:FLOOR_TOP-FLOOR_THICKNESS});
+addElevatedCenterSupport=withUavSightRule(addElevatedCenterSupport,{transparent:true,kind:'center-support'});
+function swatRemoveGeometry(){
+ for(const h of swatVanHandles){const c=physicsWorld?.getCollider(h);if(c)physicsWorld.removeCollider(c,false);physicsStaticHandles.delete(h);uavSightRules.delete(h);}
+ swatVanHandles=[];swatVanVerts=[];swatVan=null;
+}
+function swatBuild(v){
+ swatRemoveGeometry();if(!v)return;swatVan={...v};
+ const c=Math.cos(v.yaw),s=Math.sin(v.yaw),P=(x,y,z)=>[v.x+x*c-z*s,v.y+y,v.z+x*s+z*c];
+ const saved=uavBodyVerts.slice();uavBodyVerts.length=0;
+ const box=(x,y,z,sx,sy,sz,color,solid=false)=>{
+  const q=P(x,y,z);physicsRenderUavBox(...q,sx,sy,sz,v.yaw,color);
+  if(solid){const shape=physicsAddBox(...q,sx,sy,sz);shape.setRotation({x:0,y:-Math.sin(v.yaw/2),z:0,w:Math.cos(v.yaw/2)});
+   swatVanHandles.push(shape.handle);physicsStaticHandles.add(shape.handle);uavSightRules.set(shape.handle,{transparent:true,kind:'van'});}
+ };
+ const armor=[.075,.091,.102],edge=[.18,.21,.22],rubber=[.028,.031,.034],glass=[.045,.11,.14];
+ box(0,.72,0,5.8,.38,2.38,edge,true); // chassis
+ box(-.7,1.78,0,4.15,1.88,2.46,armor,true); // armored rear cabin
+ box(1.73,1.6,0,1.25,1.52,2.35,armor,true); // driver's cab
+ box(2.46,1.05,0,.75,.60,2.32,armor,true); // hood
+ box(-.7,2.78,0,4.28,.16,2.57,edge,true); // roof
+ box(2.37,1.91,0,.03,.67,1.9,glass); // windshield
+ for(const side of [-1,1]){
+  box(1.72,1.97,side*1.19,.82,.58,.035,glass);
+  box(-.8,1.49,side*1.25,3.7,.13,.045,edge); // side reinforcement
+  box(-1.23,2.12,side*1.25,.78,.42,.045,[.025,.06,.07]);
+  box(.18,1.86,side*1.258,.20,.035,.04,[.60,.64,.62]); // handles
+  box(2.40,1.16,side*.83,.05,.23,.40,[.91,.87,.66]);
+  box(-2.79,1.12,side*.90,.04,.26,.22,[.66,.035,.035]);
+  box(-2.90,.76,side*.75,.30,.14,.58,edge);
+  for(const x of [-1.85,1.77]){
+   // Twelve tread segments form wheels around the local Z axle.
+   for(let k=0;k<12;k++){const a=k*Math.PI/6;box(x+Math.cos(a)*.40,.54+Math.sin(a)*.40,side*1.20,.26,.26,.34,rubber);}
+   box(x,.54,side*1.39,.47,.47,.045,edge);
+  }
+ }
+ box(2.88,.70,0,.20,.28,2.64,edge,true);
+ box(2.85,.98,0,.025,.21,1.2,rubber);
+ box(.46,2.66,0,.30,.12,1.48,edge);
+ box(.46,2.75,-.48,.24,.12,.45,[.08,.20,.70]);box(.46,2.75,.48,.24,.12,.45,[.73,.035,.035]);
+ box(-2.80,1.87,-.62,.035,1.34,1.09,armor);box(-2.80,1.87,.62,.035,1.34,1.09,armor);
+ box(-2.83,1.7,0,.05,1.34,.035,edge);
+ // A short access ladder and roof rail give the silhouette its mounted-turret van shape.
+ for(const z of [-.24,.24])box(-2.94,1.02,z,.07,1.35,.06,edge);
+ for(let i=0;i<5;i++)box(-2.94,.43+i*.25,0,.07,.045,.54,edge);
+ swatVanVerts=uavBodyVerts.slice();uavBodyVerts.length=0;for(const n of saved)uavBodyVerts.push(n);
+ physicsWorld.step();
+}
+function swatSpawnForMap(){
+ swatRemoveGeometry();if(!swatVanEnabled)return;
+ const random=mulberry32((seed^0x41524755)>>>0),side=Math.floor(random()*4),along=WORLD*(.22+random()*.56),gap=11+random()*10;
+ // Entire van lies outside the generator's full square, not merely an empty
+ // room cell. This guarantees separation from rooms, ramp landings and exits.
+ const places=[[along,-gap],[WORLD+gap,along],[along,WORLD+gap],[-gap,along]];
+ const [x,z]=places[side],towardBuilding=Math.atan2(WORLD*.5-z,WORLD*.5-x);
+ // A fair coin selects the rear-facing hemisphere; continuous variation within
+ // it gives the full circle of parking angles without snapping to map axes.
+ const rearTowardBuilding=random()<.5;
+ const yaw=towardBuilding+(rearTowardBuilding?Math.PI:0)+(random()-.5)*Math.PI;
+ const v={x,z,y:outsideGroundY(),yaw,side};swatBuild(v);
+ // Local -X is the back-door end. Keep the mount at the rear roof edge and
+ // point the idle barrel out over the back doors, opposite the van's nose.
+ const cx=x-Math.cos(yaw)*2.55,cz=z-Math.sin(yaw)*2.55;
+ uavDrones.push({id:'ARGUS',argus:true,ttk:.866,phase:0,cx,cz,radius:0,y:v.y+3.38,x:cx,z:cz,yaw:yaw+Math.PI,stationary:true,turret:true,pitchDown:0,targetId:null,timers:new Map(),glare:0});
+}
+function swatRemove(){
+ swatRemoveGeometry();uavDrones=uavDrones.filter(d=>!d.argus);
+ nav3Columns.clear();nav3Edges.clear();nav3WalkCache.clear();uavInvalidatePlans();
+ rebuildUavDynamicMeshes();updateUavStatusHud();updateUavAudio(0);
+ routeSay('SWAT van and ARGUS removed from this map.');return true;
+}
+function uavRulesSnapshot(){return {fun:uavFunMode,enabled:uavEnabled,vanEnabled:swatVanEnabled,van:swatVan};}
+function uavApplyRules(r){
+ if(!r)return;
+ uavFunMode=!!r.fun;uavEnabled=r.enabled!==false;swatVanEnabled=r.vanEnabled!==false;
+ if(JSON.stringify(swatVan)!==JSON.stringify(r.van||null))swatBuild(r.van||null);
+ document.getElementById('funModeOption').checked=uavFunMode;
+ document.getElementById('swatVanOption').checked=swatVanEnabled;
+}
+function routeRetry(){
+ const r=routeRecording;if(!r){routeSay('No recording is running. Start one with /record #.');return false;}
+ routeCancelTake();routeGhostDiedUntil=0;
+ gunLocal=gunCreateState();gunRead({gun:gunLocal},r.initialGun);gunLocal.hp=100;gunLocal.nextShot=0;gunTrigger=false;
+ for(const d of uavDrones)uavFreshTimers(d);
+ routeStart(r.id,r.name);
+ routeSay('Retrying #'+r.id+' · '+r.name+'. Returned to its original start; this take begins at 0s.');return true;
+}
+function routeRestoreWindows(){
+ if(multiplayer||!physicsWorld)return;
+ let changed=false;
+ for(const pane of breakableGlass)changed=glassSetBroken(pane,false)||changed;
+ glassBroken.clear();glassPredicted.clear();glassShards.length=0;
+ if(changed){glassRevision++;glassFlush();uavInvalidatePlans();physicsWorld.step();}
+}
+const funModeOption=document.getElementById('funModeOption'),swatVanOption=document.getElementById('swatVanOption');
+funModeOption.checked=uavFunMode;swatVanOption.checked=swatVanEnabled;
+funModeOption.addEventListener('change',()=>{uavFunMode=!!funModeOption.checked;});
+swatVanOption.addEventListener('change',()=>{swatVanEnabled=!!swatVanOption.checked;});
 
 document.body.classList.add('menu-open');
 showMainMenu();
