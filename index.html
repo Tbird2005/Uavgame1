@@ -655,6 +655,7 @@ function enterSpectatorFreecam(){
   return true;
 }
 function exitSpectatorFreecam(){
+  if(!buildSpectatorTargets().length)return;
   spectatorFreecamActive=false;
   updateSpectatorHud();
 }
@@ -861,18 +862,18 @@ function updateSpectatorHud(){
       '<br>WASD move · Space/C up/down · Shift fast · Mouse look · Wheel speed · 0 target cam'
     : '<b>SPECTATING '+pose.label+'</b> · '+pose.kind+
       '<br>Mouse orbit · Left/Right click target · Wheel zoom · 0 freecam · V exit'+
-      (playerDead?' · Q normal map view':' · M map');
+      (playerDead||singlePlayerObserver?' · Q normal map view':' · M map');
+  if(!multiplayer)spectatorHud.innerHTML+=' · T respawn';
   spectatorHud.style.display='block';
 }
 function startSpectating(force=false){
   if(!gameStarted)return false;
 
-  // Spectator is a DEAD-PLAYER-ONLY system.
-  // Living players must never be able to detach from their first-person body.
-  if(!playerDead)return false;
+  if(multiplayer&&!playerDead)return false;
+  if(!multiplayer)enterSinglePlayerObserver();
 
   const targets=buildSpectatorTargets();
-  if(!targets.length)return false;
+  if(!targets.length&&multiplayer)return false;
 
   if(mapOpen)setMapVisible(false);
 
@@ -883,9 +884,10 @@ function startSpectating(force=false){
 
   if(!spectatorTargetKey||!targets.some(t=>t.key===spectatorTargetKey)){
     spectatorIndex=0;
-    spectatorTargetKey=targets[0].key;
+    spectatorTargetKey=targets[0]?.key||'';
   }
 
+  if(!targets.length)enterSpectatorFreecam();
   updateSpectatorHud();
   return true;
 }
@@ -1229,7 +1231,6 @@ function updateUavAudio(dt){
   // Third-person spectator audio follows the spectator camera instead of the
   // dead/original player position.
   if(spectatorActive){
-    updateSpectatorFreecam(dt);
     const pose=getSpectatorCameraPose();
     if(pose){
       listenerX=pose.eye[0];
@@ -2333,7 +2334,7 @@ let singlePlayerMapCapsuleVertexCount=0;
 function rebuildSinglePlayerMapCapsule(){
   singlePlayerMapCapsuleVertexCount=0;
 
-  if(multiplayer||!worldGeometryReady||!mapOpen)return;
+  if(multiplayer||singlePlayerObserver||!worldGeometryReady||!mapOpen)return;
 
   const dead=playerDead;
   const bodyX=dead&&Number.isFinite(singlePlayerDeathX)?singlePlayerDeathX:px;
@@ -2548,6 +2549,7 @@ function syncPlayerNameElements(){
   }
 }
 function updatePlayerNameLabels(mapCamera){
+  updateUavEyeMarkers();
   if(!multiplayer||!gameStarted||!worldGeometryReady){playerNameLayer.style.display='none';return;}
   playerNameLayer.style.display='block';syncPlayerNameElements();
   for(const raw of netPlayers.values()){
@@ -2772,8 +2774,7 @@ function rebuildUavDynamicMeshes(){
     let origin=null;
 
     if(d.argus){
-      const target=uavEntities.get(d.targetId)?.getPoint();
-      const heading=target?Math.atan2(target.z-d.z,target.x-d.x):d.yaw;
+      const heading=d.yaw;
       const pose={...d,yaw:heading};
       const box=(x,y,z,sx,sy,sz,col)=>{const q=uavLocalToWorld(pose,x,y,z,0);addUavBox(...q,sx,sy,sz,heading,col);};
       box(0,-.39,0,.58,.27,.76,[.10,.12,.13]);
@@ -2785,25 +2786,8 @@ function rebuildUavDynamicMeshes(){
       box(.35,.13,.26,.025,.11,.12,[.85,.045,.025]);
       origin={x:d.x,y:d.y,z:d.z};
     }else if(d.turret){
-      const bank=0;
-      const addLocalBox=(lx,ly,lz,sx,sy,sz,col)=>{
-        const center=uavLocalToWorld(d,lx,ly,lz,bank);
-        addUavBox(center[0],center[1],center[2],sx,sy,sz,d.yaw,col,bank);
-      };
-
-      // Ground-level stationary UAV turret. From each map corner the yaw to
-      // the center is ~45 degrees, so the barrel points diagonally inward.
-      addLocalBox(-0.10,-0.62,0,1.45,0.38,1.45,dark);
-      addLocalBox(-0.05,-0.26,0,0.84,0.34,0.84,[0.25,0.27,0.31]);
-      addLocalBox(0.12,0.06,0,1.22,0.48,0.94,body);
-      addLocalBox(-0.06,0.18,0.48,0.32,0.28,0.24,wing);
-      addLocalBox(-0.06,0.18,-0.48,0.32,0.28,0.24,wing);
-      addLocalBox(0.68,0.02,0,0.92,0.17,0.17,[0.72,0.74,0.78]);
-      addLocalBox(1.24,0.02,0,0.54,0.13,0.13,[0.72,0.74,0.78]);
-      const sensorSize=0.12+0.22*eyePulse;
-      addLocalBox(1.54,0.02,0,sensorSize,sensorSize,sensorSize,red);
-      const eyeWorld=uavLocalToWorld(d,1.54,0.02,0,bank);
-      origin={x:eyeWorld[0],y:eyeWorld[1],z:eyeWorld[2]};
+      stadiumDraw(d);
+      origin=uavScannerOrigin(d);
     }else{
       // Constant inward bank during the clockwise orbit.
       // local +Z points toward the orbit center, so positive bank lowers the
@@ -2855,6 +2839,7 @@ function rebuildUavDynamicMeshes(){
     }
   }
 
+  uavGhostSightLines();
   let data=new Float32Array(uavBodyVerts);
   uavBodyVertexCount=data.length/9;
   gl.bindBuffer(gl.ARRAY_BUFFER,uavBodyBuffer);
@@ -7204,7 +7189,7 @@ function applyPlayerSnapshot(list,preserveSelf=true){
   if(multiplayer&&uavDrones.length)resetUavEntityRegistryForMode();
 }
 function serializeUavs(){
-  return uavDrones.map(d=>({id:d.id,phase:d.phase,cx:d.cx,cz:d.cz,radius:d.radius,y:d.y,x:d.x,z:d.z,yaw:d.yaw,stationary:!!d.stationary,turret:!!d.turret,argus:!!d.argus,ttk:uavTimeMax(d),pitchDown:d.pitchDown||0,
+  return uavDrones.map(d=>({id:d.id,phase:d.phase,cx:d.cx,cz:d.cz,radius:d.radius,y:d.y,x:d.x,z:d.z,yaw:d.yaw,bodyYaw:isStadiumTurret(d)?stadiumBodyYaw(d):null,gunPitch:d.gunPitch||0,stationary:!!d.stationary,turret:!!d.turret,argus:!!d.argus,ttk:uavTimeMax(d),pitchDown:d.pitchDown||0,
     targetId:d.targetId,glare:d.glare,timers:[...d.timers.entries()]}));
 }
 function applyUavSnapshot(data){
@@ -7215,7 +7200,7 @@ function applyUavSnapshot(data){
     for(let i=0;i<data.drones.length;i++){
       const s=data.drones[i];let d=uavDrones[i];
       if(!d){d={id:s.id,phase:s.phase,cx:s.cx,cz:s.cz,radius:s.radius,y:s.y,x:s.x,z:s.z,yaw:s.yaw,stationary:!!s.stationary,turret:!!s.turret,pitchDown:s.pitchDown||0,targetId:null,timers:new Map(),glare:0};uavDrones[i]=d;}
-      d.argus=!!s.argus;d.ttk=Number(s.ttk);d.id=s.id;d.phase=s.phase;d.cx=s.cx;d.cz=s.cz;d.radius=s.radius;d.y=s.y;d.x=s.x;d.z=s.z;d.yaw=s.yaw;d.stationary=!!s.stationary;d.turret=!!s.turret;d.pitchDown=s.pitchDown||0;d.targetId=s.targetId;d.glare=s.glare||0;d.timers=new Map(s.timers||[]);
+      d.argus=!!s.argus;d.ttk=Number(s.ttk);d.id=s.id;d.phase=s.phase;d.cx=s.cx;d.cz=s.cz;d.radius=s.radius;d.y=s.y;d.x=s.x;d.z=s.z;d.yaw=s.yaw;d.bodyYaw=Number.isFinite(s.bodyYaw)?s.bodyYaw:s.yaw;d.gunPitch=Number(s.gunPitch)||0;d.stationary=!!s.stationary;d.turret=!!s.turret;d.pitchDown=s.pitchDown||0;d.targetId=s.targetId;d.glare=s.glare||0;d.timers=new Map(s.timers||[]);
     }
     uavDrones.length=data.drones.length;
   }
@@ -7624,12 +7609,14 @@ function hostKillNetworkPlayer(peerId,killerId){
   const p=netPlayers.get(peerId);if(!p||p.alive===false)return;
   gunState(p).hp=0;
   p.alive=false;p.deathYaw=p.yaw||0;p.deathX=p.x;p.deathZ=p.z;p.deathT=0;
+  physicsRemoveRemotePlayer(peerId);
   addDeathMarker({peerId:p.id,x:p.x,z:p.z,yaw:p.yaw,name:p.name});addDeathFeed(p.name,killerId);
   if(peerId===localPeerId)beginPlayerDeath(killerId);
   broadcastHost({type:'death',generation:mapGeneration,peerId:p.id,name:p.name,killer:killerId,x:p.x,z:p.z,yaw:p.yaw});
   if(hostAllPlayersDead())multiplayerNextMapTimer=ROUND_RESET_DELAY_SEC;
 }
 function applyRemoteDeath(msg){
+  physicsRemoveRemotePlayer(msg.peerId);
   const p=netPlayers.get(String(msg.peerId));
   if(p){p.alive=false;p.deathYaw=Number(msg.yaw)||0;p.deathX=Number(msg.x)||p.x;p.deathZ=Number(msg.z)||p.z;p.deathT=0;p.x=Number(msg.x)||p.x;p.z=Number(msg.z)||p.z;}
   addDeathMarker(msg);addDeathFeed(msg.name,msg.killer);
@@ -8015,7 +8002,7 @@ function handleClientMessage(msg){
 }
 
 function respawnSinglePlayer(){
-  if(multiplayer||!playerDead||!rooms.length)return;
+  if(multiplayer||(!playerDead&&!singlePlayerObserver)||!rooms.length)return;
 
   resetDeathForNewMap();
 
@@ -8283,6 +8270,7 @@ let physicsRemotePlayers=new Map();
 let physicsUavColliders=[],physicsUavIndex=0;
 
 function physicsBeginWorld(){
+  stadiumTurretCache.clear();
   uavSightRules.clear();uavSightContext=null;swatVan=null;swatVanHandles=[];swatVanVerts=[];
   gunWallSurfaces.clear();gunWallContext=null;gunDecals.length=0;gunImpactBursts.length=0;gunDecalsDirty=true;
   glassReset();
@@ -8423,7 +8411,7 @@ function syncPlayerPhysicsState(){
 function resetPlayerPhysics(feet=FLOOR_TOP+PHYSICS_SKIN){
   playerFeetY=Number.isFinite(feet)?feet:FLOOR_TOP+PHYSICS_SKIN;
   playerVerticalVelocity=0;playerGrounded=false;playerJumpQueued=false;physicsAccumulator=0;
-  if(playerCollider)playerCollider.setShape(playerShape());
+  if(playerCollider){playerCollider.setShape(playerShape());playerCollider.setEnabled(!playerDead&&!singlePlayerObserver);}
   syncPlayerPhysicsState();
   if(physicsWorld)physicsWorld.step();
 }
@@ -8473,8 +8461,8 @@ function physicsPlayerStep(vx,vz,dt){
     playerController.disableSnapToGround();playerController.disableAutostep();
   }
   const desired={x:vx*dt,y:playerVerticalVelocity*dt,z:vz*dt};
-  playerController.computeColliderMovement(playerCollider,desired);
-  if(glassPlayerContacts())playerController.computeColliderMovement(playerCollider,desired);
+  playerController.computeColliderMovement(playerCollider,desired,RAPIER.QueryFilterFlags.EXCLUDE_SENSORS);
+  if(glassPlayerContacts())playerController.computeColliderMovement(playerCollider,desired,RAPIER.QueryFilterFlags.EXCLUDE_SENSORS);
   const movement=playerController.computedMovement();
   px+=movement.x;playerFeetY+=movement.y;pz+=movement.z;
   playerGrounded=playerController.computedGrounded()&&playerVerticalVelocity<=0;
@@ -8487,8 +8475,9 @@ function physicsPlayerStep(vx,vz,dt){
   physicsWorld.step();
 }
 function updatePlayerPhysics(dt){
-  if(!physicsWorld||!playerCollider||playerDead||spectatorActive)return;
+  if(!physicsWorld)return;
   physicsSyncRemotePlayers();
+  if(!playerCollider||playerDead||singlePlayerObserver||spectatorActive)return;
   let forward=(keys.KeyW?1:0)-(keys.KeyS?1:0);
   let right=(keys.KeyD?1:0)-(keys.KeyA?1:0);
   if(mapOpen){forward=0;right=0;}
@@ -8519,6 +8508,7 @@ addUavBox=function(cx,cy,cz,sx,sy,sz,yaw,col,bank=0){
 };
 const physicsRenderUavs=rebuildUavDynamicMeshes;
 rebuildUavDynamicMeshes=function(){
+  stadiumSyncGeometry();
   physicsUavIndex=0;
   physicsRenderUavs();
   while(physicsUavColliders.length>physicsUavIndex)physicsWorld.removeCollider(physicsUavColliders.pop(),false);
@@ -9631,7 +9621,7 @@ function rebuildSurvivorCandidateSpots(){
   ];
 }
 function predictedDroneOrigin(drone,futureSec){
-  if(drone.stationary)return {x:drone.x,y:drone.y,z:drone.z};
+  if(drone.stationary)return uavScannerOrigin(drone);
   const a=drone.phase+((uavElapsed+Math.max(0,futureSec))/UAV_ORBIT_PERIOD_SEC)*Math.PI*2;
   return {
     x:drone.cx+Math.cos(a)*drone.radius,
@@ -9761,7 +9751,7 @@ function survivorSpotVisibleToDrone(drone,spot,futureSec=0){
   if(!uavEnabled)return false;
   const from=futureSec>0
     ? predictedDroneOrigin(drone,futureSec)
-    : {x:drone.x,y:drone.y,z:drone.z};
+    : uavScannerOrigin(drone);
 
   const target={
     x:spot.x,
@@ -9769,7 +9759,7 @@ function survivorSpotVisibleToDrone(drone,spot,futureSec=0){
     z:spot.z
   };
 
-  return staticUavLosFromTo(from,target);
+  return uavTrackPoint(drone,target,from);
 }
 
 function survivorEstimateDroneHandoffSeconds(agent,drone){
@@ -10437,7 +10427,7 @@ function survivorStripInteriorWaypointsAfterRunout(agent){
 }
 
 function survivorAutonomyActive(){
-  return playerDead||(!multiplayer&&survivorLivingRunoutMode);
+  return playerDead||singlePlayerObserver||(!multiplayer&&survivorLivingRunoutMode);
 }
 function survivorPointNearAnyDoorway(x,z,margin=1.05){
   for(const [k,kind] of doorways){
@@ -13047,7 +13037,7 @@ function nav3Plan(agent,target=null,emergency=false){
 function npcEnsureController(){
   if(nav3Probe)return;
   nav3Probe=physicsWorld.createCollider(RAPIER.ColliderDesc.capsule(FOLLOWER_HEIGHT/2-FOLLOWER_RADIUS,FOLLOWER_RADIUS)
-    .setSensor(true).setTranslation(0,200,0));
+    .setSensor(true).setEnabled(false).setTranslation(0,200,0));
   nav3Controller=physicsWorld.createCharacterController(NPC_SKIN);
   nav3Controller.setSlideEnabled(true);nav3Controller.setMaxSlopeClimbAngle(50*Math.PI/180);
   nav3Controller.setMinSlopeSlideAngle(51*Math.PI/180);
@@ -13080,8 +13070,10 @@ function npcStep(agent,dt,speed){
   agent.vy=Math.max(-45,vy-PLAYER_GRAVITY*dt);
   if(agent.grounded&&!agent.motion){nav3Controller.enableAutostep(.16,.12,false);nav3Controller.enableSnapToGround(.12);}
   else{nav3Controller.disableAutostep();nav3Controller.disableSnapToGround();}
+  nav3Probe.setEnabled(true);
   nav3Probe.setTranslation({x,y:y+FOLLOWER_HEIGHT/2,z});
-  nav3Controller.computeColliderMovement(nav3Probe,{x:vx*dt,y:vertical,z:vz*dt},undefined,undefined,staticGeometry);
+  try{nav3Controller.computeColliderMovement(nav3Probe,{x:vx*dt,y:vertical,z:vz*dt},undefined,undefined,staticGeometry);}
+  finally{nav3Probe.setEnabled(false);}
   const moved=nav3Controller.computedMovement();
   x+=moved.x;y+=moved.y;z+=moved.z;
   agent.grounded=nav3Controller.computedGrounded()&&agent.vy<=0;
@@ -13130,8 +13122,8 @@ function nav3Sight(d,p,t=0){
   if(!uavEnabled)return false;
   if(d.navClock==null)return survivorSpotVisibleToDrone(d,p,t);
   const angle=d.phase+((d.navClock+t)/UAV_ORBIT_PERIOD_SEC)*Math.PI*2;
-  const from=d.stationary?d:{x:d.cx+Math.cos(angle)*d.radius,y:d.y,z:d.cz+Math.sin(angle)*d.radius};
-  return staticUavLosFromTo(from,{x:p.x,y:p.y+FOLLOWER_HEIGHT*.62,z:p.z});
+  const from=d.stationary?uavScannerOrigin(d):{x:d.cx+Math.cos(angle)*d.radius,y:d.y,z:d.cz+Math.sin(angle)*d.radius};
+  return uavTrackPoint(d,{x:p.x,y:p.y+FOLLOWER_HEIGHT*.62,z:p.z},from);
 }
 function nav3States(a,snapshot=false){
   const p=nav3Here(a);
@@ -13447,7 +13439,7 @@ function rayHitsAabb3D(a,b,x0,y0,z0,x1,y1,z1){
 function uavHasLineOfSight(drone,entity){
   if(!uavEnabled)return false;
   const target=entity.getPoint();
-  return !!target&&staticUavLosFromTo({x:drone.x,y:drone.y,z:drone.z},target);
+  return !!target&&uavTrackPoint(drone,target);
 }
 
 function currentUavEntities(){
@@ -13554,7 +13546,7 @@ function updateUavKillFlash(dt){
   uavKillFlash.style.opacity=String(opacity);
 }
 function updateLavaHazard(){
-  if(playerDead||routeGhost||!usingElevatedTurretTileset())return;
+  if(playerDead||singlePlayerObserver||routeGhost||!usingElevatedTurretTileset())return;
   if(!lavaGapAtWorld(px,pz))return;
 
   const feet=playerAbsoluteFeetY();
@@ -13569,9 +13561,11 @@ function updateLavaHazard(){
 }
 
 function beginPlayerDeath(killerId){
+  if(singlePlayerObserver)return;
   if(routeBecomeGhost(killerId))return;
   if(playerDead)return;
   playerDead=true;
+  if(playerCollider)playerCollider.setEnabled(false);
 
   singlePlayerDeathX=px;
   singlePlayerDeathZ=pz;
@@ -13660,7 +13654,8 @@ function updateDeathState(dt){
 }
 function resetDeathForNewMap(){
   gunReset();
-  const wasDead=playerDead;
+  const wasDead=playerDead||singlePlayerObserver;
+  singlePlayerObserver=false;
   playerDead=false;
   uavKillFlashTimer=0;
   uavKillFlash.style.opacity='0';
@@ -13709,14 +13704,14 @@ function resetUavEntityRegistryForMode(){
     return;
   }
   localUavEntityId=1;
-  registerUavEntity(
+  if(!singlePlayerObserver)registerUavEntity(
     1,'player','YOU',
     ()=>({
       x:px,
       y:playerSurfaceYAt(px,pz)+playerVerticalOffset+localPlayerTargetHeight(),
       z:pz
     }),
-    ()=>!playerDead&&!routeGhost,
+    ()=>!playerDead&&!routeGhost&&!singlePlayerObserver,
     drone=>beginPlayerDeath(drone.id)
   );
   registerUavEntity(2,'npc','BLUE MAN',
@@ -13759,9 +13754,9 @@ function resetUavSystemForMap(){
       const [x,z]=placements[i];
       const yaw=Math.atan2(cz-z,cx-x);
       uavDrones.push({
-        id:'UAV_'+(i+1),phase:0,cx:x,cz:z,radius:0,y,x,z,yaw,
+        id:'UAV_'+(i+1),phase:0,cx:x,cz:z,radius:0,y,x,z,yaw,bodyYaw:yaw,gunPitch:0,
         targetId:null,timers:new Map(),glare:0,
-        stationary:true,turret:true,pitchDown:Math.PI/4
+        stationary:true,turret:true,pitchDown:0
       });
     }
   }else{
@@ -13851,6 +13846,7 @@ function updateUavs(dt){
     }
 
     if(target){
+      uavAimAtLock(d,target);
       d.glare=Math.min(1,d.glare+dt/0.5);
       const left=d.timers.get(target.id)??uavTimeMax(d);
       if(left<=0&&target.isAlive()){
@@ -14321,10 +14317,11 @@ function frame(now){
   // poison WASD/Shift/C state.
   syncGameplayKeysFromPhysicalState();
 
+  updateSpectatorFreecam(dt);
   updatePlayerPhysics(dt);
   routeTick(dt);
   updateLavaHazard();
-  if(!playerDead&&playerFeetY<outsideGroundY()-12)beginPlayerDeath("FALL");
+  if(!playerDead&&!singlePlayerObserver&&playerFeetY<outsideGroundY()-12)beginPlayerDeath("FALL");
   glassFlush();
   gunUpdate();
   routeHud();
@@ -14444,13 +14441,13 @@ addEventListener('keydown',e=>{
 
     tipEl.textContent=
       'NPC MODE: '+(survivorLivingRunoutMode?'RUNOUT AI':'FOLLOW PLAYER')+
-      ' · L toggle · P add survivor · T respawn after death · M map';
+      ' · L toggle · P add survivor · T respawn · 0 freecam · V spectate · M map';
     return;
   }
 
   if(!multiplayer&&e.code==='KeyT'){
     e.preventDefault();
-    if(playerDead)respawnSinglePlayer();
+    if(playerDead||singlePlayerObserver)respawnSinglePlayer();
     return;
   }
 
@@ -14462,7 +14459,7 @@ addEventListener('keydown',e=>{
 
   // While dead, Q explicitly switches between third-person spectator and
   // the normal tactical map. Target cycling is handled by mouse clicks now.
-  if(playerDead&&e.code==='KeyQ'){
+  if((playerDead||singlePlayerObserver)&&e.code==='KeyQ'){
     e.preventDefault();
 
     if(mapOpen){
@@ -14479,8 +14476,7 @@ addEventListener('keydown',e=>{
   if(e.code==='KeyV'){
     e.preventDefault();
 
-    // V only has meaning after death.
-    if(!playerDead)return;
+    if(multiplayer&&!playerDead)return;
 
     if(spectatorActive){
       stopSpectating(false);
@@ -14498,7 +14494,7 @@ addEventListener('keydown',e=>{
     if(mapOpen){
       setMapVisible(false);
 
-      if(playerDead){
+      if(playerDead||singlePlayerObserver){
         startSpectating(true);
       }else{
         try{canvas.requestPointerLock();}catch(_){}
@@ -14510,9 +14506,9 @@ addEventListener('keydown',e=>{
     return;
   }
 
-  if((e.code==='Digit0'||e.code==='Numpad0')&&spectatorActive&&!mapOpen){
+  if((e.code==='Digit0'||e.code==='Numpad0')&&(!multiplayer||spectatorActive)){
     e.preventDefault();
-    if(!e.repeat)toggleSpectatorFreecam();
+    if(!e.repeat){if(!spectatorActive&&!multiplayer)routeFreecam();else if(!mapOpen)toggleSpectatorFreecam();}
     return;
   }
 
@@ -14761,7 +14757,7 @@ function gunTrace(o,d,shooter,weapon='glock'){
  if(!multiplayer)for(const p of routePlayers.values())if(p.alive&&p.id!==shooter){
   const t=gunCapsuleHit(o,d,p);if(t<victimDistance){victim={...p,replay:p};victimDistance=t;}
  }
- if(!multiplayer&&shooter!==localPeerId&&String(shooter).startsWith('route:')&&!playerDead&&!routeGhost){
+ if(!multiplayer&&shooter!==localPeerId&&String(shooter).startsWith('route:')&&!playerDead&&!singlePlayerObserver&&!routeGhost){
   const p={id:localPeerId,livePlayer:true,x:px,z:pz,feetY:playerFeetY,crouch:playerCrouchAmount};
   const t=gunCapsuleHit(o,d,p);if(t<victimDistance){victim=p;victimDistance=t;}
  }
@@ -14924,7 +14920,7 @@ function gunShootWorld(p,id,seq){
 
 function gunAuthority(id,msg){
  if(multiplayer&&!isHost)return false;
- const p=multiplayer?netPlayers.get(id):{id:localPeerId,x:px,z:pz,feetY:playerFeetY,crouch:playerCrouchAmount,alive:!playerDead,gun:gunLocal};
+ const p=multiplayer?netPlayers.get(id):{id:localPeerId,x:px,z:pz,feetY:playerFeetY,crouch:playerCrouchAmount,alive:!playerDead&&!singlePlayerObserver,gun:gunLocal};
  if(!p||p.alive===false||msg.generation!==mapGeneration||!WEAPONS[msg.weapon])return false;
  const s=gunState(p);gunFinishReload(s);
  if(!Number.isSafeInteger(msg.seq)||msg.seq<=s.lastSeq)return false;s.lastSeq=msg.seq;
@@ -14941,7 +14937,7 @@ function gunAuthority(id,msg){
  routeRecordAction(msg,p);gunShootWorld(p,id,msg.seq);return true;
 }
 function gunFire(){
- if(!gameStarted||playerDead||mapOpen||spectatorActive||!locked||isMenuOrTextInputActive())return;
+ if(!gameStarted||playerDead||singlePlayerObserver||mapOpen||spectatorActive||!locked||isMenuOrTextInputActive())return;
  const s=gunSelf();gunFinishReload(s);const w=WEAPONS[s.equipped];if(s.reloadEnd||s.ammo<=0||gunNow()<(s.localNext||0))return;
  s.localNext=gunNow()+w.interval;
  const msg={type:'gunFire',generation:mapGeneration,seq:++gunSeq,weapon:s.equipped,yaw,pitch,motion:multiplayer&&!isHost?netMakeState():undefined};
@@ -14949,13 +14945,13 @@ function gunFire(){
  gunFlashes.set(localPeerId,gunNow());gunSound(false,msg.weapon);
 }
 function gunSwitch(weapon){
- if(!WEAPONS[weapon]||!gameStarted||playerDead||spectatorActive||isMenuOrTextInputActive())return;
+ if(!WEAPONS[weapon]||!gameStarted||playerDead||singlePlayerObserver||spectatorActive||isMenuOrTextInputActive())return;
  const s=gunSelf();if(s.equipped===weapon)return;
  const msg={type:'gunSwitch',generation:mapGeneration,seq:++gunSeq,weapon};s.localNext=gunNow()+.20;
  if(multiplayer&&!isHost){gunPredict(msg);sendConn(hostConn,msg);}else gunAuthority(localPeerId,msg);
 }
 function gunReload(){
- if(!gameStarted||playerDead||mapOpen||spectatorActive||isMenuOrTextInputActive())return;
+ if(!gameStarted||playerDead||singlePlayerObserver||mapOpen||spectatorActive||isMenuOrTextInputActive())return;
  const s=gunSelf(),w=WEAPONS[s.equipped];if(s.reloadEnd||s.ammo===w.mag)return;
  const msg={type:'gunReload',generation:mapGeneration,seq:++gunSeq,weapon:s.equipped};
  if(multiplayer&&!isHost){gunPredict(msg);sendConn(hostConn,msg);}else gunAuthority(localPeerId,msg);gunReloadVisual=gunNow();
@@ -14964,7 +14960,7 @@ function gunUpdate(){
  if(isHost)for(const p of netPlayers.values())gunFinishReload(gunState(p));
  const s=gunSelf(),w=WEAPONS[s.equipped];if(!multiplayer)gunFinishReload(s);if(playerDead)s.hp=0;
  if(gunTrigger&&w.automatic)gunFire();
- const show=gameStarted&&!isMenuOrTextInputActive();gunHud.style.display=show?'block':'none';gunCross.style.display=show&&!mapOpen&&!playerDead&&!spectatorActive?'block':'none';
+ const show=gameStarted&&!singlePlayerObserver&&!isMenuOrTextInputActive();gunHud.style.display=show?'block':'none';gunCross.style.display=show&&!mapOpen&&!playerDead&&!spectatorActive?'block':'none';
  document.getElementById('gunHealthText').textContent=Math.ceil(s.hp)+' / 100 HP';document.getElementById('gunHealthFill').style.width=s.hp+'%';document.getElementById('gunHealthFill').style.background=s.hp<=25?'#ff4e43':'#51e0ad';
  document.getElementById('gunWeapon').textContent=w.name+' · '+BULLETS[w.bullet].label+' · PEN '+BULLETS[w.bullet].penetration;
  document.getElementById('gunAmmo').textContent=s.reloadEnd?'RELOADING…':s.ammo+' / '+w.mag;
@@ -15033,7 +15029,7 @@ function gunAKModel(out,p){
  box(-.016,-.045-drop*.25,-.30,.10,.065,.11,[.13,.14,.15]);box(-.055,-.096-drop*.15,-.21,.074,.082,.16,[.42,.27,.18]);
  if(pose.shot>.4){box(0,.025,-.775,.11*pose.shot,.09*pose.shot,.14,[1,.60,.12]);box(0,.025,-.81,.025,.025,.19,[1,.96,.63]);}
 }
-function gunModel(out,p){if(gunState(p).equipped==='ak')gunAKModel(out,p);else gunGlockModel(out,p);}
+function gunModel(out,p,localFirstPerson=false){const start=out.length;if(gunState(p).equipped==='ak')gunAKModel(out,p);else gunGlockModel(out,p);if(localFirstPerson&&uavLocalTargeted())uavTintHeldGun(out,start);}
 // Separate translucent pass keeps the live ghost's item from fading replay guns,
 // bullet tracers or map effects. Draw after all opaque actors and glass.
 const ghostGunBuffer=gl.createBuffer(),ghostGunProg=gl.createProgram();
@@ -15067,8 +15063,8 @@ function renderGuns(mapCamera){
  if(!mapCamera)glassShardMesh(out);
  if(multiplayer){for(const p of netPlayers.values())if(p.alive!==false){
   const local=p.id===localPeerId;if(local&&!mapCamera&&(playerDead||spectatorActive))continue;
-  gunModel(out,local?{...p,x:px,z:pz,feetY:playerFeetY,yaw,pitch,crouch:playerCrouchAmount}:netRenderPlayer(p));
- }}else if(!playerDead&&!spectatorActive&&!routeGhost)gunModel(out,{id:localPeerId,x:px,z:pz,feetY:playerFeetY,yaw,pitch,crouch:playerCrouchAmount,gun:gunLocal});
+  gunModel(out,local?{...p,x:px,z:pz,feetY:playerFeetY,yaw,pitch,crouch:playerCrouchAmount}:netRenderPlayer(p),local&&!mapCamera);
+ }}else if(!playerDead&&!singlePlayerObserver&&!spectatorActive&&!routeGhost)gunModel(out,{id:localPeerId,x:px,z:pz,feetY:playerFeetY,yaw,pitch,crouch:playerCrouchAmount,gun:gunLocal},!mapCamera);
  const now=gunNow();
  for(let i=gunTraces.length-1;i>=0;i--){const e=gunTraces[i],age=now-e.at;if(age>Math.max(.22,Math.hypot(e.end.x-e.from.x,e.end.y-e.from.y,e.end.z-e.from.z)/(WEAPONS[e.weapon]?.visualSpeed||520)+.06)){gunTraces.splice(i,1);continue;}
   const a=e.from,b=e.end,dx=b.x-a.x,dy=b.y-a.y,dz=b.z-a.z,len=Math.hypot(dx,dy,dz)||1;
@@ -15089,7 +15085,7 @@ addEventListener('blur',()=>gunTrigger=false);
 document.addEventListener('pointerlockchange',()=>{if(document.pointerLockElement!==canvas)gunTrigger=false;});
 addEventListener('keydown',e=>{if(e.repeat)return;if(e.code==='KeyR')gunReload();if(e.code==='Digit1')gunSwitch('ak');if(e.code==='Digit2')gunSwitch('glock');});
 
-const NET_PROTOCOL='gridlock-argus-19';
+const NET_PROTOCOL='gridlock-stadium-23';
 function netVersionError(){stopClientHandshakeRetry();clientHandshakeComplete=false;try{if(hostConn)hostConn.close();}catch(_){}showMainMenu();showMenuStatus('Game versions differ. Everyone must open the same updated HTML file.');}
 let netMoveSeq=0,netWorldSeq=0,netLastWorldSeq=-1,netCorrectionSeq=-1,netLocalEpoch=0,netMotionTimer=0;
 const netPoseHistory=new Map(),netLocalSamples=[];
@@ -15221,7 +15217,7 @@ function netApplyCorrection(msg){
 function netInstallTransport(conn){
  if(!conn||conn.gridlockFast||!conn.peerConnection)return;
  try{
-  const dc=conn.peerConnection.createDataChannel('gridlock-motion-19',{negotiated:true,id:2,ordered:false,maxRetransmits:0});conn.gridlockFast=dc;
+  const dc=conn.peerConnection.createDataChannel('gridlock-motion-23',{negotiated:true,id:2,ordered:false,maxRetransmits:0});conn.gridlockFast=dc;
   dc.onmessage=e=>{try{
    const msg=JSON.parse(e.data);if(!msg||typeof msg!=='object')return;
    if(isHost){if(conn.gridlockProtocol===NET_PROTOCOL&&msg.type==='playerState')handleHostMessage(conn,msg);}
@@ -15524,7 +15520,7 @@ function routeSample(force=false){
 }
 function routeStart(id,name=''){
  if(routeRecording){routeSay('Finish the current route with /endrecording first.');return false;}
- if(playerDead||spectatorActive){routeSay('Press T to respawn before starting a recording.');return false;}
+ if(playerDead||singlePlayerObserver||spectatorActive){routeSay('Press T to respawn before starting a recording.');return false;}
  routeSeed=seed;routeGhost=false;
  routeRestoreWindows();
  routeResetOrbit();
@@ -15645,7 +15641,7 @@ function routeHud(){
  const alive=[...routePlayers.values()].filter(p=>p.alive).length;
  routeStatus.textContent=routeRecording
   ?(routeGhost?'GHOST · ':'RECORDING · ')+routeRecording.name+' · '+routeRecording.time.toFixed(1)+'s · /endrecording'
-  :'/ command chat · '+routeRecordings.size+' saved · '+alive+'/'+routePlayers.size+' replays alive';
+  :(singlePlayerObserver?'SPECTATOR · T respawn · ':'/ command chat · ')+routeRecordings.size+' saved · '+alive+'/'+routePlayers.size+' replays alive';
  routeStatus.textContent+=' · SYNC '+(routeSyncEnabled?'ON':'OFF')+' · SHOW '+(routeShowRecordings?'ON':'OFF')+' · LAST '+(routeLastDuringPlay?'ON':'OFF')+' · '+(uavFunMode?'FUNMODE':'REALISM')+' · UAV '+(uavEnabled?'ON':'OFF');
  if(routeGhost){document.getElementById('gunHealthText').textContent='GHOST · Recording continues';document.getElementById('gunHealthFill').style.background='#56dfff';}
 }
@@ -15685,6 +15681,8 @@ function routeCommand(text){
   return cmd==='/record'?routeStart(id,parts.slice(2).join(' ')):routePlay(id);
  }
  if(parts.length!==1){routeSay('Unknown command. Use /help.');return false;}
+ if(cmd==='/spectate')return routeSpectate();
+ if(cmd==='/freecam')return routeFreecam();
  if(cmd==='/retry')return routeRetry();
  if(cmd==='/novan')return swatRemove();
  if(cmd==='/funmode')return uavSetFunMode(!uavFunMode);
@@ -15705,7 +15703,7 @@ function routeCommand(text){
   routeSay(routeRecordings.size?[...routeRecordings.values()].map(r=>'#'+r.id+' · '+(r.name||'Recording #'+r.id)+' · '+r.duration.toFixed(2)+'s · '+(r.actions||[]).filter(a=>a.type==='gunFire').length+' shots · '+(r.synced?'SYNC':'UNSYNC')+(r.ghostAt!==null?' · ghost at '+r.ghostAt.toFixed(2)+'s':'')).join('\n'):'No saved routes for this map.');return false;
  }
  if(cmd==='/help'||cmd==='/'){
-  routeSay('/record # [name] — start a named route\n/retry — restart the current take from its original start\n/endrecording — save and return to start\n/playrecord # — start/restart one replay\n/playall — restart all routes together\n/stopplay — stop replays and clear their bodies\n/recordings — list routes\n/deleterec # — delete one recording\n/deleteall — delete all recordings\n/removenpcs — remove default AI survivors\n/sync — toggle shared UAV start timing\n/recordingshow — toggle other replays during recording\n/freecammap — toggle flat map style in dead freecam\n/lastduringplay — toggle live player last during playback\n/funmode — toggle solid cover for all UAV sight\n/realism — return to realism sight rules\n/novan — remove the van and ARGUS for this map\n/uavlist — list UAV names and kill times\n/ttk UAV_1 2.5 — set one UAV kill time in seconds\n/ttkall 2.5 — set all UAV kill times\n/uavoff / /uavon — disable / enable UAV targeting\nReplays repeat movement and gun actions against the current scene. Fresh recordings, retries and playback from the start restore all windows; replay shots and contact break them again. Same-seed resets keep saved routes; a different seed clears them.');return false;
+  routeSay('/record # [name] — start a named route\n/retry — restart the current take from its original start\n/endrecording — save and return to start\n/playrecord # — start/restart one replay\n/playall — restart all routes together\n/stopplay — stop replays and clear their bodies\n/recordings — list routes\n/deleterec # — delete one recording\n/deleteall — delete all recordings\n/removenpcs — remove default AI survivors\n/sync — toggle shared UAV start timing\n/recordingshow — toggle other replays during recording\n/spectate — despawn and follow a target (T to respawn)\n/freecam — despawn and fly freely (also press 0)\n/freecammap — toggle flat map style in freecam\n/lastduringplay — toggle live player last during playback\n/funmode — toggle solid cover for all UAV sight\n/realism — return to realism sight rules\n/novan — remove the van and ARGUS for this map\n/uavlist — list UAV names and kill times\n/ttk UAV_1 2.5 — set one UAV kill time in seconds\n/ttkall 2.5 — set all UAV kill times\n/uavoff / /uavon — disable / enable UAV targeting\nReplays repeat movement and gun actions against the current scene. Fresh recordings, retries and playback from the start restore all windows; replay shots and contact break them again. Same-seed resets keep saved routes; a different seed clears them.');return false;
  }
  routeSay('Unknown command. Use /help.');return false;
 }
@@ -15847,6 +15845,7 @@ function routeToggleShow(){
  return true;
 }
 function routeRemoveNpcs(){
+ if(nav3Probe)nav3Probe.setEnabled(false);
  const ids=new Set([2,...extraSurvivors.map(a=>a.id)]);
  followerAlive=false;primarySurvivorBrain=null;extraSurvivors=[];followerWaypoints=[];followerWaypointIndex=0;
  nav3Pending.clear();survivorGroupPlan=null;survivorGroupDecisionMade=false;
@@ -15855,10 +15854,10 @@ function routeRemoveNpcs(){
  rebuildFollowerMesh();rebuildExtraSurvivorMesh();rebuildDeathMarkerMesh();
  routeSay('Default AI survivors removed. Replay NPCs and saved recordings kept.');return true;
 }
-function routeUseMapFreecam(){return routeFreecamMap&&playerDead&&spectatorActive&&spectatorFreecamActive;}
+function routeUseMapFreecam(){return routeFreecamMap&&(playerDead||singlePlayerObserver)&&spectatorActive&&spectatorFreecamActive;}
 function routeToggleFreecamMap(){
  routeFreecamMap=!routeFreecamMap;
- if(routeFreecamMap&&playerDead){if(!spectatorActive)startSpectating(true);if(spectatorActive&&!spectatorFreecamActive)enterSpectatorFreecam();}
+ if(routeFreecamMap)routeFreecam();
  routeSay('Freecam map style '+(routeFreecamMap?'ON: flat map colors and map markers.':'OFF: normal textured view.'));
  return true;
 }
@@ -16019,6 +16018,309 @@ const funModeOption=document.getElementById('funModeOption'),swatVanOption=docum
 funModeOption.checked=uavFunMode;swatVanOption.checked=swatVanEnabled;
 funModeOption.addEventListener('change',()=>{uavFunMode=!!funModeOption.checked;});
 swatVanOption.addEventListener('change',()=>{swatVanEnabled=!!swatVanOption.checked;});
+
+// Single-player observation is a despawn, separate from death and its corpse.
+let singlePlayerObserver=false;
+function enterSinglePlayerObserver(){
+ if(multiplayer||singlePlayerObserver)return;
+ const take=routeRecording?.id;
+ if(routeRecording)routeEnd();
+ singlePlayerObserver=true;playerDead=false;routeGhost=false;routeGhostDiedUntil=0;
+ deathPhase='spectating';deathTimer=0;deathKillerId='';deadMapActive=false;
+ deathFade.style.opacity='0';deadHud.style.display='none';
+ uavKillFlashTimer=0;uavKillFlash.style.opacity='0';
+ singlePlayerDeathX=NaN;singlePlayerDeathZ=NaN;singlePlayerDeathYaw=0;
+ deathMarkers=deathMarkers.filter(m=>String(m.peerId)!=='single-self');rebuildDeathMarkerMesh();
+ singlePlayerMapCapsuleVertexCount=0;
+ if(playerCollider)playerCollider.setEnabled(false);
+ unregisterUavEntity(1);
+ for(const d of uavDrones){d.timers.delete(1);if(d.targetId===1){d.targetId=null;d.glare=0;}}
+ clearPhysicalGameplayKeys();clearAllGameKeys();gunTrigger=false;
+ gunHud.style.display='none';gunCross.style.display='none';updateUavStatusHud();
+ if(take)routeSay('Saved recording #'+take+' before spectating. T respawns you.');
+}
+function routeSpectate(){
+ if(!startSpectating(true))return false;
+ if(buildSpectatorTargets().length)spectatorFreecamActive=false;
+ updateSpectatorHud();routeSay('Spectating · your player is despawned. 0 freecam · T respawn.');return true;
+}
+function routeFreecam(){
+ const fromPlayer=!singlePlayerObserver&&!spectatorActive;
+ const eye={x:px,y:playerFeetY+localPlayerEyeHeight(),z:pz,yaw,pitch};
+ if(!startSpectating(true))return false;
+ if(!spectatorFreecamActive)enterSpectatorFreecam();
+ if(fromPlayer){spectatorFreecamX=eye.x;spectatorFreecamY=eye.y;spectatorFreecamZ=eye.z;spectatorFreecamYaw=eye.yaw;spectatorFreecamPitch=eye.pitch;}
+ updateSpectatorHud();routeSay('Freecam · WASD move · Space/C up/down · Shift fast · T respawn.');return true;
+}
+function physicsRemoveRemotePlayer(id){
+ const entry=physicsRemotePlayers.get(String(id));if(!entry)return;
+ physicsWorld.removeCollider(entry.collider,false);physicsRemotePlayers.delete(String(id));
+}
+function uavAimAtLock(d,target){
+ if(!d.stationary||!d.turret||!target)return;
+ const point=target.getPoint();
+ if(isStadiumTurret(d)&&!Number.isFinite(d.bodyYaw))d.bodyYaw=d.yaw||0;
+ if(point&&Math.hypot(point.x-d.x,point.z-d.z)>1e-6)d.yaw=Math.atan2(point.z-d.z,point.x-d.x);
+ if(point&&isStadiumTurret(d)){
+  const pivot=stadiumPose(d,true);
+  d.gunPitch=Math.atan2(point.y-pivot.y,Math.hypot(point.x-pivot.x,point.z-pivot.z));
+  stadiumClampGun(d);
+ }
+ // No target means no change: yaw retains the last visible lock position,
+ // including after death, despawn, lost LOS, /uavoff and recording resets.
+}
+
+// Personal lock feedback: never changes remote weapon colors or other players' HUDs.
+function uavFirstPersonLocal(){return gameStarted&&worldGeometryReady&&!mapOpen&&!spectatorActive&&!playerDead&&!singlePlayerObserver;}
+function uavLocalLocks(){return uavEnabled&&!routeGhost?uavDrones.filter(d=>d.targetId===localUavEntityId):[];}
+function uavLocalTargeted(){return uavFirstPersonLocal()&&uavLocalLocks().length>0;}
+function uavTintHeldGun(out,start){
+ for(let i=start+6;i<out.length;i+=9){out[i]=Math.min(1,out[i]*.55+.60);out[i+1]*=.26;out[i+2]*=.22;}
+}
+function uavGhostVisibleDrones(){
+ if(multiplayer||!routeGhost||!uavEnabled||singlePlayerObserver)return [];
+ const point={x:px,y:playerFeetY+localPlayerTargetHeight(),z:pz};
+ return uavDrones.filter(d=>uavTrackPoint(d,point));
+}
+function uavGhostSightLines(){
+ const point={x:px,y:playerFeetY+localPlayerTargetHeight(),z:pz};
+ for(const d of uavGhostVisibleDrones()){
+  const origin=uavScannerOrigin(d);
+  // These are local diagnostic beams. They neither acquire a lock nor drain a
+  // timer, so the real replay/NPC target and its red glare continue unchanged.
+  UBV(origin.x,origin.y,origin.z,.28,.84,1);UBV(point.x,point.y,point.z,.28,.84,1);
+ }
+}
+const uavEyeStyle=document.createElement('style');
+uavEyeStyle.textContent=`
+#uavEyeLayer{position:fixed;inset:0;z-index:28;pointer-events:none;overflow:hidden;display:none}
+.uavEyeMarker{position:absolute;transform:translate(-50%,-50%);width:38px;height:38px;display:flex;align-items:center;justify-content:center;border-radius:50%;background:#171303b8;filter:drop-shadow(0 1px 3px #000);color:#ffdf32}
+.uavEyeMarker svg{width:30px;height:25px;overflow:visible}
+.uavEyeDirection{position:absolute;left:50%;top:50%;transform-origin:0 0}
+.uavEyeArrow{position:absolute;left:25px;top:-5px;width:0;height:0;border-top:5px solid transparent;border-bottom:5px solid transparent;border-left:10px solid #ffdf32}
+.uavEyeName{position:absolute;left:50%;top:39px;transform:translateX(-50%);font:700 10px/1.2 Consolas,monospace;white-space:nowrap;text-shadow:0 1px 3px #000}
+.uavEyeMarker.ghost{color:#78ddff;background:#061923b8}.uavEyeMarker.ghost svg path{stroke:#78ddff}.uavEyeMarker.ghost svg circle{fill:#78ddff}.uavEyeMarker.ghost svg circle:last-child{fill:#e6fbff}.uavEyeMarker.ghost .uavEyeArrow{border-left-color:#78ddff}
+body.menu-open #uavEyeLayer,body.map-open #uavEyeLayer{display:none!important}
+`;
+document.head.appendChild(uavEyeStyle);
+const uavEyeLayer=document.createElement('div');uavEyeLayer.id='uavEyeLayer';uavEyeLayer.setAttribute('aria-hidden','true');document.body.appendChild(uavEyeLayer);
+const uavEyeMarkers=new Map();
+function uavEyePosition(d,width=innerWidth,height=innerHeight){
+ if(isStadiumTurret(d))d=uavScannerOrigin(d);
+ const x=view[0]*d.x+view[4]*d.y+view[8]*d.z+view[12];
+ const y=view[1]*d.x+view[5]*d.y+view[9]*d.z+view[13];
+ const z=view[2]*d.x+view[6]*d.y+view[10]*d.z+view[14];
+ const pad=52,hw=Math.max(12,width*.5-pad),hh=Math.max(12,height*.5-pad);
+ let dx=proj[0]*x*width*.5,dy=-proj[5]*y*height*.5;
+ const front=z<-.001,sx=front?dx/-z:0,sy=front?dy/-z:0;
+ if(front&&Math.abs(sx)<=hw&&Math.abs(sy)<=hh)return {x:width*.5+sx,y:height*.5+sy,offscreen:false,angle:0};
+ // Using camera-space lateral/up components avoids reversing arrows for points
+ // behind the camera. Directly behind falls back to the bottom edge.
+ if(Math.hypot(dx,dy)<.01){dx=0;dy=1;}
+ const scale=Math.min(hw/Math.max(1e-9,Math.abs(dx)),hh/Math.max(1e-9,Math.abs(dy)));
+ return {x:width*.5+dx*scale,y:height*.5+dy*scale,offscreen:true,angle:Math.atan2(dy,dx),verticalEdge:Math.abs(dx)*hh>=Math.abs(dy)*hw};
+}
+function updateUavEyeMarkers(){
+ const show=uavFirstPersonLocal();uavEyeLayer.style.display=show?'block':'none';
+ if(!show)return;
+ const locks=routeGhost?uavGhostVisibleDrones():uavLocalLocks(),keep=new Set(),placed=[];
+ for(const d of locks){
+  keep.add(d.id);let marker=uavEyeMarkers.get(d.id);
+  if(!marker){
+   const el=document.createElement('div');el.className='uavEyeMarker';
+   el.innerHTML='<svg viewBox="0 0 32 24"><path d="M2 12 Q16 -3 30 12 Q16 27 2 12Z" fill="none" stroke="#ffdf32" stroke-width="2.5"/><circle cx="16" cy="12" r="5" fill="#ffdf32"/><circle cx="17" cy="10.5" r="1.4" fill="#fff8bd"/></svg>';
+   const direction=document.createElement('div');direction.className='uavEyeDirection';direction.innerHTML='<span class="uavEyeArrow"></span>';el.appendChild(direction);
+   const name=document.createElement('span');name.className='uavEyeName';name.textContent=d.id;el.appendChild(name);uavEyeLayer.appendChild(el);
+   marker={el,direction};uavEyeMarkers.set(d.id,marker);
+  }
+  marker.el.classList.toggle('ghost',routeGhost);
+  const p=uavEyePosition(d),original={...p};
+  if(p.offscreen)for(let i=0;i<locks.length*2;i++){
+   if(!placed.some(q=>Math.hypot(p.x-q.x,p.y-q.y)<43))break;
+   const offset=(i%2?1:-1)*Math.ceil((i+1)/2)*46;
+   if(p.verticalEdge)p.y=Math.max(52,Math.min(innerHeight-52,original.y+offset));
+   else p.x=Math.max(52,Math.min(innerWidth-52,original.x+offset));
+  }
+  placed.push(p);marker.el.style.left=p.x+'px';marker.el.style.top=p.y+'px';
+  marker.direction.style.display=p.offscreen?'block':'none';marker.direction.style.transform='rotate('+p.angle+'rad)';
+ }
+ for(const [id,m] of uavEyeMarkers)if(!keep.has(id)){m.el.remove();uavEyeMarkers.delete(id);}
+}
+
+// Stadium turrets: an anchored armored housing, an independent gun gimbal,
+// and a fixed scanner recessed beneath it. Model dimensions also make the hulls.
+const stadiumTurretCache=new Map();
+function isStadiumTurret(d){return !!d?.stationary&&!!d.turret&&!d.argus;}
+function stadiumBodyYaw(d){return Number.isFinite(d.bodyYaw)?d.bodyYaw:d.yaw||0;}
+function stadiumPose(d,gun=false){return {x:d.x,y:d.y-ELEVATED_TURRET_ROOT_HEIGHT+(gun?1.38:0),z:d.z,yaw:gun?d.yaw:stadiumBodyYaw(d),pitch:gun?(d.gunPitch||0):0};}
+function stadiumTransform(p,pose,normal=false){
+ const cp=Math.cos(pose.pitch||0),sp=Math.sin(pose.pitch||0),c=Math.cos(pose.yaw),s=Math.sin(pose.yaw);
+ const x=p[0]*cp-p[1]*sp,y=p[0]*sp+p[1]*cp;
+ return [x*c-p[2]*s+(normal?0:pose.x),y+(normal?0:pose.y),x*s+p[2]*c+(normal?0:pose.z)];
+}
+function stadiumRotation(pose){
+ const c=Math.cos(pose.yaw/2),s=Math.sin(pose.yaw/2),cp=Math.cos((pose.pitch||0)/2),sp=Math.sin((pose.pitch||0)/2);
+ return {x:-s*sp,y:-s*cp,z:c*sp,w:c*cp};
+}
+function stadiumLocalPoint(d,x,y,z){const p=stadiumTransform([x,y,z],stadiumPose(d));return {x:p[0],y:p[1],z:p[2]};}
+function uavScannerOrigin(d){return isStadiumTurret(d)?stadiumLocalPoint(d,.628,.34,0):{x:d.x,y:d.y,z:d.z};}
+function stadiumTriangle(out,a,b,c,color,pose){
+ const u=b.map((v,i)=>v-a[i]),v=c.map((v,i)=>v-a[i]);
+ const n=[u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]],len=Math.hypot(...n)||1;
+ const normal=stadiumTransform(n.map(v=>v/len),pose,true);
+ for(const p of [a,b,c])out.push(...stadiumTransform(p,pose),...normal,...color);
+}
+function stadiumPrism(out,shapes,pose,footprint,bottom,top,color,solid=true){
+ const lo=footprint.map(p=>[p[0],bottom,p[1]]),hi=footprint.map(p=>[p[0],top,p[1]]),count=lo.length;
+ for(let i=0;i<count;i++){
+  const j=(i+1)%count;
+  stadiumTriangle(out,lo[i],hi[i],hi[j],color,pose);stadiumTriangle(out,lo[i],hi[j],lo[j],color,pose);
+  if(i>0&&i<count-1){stadiumTriangle(out,hi[0],hi[j],hi[i],color,pose);stadiumTriangle(out,lo[0],lo[i],lo[j],color,pose);}
+ }
+ if(solid)shapes.push({points:lo.concat(hi),pose});
+}
+function stadiumBox(out,shapes,pose,x,y,z,sx,sy,sz,color,solid=true){
+ stadiumPrism(out,shapes,pose,[[x-sx/2,z-sz/2],[x+sx/2,z-sz/2],[x+sx/2,z+sz/2],[x-sx/2,z+sz/2]],y-sy/2,y+sy/2,color,solid);
+}
+// A radial shell segment. Each convex trapezoid has the same beveled profile
+// in its render mesh and collider; the open front is never filled by one hull.
+function stadiumProfileSegment(out,shapes,pose,a,b,profile,color,solid=true){
+ const rings=profile.map(([y,inner,outer])=>[[inner*Math.cos(a),y,inner*Math.sin(a)],[outer*Math.cos(a),y,outer*Math.sin(a)],[outer*Math.cos(b),y,outer*Math.sin(b)],[inner*Math.cos(b),y,inner*Math.sin(b)]]);
+ for(let k=0;k<rings.length-1;k++)for(let i=0;i<4;i++){
+  const j=(i+1)%4,lo=rings[k],hi=rings[k+1];
+  stadiumTriangle(out,lo[i],hi[i],hi[j],color,pose);stadiumTriangle(out,lo[i],hi[j],lo[j],color,pose);
+ }
+ const lo=rings[0],hi=rings[rings.length-1];
+ stadiumTriangle(out,lo[0],lo[1],lo[2],color,pose);stadiumTriangle(out,lo[0],lo[2],lo[3],color,pose);
+ stadiumTriangle(out,hi[0],hi[2],hi[1],color,pose);stadiumTriangle(out,hi[0],hi[3],hi[2],color,pose);
+ if(solid)shapes.push({points:rings.flat(),pose});
+}
+function stadiumRadialShell(out,shapes,pose,start,end,profile,color,segments=12){
+ for(let i=0;i<segments;i++)stadiumProfileSegment(out,shapes,pose,start+(end-start)*i/segments,start+(end-start)*(i+1)/segments,profile,color);
+}
+function stadiumDisc(out,shapes,pose,profile,color,solid=true){
+ const count=32,rings=profile.map(([y,r])=>Array.from({length:count},(_,i)=>[r*Math.cos(i*Math.PI*2/count),y,r*Math.sin(i*Math.PI*2/count)]));
+ for(let k=0;k<rings.length-1;k++)for(let i=0;i<count;i++){
+  const j=(i+1)%count,lo=rings[k],hi=rings[k+1];
+  stadiumTriangle(out,lo[i],hi[i],hi[j],color,pose);stadiumTriangle(out,lo[i],hi[j],lo[j],color,pose);
+ }
+ const lo=rings[0],hi=rings[rings.length-1];
+ for(let i=1;i<count-1;i++){stadiumTriangle(out,lo[0],lo[i],lo[i+1],color,pose);stadiumTriangle(out,hi[0],hi[i+1],hi[i],color,pose);}
+ if(solid)shapes.push({points:rings.flat(),pose});
+}
+function stadiumCrossAxle(out,shapes,pose,x,y,halfLength,r,color,solid=true){
+ // Rotate a Y-axis cylinder onto Z. Its ends meet the two radial support bars.
+ const vertices=[],parts=[];stadiumDisc(vertices,parts,{x:0,y:0,z:0,yaw:0,pitch:0},[[-halfLength,r],[halfLength,r]],color);
+ for(let i=0;i<vertices.length;i+=9){const v=vertices.slice(i,i+9),p=[v[0]+x,v[2]+y,-v[1]],n=[v[3],v[5],-v[4]];out.push(...stadiumTransform(p,pose),...stadiumTransform(n,pose,true),...v.slice(6));}
+ if(solid)for(const part of parts)shapes.push({points:part.points.map(p=>[p[0]+x,p[2]+y,-p[1]]),pose});
+}
+function stadiumFixedModel(d){
+ const out=[],shapes=[],pose=stadiumPose(d),steel=[.36,.39,.40],edge=[.21,.24,.25],dark=[.075,.09,.095],yellow=[.86,.60,.075];
+ const box=(...args)=>stadiumBox(out,shapes,pose,...args);
+ const round=(r,lo,hi,c)=>stadiumPrism(out,shapes,pose,Array.from({length:16},(_,i)=>[r*Math.cos(i*Math.PI/8),r*Math.sin(i*Math.PI/8)]),lo,hi,c);
+ // Preserve the accepted circular plinth and its below-ground implantation.
+ round(.62,-.78,.40,[.32,.35,.36]);round(.70,-.035,.11,[.20,.23,.24]);round(.67,.18,.27,[.38,.41,.42]);round(.72,.40,.50,[.20,.23,.24]);round(.59,.50,.55,[.29,.31,.30]);
+ // Two beveled uprights follow the SAME radius as the round base and canopy.
+ // They are radial bars, not the corners of a rectangular cage.
+ const supportProfile=[[.53,.53,.61],[.59,.49,.66],[1.79,.49,.66],[1.86,.53,.61]];
+ for(const sign of [-1,1])stadiumRadialShell(out,shapes,pose,sign*Math.PI/2-.19,sign*Math.PI/2+.19,supportProfile,steel,3);
+ // Curved rear armor leaves the gun bay open at the front, while blocking rear LOS.
+ stadiumRadialShell(out,shapes,pose,Math.PI*.61,Math.PI*1.39,[[.54,.49,.58],[.60,.47,.64],[1.79,.47,.64],[1.85,.49,.58]],edge,12);
+ // The mounting axle spans the two bars. A central fixed saddle supports the
+ // limited yaw bearing; the receiver pivots on it rather than floating in space.
+ stadiumCrossAxle(out,shapes,pose,0,1.28,.56,.065,[.43,.46,.45]);
+ box(0,1.32,0,.32,.16,.28,dark,false);
+ stadiumDisc(out,shapes,pose,[[1.35,.18],[1.39,.18]],[.42,.44,.41],false);
+ // Recessed mechanical details remain inside the circular rear shell.
+ box(-.385,1.12,0,.045,.70,.38,dark,false);
+ box(-.351,1.13,-.09,.024,.37,.12,[.035,.30,.19],false);
+ box(-.335,1.26,-.09,.01,.11,.068,[.10,.61,.34],false);
+ box(-.32,.91,.13,.10,.13,.17,[.48,.48,.39],false);
+ // A true circular roof: beveled drum, circular inset, circumferential trim.
+ stadiumDisc(out,shapes,pose,[[1.845,.68],[1.88,.73],[1.94,.73]],dark);
+ stadiumDisc(out,shapes,pose,[[1.94,.73],[2.035,.73],[2.09,.66]],steel);
+ stadiumDisc(out,shapes,pose,[[2.09,.46],[2.108,.46]],[.29,.32,.33],false);
+ stadiumDisc(out,shapes,pose,[[2.108,.11],[2.125,.11]],[.43,.46,.47],false);
+ // Hazard band wraps the cylindrical rim rather than a flat front edge.
+ for(let i=0;i<32;i++){
+  const a=i*Math.PI/16,b=(i+.56)*Math.PI/16,shift=.04;
+  const p=(angle,y)=>[.735*Math.cos(angle),y,.735*Math.sin(angle)];
+  stadiumTriangle(out,p(a,1.885),p(a+shift,1.932),p(b+shift,1.932),yellow,pose);
+  stadiumTriangle(out,p(a,1.885),p(b+shift,1.932),p(b,1.885),yellow,pose);
+ }
+ // The scanner is an invisible ray origin on the front face of the base.
+ // There is intentionally no lens box or sensor prop on top of the plinth.
+ return {out,shapes};
+}
+
+function stadiumGunModel(d){
+ const out=[],shapes=[],pose=stadiumPose(d,true),metal=[.19,.22,.23],edge=[.085,.10,.11];
+ const box=(...args)=>stadiumBox(out,shapes,pose,...args);
+ // Only this gun assembly yaws/elevates. The pivot, scanner and shell stay put.
+ box(.03,0,0,.48,.30,.35,metal);box(.40,-.025,0,.40,.22,.26,[.27,.30,.31]);
+ box(.93,-.025,0,.80,.15,.17,metal);box(1.405,-.025,0,.20,.21,.23,edge);
+ box(1.509,-.025,0,.006,.108,.123,[.008,.010,.012],false);
+ box(.20,.168,0,.35,.028,.075,edge,false);
+ for(const z of [-.091,.091])for(let i=0;i<5;i++)box(.64+i*.12,-.025,z,.062,.072,.008,[.045,.055,.06],false);
+ return {out,shapes};
+}
+function stadiumCreateHulls(shapes){
+ return shapes.map(s=>{
+  const desc=RAPIER.ColliderDesc.convexHull(new Float32Array(s.points.flat()));
+  if(!desc)throw new Error('Invalid stadium turret hull');
+  const c=physicsWorld.createCollider(desc.setTranslation(s.pose.x,s.pose.y,s.pose.z).setRotation(stadiumRotation(s.pose)).setFriction(0));
+  physicsStaticHandles.add(c.handle);return c;
+ });
+}
+function stadiumRemoveEntry(entry){
+ for(const c of entry.fixedColliders.concat(entry.gunColliders)){physicsStaticHandles.delete(c.handle);physicsWorld.removeCollider(c,false);}
+}
+function stadiumSyncGeometry(){
+ if(!physicsWorld)return;
+ const keep=new Set();let changed=false;
+ for(const d of uavDrones)if(isStadiumTurret(d)){
+  if(!Number.isFinite(d.bodyYaw))d.bodyYaw=d.yaw||0;
+  stadiumClampGun(d);
+  const key=[d.x,d.y,d.z,d.bodyYaw].join(','),gunKey=[d.yaw,d.gunPitch||0].join(',');keep.add(d.id);
+  let entry=stadiumTurretCache.get(d.id);
+  if(!entry||entry.key!==key){
+   if(entry)stadiumRemoveEntry(entry);
+   const fixed=stadiumFixedModel(d),gun=stadiumGunModel(d);
+   entry={key,gunKey,fixed:fixed.out,gun:gun.out,fixedColliders:stadiumCreateHulls(fixed.shapes),gunColliders:stadiumCreateHulls(gun.shapes)};
+   stadiumTurretCache.set(d.id,entry);changed=true;
+  }else if(entry.gunKey!==gunKey){
+   const gun=stadiumGunModel(d);entry.gunKey=gunKey;entry.gun=gun.out;
+   for(let i=0;i<entry.gunColliders.length;i++){const pose=gun.shapes[i].pose;entry.gunColliders[i].setTranslation({x:pose.x,y:pose.y,z:pose.z});entry.gunColliders[i].setRotation(stadiumRotation(pose));}
+  }
+ }
+ for(const [id,entry] of stadiumTurretCache)if(!keep.has(id)){stadiumRemoveEntry(entry);stadiumTurretCache.delete(id);changed=true;}
+ // Refresh the query index on creation/removal. Ordinary tracking uses the
+ // regular physics steps; the fixed shell never depends on gun orientation.
+ if(changed)physicsWorld.step();
+}
+function stadiumDraw(d){
+ const entry=stadiumTurretCache.get(d.id);if(!entry)return;
+ for(const v of entry.fixed)uavBodyVerts.push(v);for(const v of entry.gun)uavBodyVerts.push(v);
+}
+
+const STADIUM_YAW_LIMIT=Math.PI*50/180;
+const STADIUM_PITCH_MIN=-Math.PI*20/180,STADIUM_PITCH_MAX=Math.PI*20/180;
+function stadiumAngle(a){return Math.atan2(Math.sin(a),Math.cos(a));}
+function stadiumClampGun(d){
+ const base=stadiumBodyYaw(d),delta=stadiumAngle((Number.isFinite(d.yaw)?d.yaw:base)-base);
+ d.yaw=base+Math.max(-STADIUM_YAW_LIMIT,Math.min(STADIUM_YAW_LIMIT,delta));
+ d.gunPitch=Math.max(STADIUM_PITCH_MIN,Math.min(STADIUM_PITCH_MAX,Number(d.gunPitch)||0));
+}
+function stadiumCanAim(d,point){
+ if(!isStadiumTurret(d))return true;
+ const pivot=stadiumPose(d,true),dx=point.x-pivot.x,dz=point.z-pivot.z,h=Math.hypot(dx,dz);
+ if(h<.001)return false;
+ const angle=stadiumAngle(Math.atan2(dz,dx)-stadiumBodyYaw(d)),pitch=Math.atan2(point.y-pivot.y,h);
+ return Math.abs(angle)<=STADIUM_YAW_LIMIT+1e-8&&pitch>=STADIUM_PITCH_MIN-1e-8&&pitch<=STADIUM_PITCH_MAX+1e-8;
+}
+function uavTrackPoint(d,point,origin=uavScannerOrigin(d)){
+ return stadiumCanAim(d,point)&&staticUavLosFromTo(origin,point);
+}
 
 document.body.classList.add('menu-open');
 showMainMenu();
