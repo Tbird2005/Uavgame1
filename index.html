@@ -498,6 +498,7 @@ let currentDrawStrokeId='';
 let clientHandshakeTimer=null;
 let clientHandshakeComplete=false;
 let worldGeometryReady=false;
+let mapGenerating=false;
 
 let spectatorActive=false;
 let spectatorTargetKey='';
@@ -543,7 +544,7 @@ function makeEntityId(slot){return 1000+slot;}
 function makeStrokeId(){return localPeerId+'-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,7);}
 
 function isMenuOrTextInputActive(target=document.activeElement){
-  if(routeChatOpen||scoreboardOpen)return true;
+  if(mapGenerating||routeChatOpen||scoreboardOpen)return true;
   if(!gameStarted)return true;
   if(!mainMenu.classList.contains('hidden'))return true;
 
@@ -618,7 +619,7 @@ function buildSpectatorTargets(){
     out.push({
       key:'uav:'+i,
       kind:'UAV',
-      label:d.id||('UAV '+(i+1)),
+      label:uavAttackerName(d.id),
       uavIndex:i
     });
   }
@@ -861,7 +862,7 @@ function updateSpectatorHud(){
     ? '<b>SPECTATOR FREECAM'+(routeUseMapFreecam()?' · MAP':'')+'</b>'+
       '<br>WASD move · Space/C up/down · Shift fast · Mouse look · Wheel speed · 0 target cam'
     : '<b>SPECTATING '+pose.label+'</b> · '+pose.kind+
-      '<br>Mouse orbit · Left/Right click target · Wheel zoom · 0 freecam · V exit'+
+      '<br>Mouse orbit · Left/Right click target · Wheel zoom · 0 freecam · B exit'+
       (playerDead||singlePlayerObserver?' · Q normal map view':' · M map');
   if(!multiplayer)spectatorHud.innerHTML+=' · T respawn';
   spectatorHud.style.display='block';
@@ -2135,7 +2136,7 @@ const netPlayerVerts=[];
 const targetedPlayerGlowVerts=[];
 function NPV(x,y,z,nx,ny,nz,r,g,b){netPlayerVerts.push(x,y,z,nx,ny,nz,r,g,b);}
 function netPlayerTransform(p,lx,ly,lz){
-  const fall=(p.alive===false)?(-Math.PI*.5*smooth01(p.deathT==null?1:p.deathT)):0;
+  const fall=(p.alive===false)?(-Math.PI*.5*smooth01(p.deathT==null?1:p.deathT)):-doorKickLean(p);
 
   // Standing capsule physically compresses downward while crouched.
   // Dead bodies retain their normal full-size corpse silhouette.
@@ -2150,7 +2151,7 @@ function netPlayerTransform(p,lx,ly,lz){
   return [p.x+lx*c+z2*s,networkPlayerFeetY(p)+lift+y2,p.z+lx*s-z2*c];
 }
 function netPlayerNormal(p,lx,ly,lz){
-  const fall=(p.alive===false)?(-Math.PI*.5*smooth01(p.deathT==null?1:p.deathT)):0;
+  const fall=(p.alive===false)?(-Math.PI*.5*smooth01(p.deathT==null?1:p.deathT)):-doorKickLean(p);
   const crouch=(p.alive===false)?0:Math.max(0,Math.min(1,Number(p.crouch)||0));
   const crouchScale=1-crouch*(1-PLAYER_CROUCH_CAPSULE_HEIGHT/PLAYER_CAPSULE_HEIGHT);
   // Capsule rings already use the current physical height.
@@ -2831,11 +2832,13 @@ function rebuildUavDynamicMeshes(){
           addUavSpotlightCone(uavConeVerts,origin,ground,radius,18);
           addUavSpotDisc(uavSpotVerts,ground,radius,24);
 
-          const glare=Math.max(0,Math.min(1,d.glare||0));
-          addUavGlareOcta(uavGlareVerts,origin.x,origin.y,origin.z,0.30+glare*.42);
-          addUavGlareOcta(uavGlareVerts,origin.x,origin.y,origin.z,0.62+glare*.82);
         }
       }
+    }
+    // Keep the source glare visible while a lost/dead target's glow shrinks.
+    if(origin&&eyePulse>0){
+      addUavGlareOcta(uavGlareVerts,origin.x,origin.y,origin.z,.72*eyePulse);
+      addUavGlareOcta(uavGlareVerts,origin.x,origin.y,origin.z,1.44*eyePulse);
     }
   }
 
@@ -2861,7 +2864,7 @@ function bindUavBuffer(buf){
   gl.enableVertexAttribArray(uavColorLoc);gl.vertexAttribPointer(uavColorLoc,3,gl.FLOAT,false,9*4,6*4);
 }
 function renderUavs(){
-  if(!uavBodyVertexCount&&!uavBeamVertexCount)return;
+  if(!uavBodyVertexCount&&!uavBeamVertexCount&&!stadiumFixedVertexCount)return;
   gl.useProgram(uavProg);
   gl.uniformMatrix4fv(uavProjLoc,false,proj);
   gl.uniformMatrix4fv(uavViewLoc,false,view);
@@ -2872,6 +2875,10 @@ function renderUavs(){
   gl.frontFace(gl.CCW);
   gl.disable(gl.BLEND);
 
+  if(stadiumFixedVertexCount){
+    bindUavBuffer(stadiumFixedBuffer);
+    gl.drawArrays(gl.TRIANGLES,0,stadiumFixedVertexCount);
+  }
   if(uavBodyVertexCount){
     bindUavBuffer(uavBodyBuffer);
     gl.drawArrays(gl.TRIANGLES,0,uavBodyVertexCount);
@@ -4042,6 +4049,7 @@ function aStar(sx,sz,tx,tz,allowedRoomA,allowedRoomB){
 }
 function doorwayKind(){
   const r=rng();
+  if(usingElevatedTurretTileset())return r<.94?'open':'double';
 
   // "open" is not a doorway frame at all. The full 3-unit connection is simply absent:
   // no side jamb, no lintel, no door, no wall geometry.
@@ -4054,6 +4062,7 @@ function doorwayKind(){
   return 'single-center';
 }
 function exteriorDoorwayKind(){
+  if(usingElevatedTurretTileset())return 'double';
   // Exterior exits must always be framed openings.
   // The literal "open" / no-wall connector is never valid here.
   const r=rng();
@@ -4467,7 +4476,7 @@ function chooseExteriorDoorways(){
   if(!mainCandidates.length)
     throw new Error('Generator could not find a true boundary-connected exterior exit edge.');
 
-  const desired=(rng()<0.58)?3:2;
+  const desired=3;
   const chosen=[];
 
   // FIRST EXIT: always true main outside.
@@ -4514,6 +4523,7 @@ function chooseExteriorDoorways(){
     if(c)chosen.push(c);
   }
 
+  if(chosen.length!==3)throw new Error('Every map requires exactly three entrances.');
   externalDoorways=[];
   mainExteriorDoorways=[];
   courtyardDoorways=[];
@@ -5140,7 +5150,7 @@ function buildLayout(){
   // because an alternate literal-open route already connects both sides.
   collapseRedundantDoorwayCycles();
 
-  // Usually create 2-3 framed outdoor exits.
+  // Exactly three framed outdoor exits: one green and two red.
   // At least one ALWAYS reaches true boundary-connected outside grass.
   // If the building encloses a sealed grass courtyard, a secondary exit can
   // deliberately open into it so the courtyard is actually accessible.
@@ -7037,6 +7047,7 @@ function rebuildMesh(){
   rebuildTacticalMarkerMesh();
 
   physicsFinishWorld();
+  doorBuild();
 
   // Build one broad-phase collision index and clear the A* caches once per map.
   rebuildColliderHash();
@@ -7132,7 +7143,7 @@ function broadcastHost(msg,exceptPeerId=null){
 }
 function serializePlayer(p){
   return {
-    gun:gunPack(p),motion:netMotionPack(p),killOrder:scoreOrder(p),pingMs:scorePingValue(p),
+    kick:doorKickPack(p),gun:gunPack(p),motion:netMotionPack(p),killOrder:scoreOrder(p),pingMs:scorePingValue(p),
     id:p.id,entityId:p.entityId,name:p.name,slot:p.slot,colorIndex:p.colorIndex,
     x:p.x,z:p.z,yaw:p.yaw,feetY:networkPlayerFeetY(p),
     crouch:Number.isFinite(p.crouch)?p.crouch:0,
@@ -7181,7 +7192,7 @@ function applyPlayerSnapshot(list,preserveSelf=true){
       p.deathT=Number.isFinite(d.deathT)?d.deathT:(p.alive?0:1);
     }
   }
-  for(const d of list||[]){const p=netPlayers.get(String(d.id));if(p){gunRead(p,d.gun);if(p.id!==localPeerId)netReceivePose(p,d.motion);}}
+  for(const d of list||[]){const p=netPlayers.get(String(d.id));if(p){gunRead(p,d.gun);doorKickRead(p,d.kick);if(p.id!==localPeerId)netReceivePose(p,d.motion);}}
   if(!isHost)for(const id of [...netPlayers.keys()])if(!incoming.has(id))netPlayers.delete(id);
   const me=netPlayers.get(localPeerId);if(me)localUavEntityId=me.entityId;
   updateNetworkInfo();rebuildNetPlayerMesh();syncPlayerNameElements();
@@ -7199,7 +7210,9 @@ function applyUavSnapshot(data){
     for(let i=0;i<data.drones.length;i++){
       const s=data.drones[i];let d=uavDrones[i];
       if(!d){d={id:s.id,phase:s.phase,cx:s.cx,cz:s.cz,radius:s.radius,y:s.y,x:s.x,z:s.z,yaw:s.yaw,stationary:!!s.stationary,turret:!!s.turret,pitchDown:s.pitchDown||0,targetId:null,timers:new Map(),glare:0};uavDrones[i]=d;}
+      if(d.id!==s.id)d.glareFx=null;
       d.argus=!!s.argus;d.ttk=Number(s.ttk);d.id=s.id;d.phase=s.phase;d.cx=s.cx;d.cz=s.cz;d.radius=s.radius;d.y=s.y;d.x=s.x;d.z=s.z;d.yaw=s.yaw;d.bodyYaw=Number.isFinite(s.bodyYaw)?s.bodyYaw:s.yaw;d.gunPitch=Number(s.gunPitch)||0;d.stationary=!!s.stationary;d.turret=!!s.turret;d.pitchDown=s.pitchDown||0;d.targetId=s.targetId;d.glare=s.glare||0;d.timers=new Map(s.timers||[]);
+      uavUpdateGlare(d,0);
     }
     uavDrones.length=data.drones.length;
   }
@@ -7296,8 +7309,18 @@ function submitEraseAt(x,z){
     broadcastHost({type:'eraseApply',x,z,r:MAP_ERASE_RADIUS});
   }
 }
+function uavAttackerName(killer){
+  const id=String(killer||'UAV'),drone=uavDrones.find(d=>d.id===id);
+  if(drone?.argus||id==='ARGUS'){
+    const index=Math.max(0,uavDrones.filter(d=>d.argus).findIndex(d=>d.id===id));
+    return 'TRUCK TURRET '+String.fromCharCode(65+index);
+  }
+  const match=/^UAV_(\d+)$/.exec(id);
+  if(match)return (drone?.stationary?'TURRET ':'UAV ')+String.fromCharCode(64+Number(match[1]));
+  return id;
+}
 function addDeathFeed(name,killer){
-  const row=document.createElement('div');row.className='deathFeedRow';row.textContent=safeName(name)+'  ⚡  '+String(killer||'UAV');
+  const row=document.createElement('div');row.className='deathFeedRow';row.textContent=uavAttackerName(killer)+' killed '+safeName(name);
   deathFeed.prepend(row);while(deathFeed.children.length>6)deathFeed.lastElementChild.remove();
   setTimeout(()=>{if(row.isConnected)row.remove();},6500);
 }
@@ -7409,6 +7432,8 @@ function spawnHasEscapeSpace(x,z){
     );
 
     if(dist>=1.25)directions++;
+    // These values only increase: further flood-fill cannot change acceptance.
+    if(reachable>=14&&farthest>=1.45&&directions>=2)return true;
 
     for(const [dx,dz] of [
       [1,0],[-1,0],
@@ -7623,7 +7648,7 @@ function applyRemoteDeath(msg){
   if(String(msg.peerId)===localPeerId)beginPlayerDeath(msg.killer);
   rebuildNetPlayerMesh();
 }
-function serializeWorldState(){return{type:'world',generation:mapGeneration,seq:++netWorldSeq,glass:glassSnapshot(),players:serializePlayers(),uav:{elapsed:uavElapsed,grace:uavSpawnGrace,drones:serializeUavs(),rules:uavRulesSnapshot()}};}
+function serializeWorldState(){return{type:'world',generation:mapGeneration,seq:++netWorldSeq,glass:glassSnapshot(),doors:doorSnapshot(),players:serializePlayers(),uav:{elapsed:uavElapsed,grace:uavSpawnGrace,drones:serializeUavs(),rules:uavRulesSnapshot()}};}
 function hostBroadcastWorld(){broadcastHost(serializeWorldState());}
 function hostRemovePlayer(peerId){
   peerConnections.delete(peerId);
@@ -7658,6 +7683,7 @@ function makeStateSync(){
     generation:mapGeneration,
     decals:gunDecals.slice(),
     glass:glassSnapshot(),
+    doors:doorSnapshot(),
     drawings:serializeDrawings(),
     deaths:deathMarkers,
     uav:{elapsed:uavElapsed,grace:uavSpawnGrace,drones:serializeUavs(),rules:uavRulesSnapshot()}
@@ -7786,6 +7812,7 @@ function handleHostMessage(conn,msg){
   }
 
   const p=netPlayers.get(peerId);
+  if(msg.type==='doorAction'){doorHostAction(conn,msg);return;}
   if(msg.type==='glassTouch'){glassHandleTouch(conn,msg);return;}
   if(msg.type==='gunFire'||msg.type==='gunReload'||msg.type==='gunSwitch'){
     if(msg.motion&&msg.generation===mapGeneration)netAcceptState(conn,msg.motion);
@@ -7858,7 +7885,7 @@ function applyStateSync(msg){
   if(!clientHandshakeComplete||!worldGeometryReady)return;
   if(Number(msg.generation)!==mapGeneration)return;
 
-  glassApplySnapshot(msg.glass);
+  glassApplySnapshot(msg.glass);doorApplySnapshot(msg.doors);
   gunDecals.length=0;gunAddImpacts(msg.decals,false);
   applyDrawSnapshot(msg.drawings||[]);
   deathMarkers=(msg.deaths||[]).map(x=>({...x}));
@@ -7871,6 +7898,9 @@ function handleClientMessage(msg){
   try{
     if(msg.type==='motion'){netReceiveMotion(msg);return;}
     if(msg.type==='versionMismatch'){netVersionError();return;}
+    if(msg.type==='doorKick'){if(msg.generation===mapGeneration)doorKickRead({id:String(msg.peerId)},msg.kick);return;}
+    if(msg.type==='doorState'){if(msg.generation===mapGeneration)doorApplySnapshot(msg.doors);return;}
+    if(msg.type==='doorNotice'){if(msg.generation===mapGeneration)doorNotice(String(msg.message));return;}
     if(msg.type==='glassBreak'){glassBreakEvent(msg);return;}
     if(msg.type==='glassReject'){if(msg.generation===mapGeneration&&!glassBroken.has(msg.id)){glassPredicted.delete(msg.id);glassSetBroken(breakableGlass[msg.id],false);}return;}
     if(msg.type==='positionCorrection'){netApplyCorrection(msg);return;}
@@ -7920,7 +7950,7 @@ function handleClientMessage(msg){
       if(Number(msg.generation)!==mapGeneration)return;
 
       if(!Number.isSafeInteger(msg.seq)||msg.seq<=netLastWorldSeq)return;
-      netLastWorldSeq=msg.seq;glassApplySnapshot(msg.glass);
+      netLastWorldSeq=msg.seq;glassApplySnapshot(msg.glass);doorApplySnapshot(msg.doors);
       applyPlayerSnapshot(msg.players||[],true);
       applyUavSnapshot(msg.uav);
       return;
@@ -8270,6 +8300,7 @@ let physicsUavColliders=[],physicsUavIndex=0;
 
 function physicsBeginWorld(){
   stadiumTurretCache.clear();
+  stadiumFixedVertexCount=0;
   uavSightRules.clear();uavSightContext=null;swatVan=null;swatVanHandles=[];swatVanVerts=[];
   gunWallSurfaces.clear();gunWallContext=null;gunDecals.length=0;gunImpactBursts.length=0;gunDecalsDirty=true;
   glassReset();
@@ -8415,6 +8446,7 @@ function resetPlayerPhysics(feet=FLOOR_TOP+PHYSICS_SKIN){
   if(physicsWorld)physicsWorld.step();
 }
 function tryPlayerJump(){
+  if(doorKickRemaining()>0)return;
   if(playerDead||mapOpen||spectatorActive||!playerGrounded||playerCrouchAmount>.28)return;
   playerJumpQueued=true;
 }
@@ -8438,6 +8470,11 @@ function physicsSyncRemotePlayers(){
   }
 }
 function physicsPlayerStep(vx,vz,dt){
+  if(doorKickRemaining()>0){
+    const anchor=doorKickStates.get(localPeerId).anchor;px=anchor.x;pz=anchor.z;playerFeetY=anchor.y;
+    playerJumpQueued=false;playerVerticalVelocity=0;playerCrouchAmount=0;
+    syncPlayerPhysicsState();physicsWorld.step();return;
+  }
   const target=keys.KeyC&&playerGrounded?1:0;
   const amount=playerCrouchAmount;
   const next=amount+Math.sign(target-amount)*Math.min(Math.abs(target-amount),PLAYER_CROUCH_SPEED*dt);
@@ -12707,13 +12744,13 @@ function npcClear(x,y,z){
   physicsWorld.intersectionsWithShape(p,PHYSICS_ROT,NPC_SHAPE,c=>{
     const contact=c.contactShape(NPC_SHAPE,p,PHYSICS_ROT,0);
     if(contact&&contact.distance<-.001){clear=false;return false;}return true;
-  },undefined,undefined,undefined,undefined,staticGeometry);
+  },undefined,undefined,undefined,undefined,bodyGeometry);
   return clear;
 }
 function npcSweep(a,b){
   return physicsWorld.castShape({x:a.x,y:a.y+FOLLOWER_HEIGHT/2,z:a.z},PHYSICS_ROT,
     {x:b.x-a.x,y:b.y-a.y,z:b.z-a.z},NPC_SHAPE,.001,1,false,
-    undefined,undefined,undefined,undefined,staticGeometry);
+    undefined,undefined,undefined,undefined,bodyGeometry);
 }
 function nav3Stand(x,z,y){
   if(lavaZoneAtWorld(x,z)&&y<FLOOR_TOP-.3)return null;
@@ -12721,7 +12758,7 @@ function nav3Stand(x,z,y){
   if(!npcClear(x,from,z))return null;
   const hit=physicsWorld.castShape({x,y:from+FOLLOWER_HEIGHT/2,z},PHYSICS_ROT,
     {x:0,y:-1,z:0},NPC_SHAPE,NPC_SKIN,.62,true,
-    undefined,undefined,undefined,undefined,staticGeometry);
+    undefined,undefined,undefined,undefined,bodyGeometry);
   if(!hit||hit.normal1.y<.60)return null;
   const feet=from-hit.time_of_impact;
   if(Math.abs(feet-y)>.29)return null;
@@ -13071,7 +13108,7 @@ function npcStep(agent,dt,speed){
   else{nav3Controller.disableAutostep();nav3Controller.disableSnapToGround();}
   nav3Probe.setEnabled(true);
   nav3Probe.setTranslation({x,y:y+FOLLOWER_HEIGHT/2,z});
-  try{nav3Controller.computeColliderMovement(nav3Probe,{x:vx*dt,y:vertical,z:vz*dt},undefined,undefined,staticGeometry);}
+  try{nav3Controller.computeColliderMovement(nav3Probe,{x:vx*dt,y:vertical,z:vz*dt},undefined,undefined,bodyGeometry);}
   finally{nav3Probe.setEnabled(false);}
   const moved=nav3Controller.computedMovement();
   x+=moved.x;y+=moved.y;z+=moved.z;
@@ -13449,6 +13486,7 @@ function currentUavEntities(){
 
 function updateUavStatusHud(){
   const rows=[];
+  if(uavEnabled&&uavSpawnGrace>0)rows.push('<div class="uavStatusRow">UAV GRACE · <span class="time">'+uavSpawnGrace.toFixed(2)+'s</span></div>');
   let playerLockCount=0;
   let playerMin=Infinity;
   for(const d of uavDrones){
@@ -13456,7 +13494,7 @@ function updateUavStatusHud(){
     const ent=uavEntities.get(d.targetId);
     if(!ent||!ent.isAlive())continue;
     const left=d.timers.get(d.targetId)??uavTimeMax(d);
-    rows.push('<div class="uavStatusRow">'+d.id+' → '+ent.label+' &nbsp; <span class="time">'+left.toFixed(2)+'s</span></div>');
+    rows.push('<div class="uavStatusRow">'+uavAttackerName(d.id)+' → '+ent.label+' &nbsp; <span class="time">'+left.toFixed(2)+'s</span></div>');
     if(d.targetId===localUavEntityId){playerLockCount++;playerMin=Math.min(playerMin,left);}
   }
   if(rows.length&&!mapOpen&&!playerDead){
@@ -13711,7 +13749,7 @@ function resetUavEntityRegistryForMode(){
       z:pz
     }),
     ()=>!playerDead&&!routeGhost&&!singlePlayerObserver,
-    drone=>beginPlayerDeath(drone.id)
+    drone=>{addDeathFeed(routeRecording?.name||displayName||'YOU',drone.id);beginPlayerDeath(drone.id);}
   );
   registerUavEntity(2,'npc','BLUE MAN',
     ()=>followerAlive&&Number.isFinite(followerX)&&Number.isFinite(followerZ)
@@ -13770,6 +13808,23 @@ function resetUavSystemForMap(){
   rebuildUavDynamicMeshes();
   ensureUavAudioNodeCount();
 }
+function uavUpdateGlare(d,dt){
+  // Visual state is independent of lock timers and survives a target dying.
+  const fx=d.glareFx||(d.glareFx={target:null,value:Math.max(0,Math.min(1,d.glare||0)),shrinking:false});
+  const target=d.targetId??null;
+  if(target!==fx.target){
+    if(fx.target!=null||fx.shrinking||target==null)fx.shrinking=fx.value>0;
+    fx.target=target;
+  }
+  let remaining=Math.max(0,dt);
+  if(fx.shrinking){
+    const fadeTime=fx.value*.14,used=Math.min(remaining,fadeTime);
+    fx.value=Math.max(0,fx.value-used/.14);remaining-=used;
+    if(fx.value<1e-7){fx.value=0;fx.shrinking=false;}
+  }
+  if(!fx.shrinking)fx.value=target==null?Math.max(0,fx.value-remaining/.14):Math.min(1,fx.value+remaining/.5);
+  d.glare=fx.value;
+}
 function updateUavs(dt){
   if(!uavDrones.length)return;
 
@@ -13792,6 +13847,7 @@ function updateUavs(dt){
       if(d.targetId!=null&&d.timers.has(d.targetId)){
         d.timers.set(d.targetId,Math.max(0,d.timers.get(d.targetId)-dt));
       }
+      uavUpdateGlare(d,dt);
     }
     updateUavStatusHud();
     updateUavAudio(dt);
@@ -13846,17 +13902,14 @@ function updateUavs(dt){
 
     if(target){
       uavAimAtLock(d,target);
-      d.glare=Math.min(1,d.glare+dt/0.5);
       const left=d.timers.get(target.id)??uavTimeMax(d);
       if(left<=0&&target.isAlive()){
         triggerUavKillEffects(d,target);
         target.onKilled(d);
         d.targetId=null;
-        d.glare=0;
       }
-    }else{
-      d.glare=0;
     }
+    uavUpdateGlare(d,dt);
   }
 
   rebuildUavDynamicMeshes();
@@ -14055,9 +14108,10 @@ function updateGeneratorHud(){
   exitCountEl.textContent=externalDoorways.length;smallDoorCountEl.textContent=small;bigDoorCountEl.textContent=big;openWallCountEl.textContent=openWalls;
   tipEl.textContent=usingElevatedTurretTileset()
     ? 'ELEVATED TURRET TILESET · irregular industrial rooms · lava parkour · 4 stationary corner turrets · targeting audio only'
-    : 'WASD move · Shift sprint · C crouch · Space jump · M map · left click draw · right click erase';
+    : 'WASD move · Shift sprint · C crouch · Space jump · M map';
+  tipEl.textContent+=' · F door · V kick (1.5 tiles) · 3 shotgun · R reload · B spectate';
 }
-function loadBuildingSeed(forcedSeed,allowFollower){
+function* buildingSeedStages(forcedSeed,allowFollower){
   routeMapChanging(Number(forcedSeed)>>>0);
   worldGeometryReady=false;
   resetDeathForNewMap();
@@ -14065,8 +14119,11 @@ function loadBuildingSeed(forcedSeed,allowFollower){
   seed=Number(forcedSeed)>>>0;
   currentTileset=((seed>>>1)&1)?TILESET_ELEVATED_TURRETS:TILESET_CLASSIC;
   rng=mulberry32(seed);
+  yield 'Planning rooms…';
   buildLayout();
+  yield 'Building walls and doors…';
   rebuildMesh();
+  yield 'Finding safe spawn points…';
   rebuildPlayerSpawnPoints();
 
   // From this point onward mapSurfaceYAt / capsule mesh generation is safe.
@@ -14081,6 +14138,7 @@ function loadBuildingSeed(forcedSeed,allowFollower){
   playerVerticalVelocity=0;
   playerUnderDeck=false;playerOnJungleCatwalk=false;playerOnJungleRamp=false;
   resetPlayerPhysics();
+  yield 'Placing survivors…';
   if(!multiplayer&&allowFollower){
     try{spawnFollower();}
     catch(err){
@@ -14101,11 +14159,40 @@ function loadBuildingSeed(forcedSeed,allowFollower){
     rebuildExtraSurvivorMesh();
   }
   mapDrawStrokes=[];currentDrawStroke=null;currentDrawStrokeId='';clearRoundDeathVisuals();
-  resetUavSystemForMap();nav3BuildPortals();updateGeneratorHud();resetTacticalMapCamera();rebuildMapOverlayMesh();rebuildRoomMapLabels();updateMapHud();updateRoomMapLabels();
+  yield 'Preparing UAVs…';
+  resetUavSystemForMap();
+  yield 'Finishing map…';
+  nav3BuildPortals();updateGeneratorHud();resetTacticalMapCamera();rebuildMapOverlayMesh();rebuildRoomMapLabels();updateMapHud();updateRoomMapLabels();
+}
+function loadBuildingSeed(forcedSeed,allowFollower){
+  // Network snapshots still build atomically before applying their world state.
+  for(const stage of buildingSeedStages(forcedSeed,allowFollower)){}
+}
+const mapLoading=document.createElement('div');
+mapLoading.id='mapLoading';mapLoading.setAttribute('role','status');
+mapLoading.style.cssText='position:fixed;inset:0;z-index:3000;background:#10202d;color:#e6ffff;display:none;align-items:center;justify-content:center;font:600 20px system-ui;pointer-events:none';
+document.body.appendChild(mapLoading);
+function mapGenerationPaint(){return new Promise(resolve=>requestAnimationFrame(()=>setTimeout(resolve,0)));}
+async function generateBuildingSeed(forcedSeed,allowFollower){
+  if(mapGenerating)return false;
+  mapGenerating=true;mapLoading.style.display='flex';clearPhysicalGameplayKeys();clearAllGameKeys();gunTrigger=false;
+  try{
+    for(const stage of buildingSeedStages(forcedSeed,allowFollower)){
+      mapLoading.textContent=stage;
+      await mapGenerationPaint();
+    }
+    return true;
+  }catch(error){
+    worldGeometryReady=false;
+    console.error('Map generation failed:',error);routeSay('Map could not finish. Press N to try another map.');
+    return false;
+  }finally{
+    mapGenerating=false;mapLoading.style.display='none';last=performance.now();
+  }
 }
 function newBuilding(){
   if(multiplayer){if(isHost)hostStartNewMap();return;}
-  loadBuildingSeed((Date.now()^Math.floor(Math.random()*0xffffffff))>>>0,true);
+  return generateBuildingSeed((Date.now()^Math.floor(Math.random()*0xffffffff))>>>0,true);
 }
 function resize(){
   const dpr=Math.min(window.devicePixelRatio||1,1.25);
@@ -14243,6 +14330,7 @@ function renderWorldWithCamera(mapCamera,mapVisual){
   // UAVs are real dynamic 3D world objects and remain visible in both views.
   renderUavs();
 
+  doorRender();
   renderGuns(mapCamera);
 
   // Glass exists in first-person only. It is 0% visible in SAT/MAP.
@@ -14305,7 +14393,7 @@ function frame(now){
   if(!multiplayer&&(routeChatOpen||document.hidden))dt=0;
   routeHud();
 
-  if(!gameStarted){
+  if(!gameStarted||mapGenerating||!worldGeometryReady){
     gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
     requestAnimationFrame(frame);
     return;
@@ -14317,8 +14405,10 @@ function frame(now){
   syncGameplayKeysFromPhysicalState();
 
   updateSpectatorFreecam(dt);
+  doorTick(dt);
   updatePlayerPhysics(dt);
   routeTick(dt);
+  doorKickTick(dt);
   updateLavaHazard();
   if(!playerDead&&!singlePlayerObserver&&playerFeetY<outsideGroundY()-12)beginPlayerDeath("FALL");
   glassFlush();
@@ -14378,7 +14468,7 @@ function frame(now){
 
   perspective(proj,75*Math.PI/180,canvas.width/canvas.height,0.08,180);
 
-  let camPitch=pitch;
+  let camPitch=pitch+doorKickLean();
   let camYaw=yaw;
   const localSurfaceY=playerFeetY;
   let camEyeY=playerFeetY+localPlayerEyeHeight();
@@ -14440,7 +14530,7 @@ addEventListener('keydown',e=>{
 
     tipEl.textContent=
       'NPC MODE: '+(survivorLivingRunoutMode?'RUNOUT AI':'FOLLOW PLAYER')+
-      ' · L toggle · P add survivor · T respawn · 0 freecam · V spectate · M map';
+      ' · L toggle · P add survivor · T respawn · 0 freecam · B spectate · M map';
     return;
   }
 
@@ -14472,7 +14562,7 @@ addEventListener('keydown',e=>{
     return;
   }
 
-  if(e.code==='KeyV'){
+  if(e.code==='KeyB'){
     e.preventDefault();
 
     if(multiplayer&&!playerDead)return;
@@ -14529,6 +14619,7 @@ addEventListener('keydown',e=>{
     // and tactical camera framing, while leaving mapOpen itself untouched.
     if(e.code==='KeyN'){
       e.preventDefault();
+      if(e.repeat)return;
       if(!multiplayer)newBuilding();
       else if(isHost)hostStartNewMap();
       return;
@@ -14551,7 +14642,7 @@ addEventListener('keydown',e=>{
   // Keep this assignment for other future held-action keys only.
   if(!PHYSICAL_GAMEPLAY_CODES.has(e.code))keys[e.code]=true;
 
-  if(e.code==='KeyN'){if(!multiplayer)newBuilding();else if(isHost)hostStartNewMap();}
+  if(e.code==='KeyN'&&!e.repeat){if(!multiplayer)newBuilding();else if(isHost)hostStartNewMap();}
 });
 addEventListener('keyup',e=>{
   // Never let a focused text field prevent release cleanup for normal logical
@@ -14730,12 +14821,13 @@ joinCodeInput.addEventListener('keydown',e=>{
 joinCodeInput.addEventListener('keyup',stopMenuKeyFromReachingGame);
 
 // Gameplay penetration units (not real-world ballistic measurements).
-const BULLETS={pistol9:{label:'9mm',penetration:65},rifle762:{label:'7.62',penetration:145}};
+const BULLETS={pistol9:{label:'9mm',penetration:65},rifle762:{label:'7.62',penetration:145},buckshot:{label:'12 GA · 8 pellets',penetration:12}};
 const WEAPONS={
  ak:{name:'AK',bullet:'rifle762',damage:34,mag:30,reload:2.25,interval:.10,range:140,automatic:true,muzzle:-.70,visualSpeed:900},
- glock:{name:'GLOCK',bullet:'pistol9',damage:25,mag:17,reload:1.65,interval:.18,range:90,automatic:false,muzzle:-.19,visualSpeed:520}
+ glock:{name:'GLOCK',bullet:'pistol9',damage:25,mag:17,reload:1.65,interval:.18,range:90,automatic:false,muzzle:-.19,visualSpeed:520},
+ shotgun:{name:'SHOTGUN',bullet:'buckshot',damage:15,mag:6,reload:2.8,interval:.8,range:42,automatic:false,muzzle:-.79,visualSpeed:420}
 };
-const WALL_ABSORPTION=40;
+const WALL_ABSORPTION=40,DOOR_ABSORPTION=8;
 let gunWallContext=null;
 const gunWallSurfaces=new Map();
 function gunMarkWall(ax,az,bx,bz,cx,cy,cz,sx,sy,sz){
@@ -14743,7 +14835,7 @@ function gunMarkWall(ax,az,bx,bz,cx,cy,cz,sx,sy,sz){
   lo:[cx-sx/2,cy-sy/2,cz-sz/2],hi:[cx+sx/2,cy+sy/2,cz+sz/2],absorption:WALL_ABSORPTION};
 }
 function gunTrace(o,d,shooter,weapon='glock'){
- const w=WEAPONS[weapon]||WEAPONS.glock,ignored=new Set(),impacts=[];
+ const w=WEAPONS[weapon]||WEAPONS.glock,ignored=new Set(),ignoredDoors=new Set(),impacts=[],doorHits=[];
  let remaining=BULLETS[w.bullet].penetration,damage=w.damage,walls=0;
  let victim=null,victimDistance=w.range;
  for(const p of netPlayers.values())if(p.id!==shooter&&p.alive!==false){const t=gunCapsuleHit(o,d,p);if(t<victimDistance){victim=p;victimDistance=t;}}
@@ -14763,29 +14855,41 @@ function gunTrace(o,d,shooter,weapon='glock'){
  const point=t=>({x:o.x+d.x*t,y:o.y+d.y*t,z:o.z+d.z*t});
  for(let step=0;step<12;step++){
   const hit=physicsWorld.castRayAndGetNormal(new RAPIER.Ray(o,d),w.range,true,undefined,undefined,undefined,undefined,
-   c=>staticGeometry(c)&&!ignored.has(gunWallSurfaces.get(c.handle)?.group));
-  if(!hit||victim&&victimDistance<hit.timeOfImpact)return {target:victim,distance:victimDistance,end:point(victimDistance),impacts,walls,damage,remaining};
+   c=>staticGeometry(c)&&!ignoredDoors.has(c.handle)&&!ignored.has(gunWallSurfaces.get(c.handle)?.group));
+  if(!hit||victim&&victimDistance<hit.timeOfImpact)return {target:victim,distance:victimDistance,end:point(victimDistance),impacts,doorHits,walls,damage,remaining};
   const at=point(hit.timeOfImpact),pane=glassByHandle.get(hit.collider.handle),surface=gunWallSurfaces.get(hit.collider.handle),n=hit.normal;
-  if(pane)return {target:null,pane,end:at,distance:hit.timeOfImpact,impacts,walls,damage,remaining};
+  if(pane)return {target:null,pane,end:at,distance:hit.timeOfImpact,impacts,doorHits,walls,damage,remaining};
+  const door=doorByHandle.get(hit.collider.handle);
+  if(door){
+   doorHits.push({door,point:at});
+   impacts.push({point:at,normal:{x:n.x,y:n.y,z:n.z},exit:false,transient:true});
+   // Red exterior leaves are the only bulletproof door material, in every pose.
+   const exit=door.type==='red'&&door.exterior?null:doorBulletExit(door,o,d);
+   const cost=exit?DOOR_ABSORPTION*Math.max(0,exit.distance-hit.timeOfImpact)/DOOR_THICKNESS:Infinity;
+   if(!exit||exit.distance>w.range||remaining+1e-5<cost)return {target:null,door,end:at,distance:hit.timeOfImpact,impacts,doorHits,walls,damage,remaining};
+   remaining=Math.max(0,remaining-cost);damage*=.5;walls++;ignoredDoors.add(hit.collider.handle);
+   impacts.push({point:point(exit.distance),normal:exit.normal,exit:true,transient:true});
+   continue;
+  }
   impacts.push({point:at,normal:{x:n.x,y:n.y,z:n.z},exit:false});
-  if(!surface||!surface.interior)return {target:null,end:at,distance:hit.timeOfImpact,impacts,walls,damage,remaining};
+  if(!surface||!surface.interior)return {target:null,end:at,distance:hit.timeOfImpact,impacts,doorHits,walls,damage,remaining};
   const k=surface.axis,axis=['x','y','z'][k],component=d[axis];
-  if(Math.abs(component)<1e-6)return {target:null,end:at,impacts,walls,damage,remaining};
+  if(Math.abs(component)<1e-6)return {target:null,end:at,impacts,doorHits,walls,damage,remaining};
   const exitPlane=component>0?surface.hi[k]:surface.lo[k],exit=(exitPlane-o[axis])/component;
   const thickness=Math.max(0,exit-hit.timeOfImpact),cost=surface.absorption*thickness/WALL_THICKNESS;
-  if(exit>w.range||cost<=0||remaining+1e-5<cost)return {target:null,end:at,distance:hit.timeOfImpact,impacts,walls,damage,remaining};
+  if(exit>w.range||cost<=0||remaining+1e-5<cost)return {target:null,end:at,distance:hit.timeOfImpact,impacts,doorHits,walls,damage,remaining};
   remaining-=cost;damage*=.5;walls++;ignored.add(surface.group);
   const exitNormal={x:0,y:0,z:0};exitNormal[axis]=Math.sign(component);
   impacts.push({point:point(exit),normal:exitNormal,exit:true});
  }
- return {target:null,end:point(w.range),impacts,walls,damage,remaining};
+ return {target:null,end:point(w.range),impacts,doorHits,walls,damage,remaining};
 }
 const gunDecals=[],gunImpactBursts=[],gunDecalBuffer=gl.createBuffer();let gunDecalsDirty=true,gunDecalVertices=0;
 function gunAddImpacts(impacts,effects=true){
  for(const hit of (impacts||[]).slice(0,effects?24:180)){
   if(!hit.point||!hit.normal||![hit.point.x,hit.point.y,hit.point.z,hit.normal.x,hit.normal.y,hit.normal.z].every(Number.isFinite))continue;
   const len=Math.hypot(hit.normal.x,hit.normal.y,hit.normal.z);if(len<.5)continue;
-  gunDecals.push({point:hit.point,normal:{x:hit.normal.x/len,y:hit.normal.y/len,z:hit.normal.z/len},exit:!!hit.exit});
+  if(!hit.transient)gunDecals.push({point:hit.point,normal:{x:hit.normal.x/len,y:hit.normal.y/len,z:hit.normal.z/len},exit:!!hit.exit});
   if(effects)gunImpactBursts.push({...hit,at:gunNow()});
  }
  if(gunDecals.length>180)gunDecals.splice(0,gunDecals.length-180);
@@ -14824,12 +14928,12 @@ const gunBuffer=gl.createBuffer(),gunTraces=[],gunFlashes=new Map(),gunSeenEvent
 let gunSeq=0,gunReloadVisual=0,gunHitUntil=0,gunTrigger=false;
 const gunNow=()=>performance.now()/1000;
 function gunCreateState(hp=100){
- const s={hp,equipped:'ak',slots:{ak:{ammo:30,reloadEnd:0},glock:{ammo:17,reloadEnd:0}},nextShot:0,lastSeq:0,serverAck:-1,pending:[]};
+ const s={hp,equipped:'ak',slots:Object.fromEntries(Object.entries(WEAPONS).map(([id,w])=>[id,{ammo:w.mag,reloadEnd:0}])),nextShot:0,lastSeq:0,serverAck:-1,pending:[]};
  Object.defineProperties(s,{ammo:{get(){return this.slots[this.equipped].ammo;},set(v){this.slots[this.equipped].ammo=v;}},reloadEnd:{get(){return this.slots[this.equipped].reloadEnd;},set(v){this.slots[this.equipped].reloadEnd=v;}}});return s;
 }
 let gunLocal=gunCreateState();
 const gunHud=document.createElement('div');gunHud.id='gunHud';
-gunHud.innerHTML='<div id="gunHealthText">100 / 100 HP</div><div id="gunHealthTrack"><div id="gunHealthFill"></div></div><div id="gunWeapon" style="font-size:13px;color:#78e7c5"></div><div id="gunAmmo">30 / 30</div><div class="gunHint">1 AK · 2 GLOCK · R RELOAD</div>';
+gunHud.innerHTML='<div id="gunHealthText">100 / 100 HP</div><div id="gunHealthTrack"><div id="gunHealthFill"></div></div><div id="gunWeapon" style="font-size:13px;color:#78e7c5"></div><div id="gunAmmo">30 / 30</div><div class="gunHint">1 AK · 2 GLOCK · 3 SHOTGUN · R RELOAD</div>';
 document.body.appendChild(gunHud);
 const gunCross=document.createElement('div');gunCross.id='gunCross';gunCross.textContent='+';document.body.appendChild(gunCross);
 function gunState(p){if(!p.gun?.slots)p.gun=gunCreateState(p.alive===false?0:(p.gun?.hp??100));return p.gun;}
@@ -14870,29 +14974,21 @@ function gunCapsuleHit(o,d,p,h=PLAYER_CAPSULE_HEIGHT+(PLAYER_CROUCH_CAPSULE_HEIG
 function gunRay(o,d,shooter,weapon='glock'){return gunTrace(o,d,shooter,weapon);}
 function gunSound(remote=false,weapon='glock'){
  try{const C=window.AudioContext||window.webkitAudioContext;if(!C)return;const ctx=gunSound.ctx||(gunSound.ctx=new C());if(ctx.state==='suspended')ctx.resume();
-  const duration=weapon==='ak'?.14:.09,n=ctx.createBuffer(1,Math.floor(ctx.sampleRate*duration),ctx.sampleRate),a=n.getChannelData(0);
+  const duration=weapon==='shotgun'?.30:weapon==='ak'?.14:.09,n=ctx.createBuffer(1,Math.floor(ctx.sampleRate*duration),ctx.sampleRate),a=n.getChannelData(0);
   for(let i=0;i<a.length;i++)a[i]=(Math.random()*2-1)*Math.exp(-i/(a.length*.18));
   const src=ctx.createBufferSource(),gain=ctx.createGain(),filter=ctx.createBiquadFilter();src.buffer=n;gain.gain.value=remote?.075:.21;filter.type='lowpass';filter.frequency.value=weapon==='ak'?4800:7800;src.connect(filter);filter.connect(gain);gain.connect(ctx.destination);src.start();
-  if(weapon==='ak'){const osc=ctx.createOscillator(),thump=ctx.createGain();osc.frequency.setValueAtTime(150,ctx.currentTime);osc.frequency.exponentialRampToValueAtTime(45,ctx.currentTime+.10);thump.gain.setValueAtTime(remote?.035:.08,ctx.currentTime);thump.gain.exponentialRampToValueAtTime(.001,ctx.currentTime+.12);osc.connect(thump);thump.connect(ctx.destination);osc.start();osc.stop(ctx.currentTime+.13);}
+  if(weapon==='ak'||weapon==='shotgun'){const osc=ctx.createOscillator(),thump=ctx.createGain();osc.frequency.setValueAtTime(150,ctx.currentTime);osc.frequency.exponentialRampToValueAtTime(45,ctx.currentTime+.10);thump.gain.setValueAtTime(remote?.035:.08,ctx.currentTime);thump.gain.exponentialRampToValueAtTime(.001,ctx.currentTime+.12);osc.connect(thump);thump.connect(ctx.destination);osc.start();osc.stop(ctx.currentTime+.13);}
  }catch(_){}
 }
 function gunEvent(e){
  if(e.generation!==mapGeneration||!Number.isSafeInteger(e.seq)||e.seq<=(gunSeenEvents.get(e.shooter)||0))return;
- gunSeenEvents.set(e.shooter,e.seq);gunTraces.push({...e,at:gunNow()});if(gunTraces.length>80)gunTraces.shift();gunAddImpacts(e.impacts);
+ gunSeenEvents.set(e.shooter,e.seq);for(const ray of e.rays||[{from:e.from,end:e.end}])gunTraces.push({...e,...ray,at:gunNow()});if(gunTraces.length>160)gunTraces.splice(0,gunTraces.length-160);gunAddImpacts(e.impacts);
  const p=netPlayers.get(e.shooter);if(p&&e.gun)gunRead(p,e.gun);
  if(e.shooter!==localPeerId){gunFlashes.set(e.shooter,gunNow());gunSound(true,e.weapon);}
  if(e.shooter===localPeerId&&e.hit)gunHitUntil=gunNow()+.16;
 }
 // Shared live-scene shot resolution for players and recorded actors.
-function gunShootWorld(p,id,seq){
- const s=gunState(p),w=WEAPONS[s.equipped];
- const eye=gunEye(p),direction=gunDirection(p.yaw,p.pitch),aim=gunTrace(eye,direction,id,s.equipped);
- const muzzle=gunPose(p,false).point(0,.025,w.muzzle);let origin={x:muzzle[0],y:muzzle[1],z:muzzle[2]};
- const mount={x:origin.x-eye.x,y:origin.y-eye.y,z:origin.z-eye.z};
- if(physicsWorld.castRay(new RAPIER.Ray(eye,mount),1,true,undefined,undefined,undefined,undefined,staticGeometry))origin=eye;
- const delta={x:aim.end.x-origin.x,y:aim.end.y-origin.y,z:aim.end.z-origin.z},length=Math.hypot(delta.x,delta.y,delta.z)||1;
- const d={x:delta.x/length,y:delta.y/length,z:delta.z/length},hit=gunTrace(origin,d,id,s.equipped);
- if(hit.pane)glassBreakAuthority(hit.pane.id,hit.end);
+function gunDamageHit(p,hit){
  if(hit.target){
   const a=hit.target.npc,replay=hit.target.replay;
   if(replay){
@@ -14910,10 +15006,31 @@ function gunShootWorld(p,id,seq){
    if(gunLocal.hp<=0){beginPlayerDeath(p.name);if(!routeGhost)addDeathFeed('YOU',p.name);}
   }else{
    const victim=gunState(hit.target);victim.hp=Math.max(0,victim.hp-hit.damage);
-   if(victim.hp<=0)hostKillNetworkPlayer(hit.target.id,p.name||w.name);
+   if(victim.hp<=0)hostKillNetworkPlayer(hit.target.id,p.name||WEAPONS[gunState(p).equipped].name);
   }
  }
- const e={type:'gunShot',generation:mapGeneration,shooter:id,seq,weapon:s.equipped,from:origin,end:hit.end,hit:!!hit.target,walls:hit.walls,damage:hit.target?hit.damage:0,impacts:hit.impacts,gun:gunPack(p)};
+}
+function gunShootWorld(p,id,seq,spreadSeed=seq){
+ const s=gunState(p),w=WEAPONS[s.equipped];
+ const eye=gunEye(p),direction=gunDirection(p.yaw,p.pitch+doorKickLean(p)),aim=gunTrace(eye,direction,id,s.equipped);
+ const muzzle=gunPose(p,false).point(0,.025,w.muzzle);let origin={x:muzzle[0],y:muzzle[1],z:muzzle[2]};
+ const mount={x:origin.x-eye.x,y:origin.y-eye.y,z:origin.z-eye.z};
+ if(physicsWorld.castRay(new RAPIER.Ray(eye,mount),1,true,undefined,undefined,undefined,undefined,staticGeometry))origin=eye;
+ // Keep a shotgun aimed at the visible door handle even though its pellets can pass through the leaf.
+ const aimPoint=s.equipped==='shotgun'&&aim.doorHits.length?aim.doorHits[0].point:aim.end;
+ const delta={x:aimPoint.x-origin.x,y:aimPoint.y-origin.y,z:aimPoint.z-origin.z},length=Math.hypot(delta.x,delta.y,delta.z)||1;
+ const directionAtMuzzle={x:delta.x/length,y:delta.y/length,z:delta.z/length};
+ const directions=s.equipped==='shotgun'?shotgunDirections(directionAtMuzzle,spreadSeed):[directionAtMuzzle];
+ const hits=directions.map(d=>gunTrace(origin,d,id,s.equipped)),breaches=new Set();
+ let damage=0;
+ for(const hit of hits){
+  if(hit.pane)glassBreakAuthority(hit.pane.id,hit.end);
+  if(hit.target){gunDamageHit(p,hit);damage+=hit.damage;}
+  if(s.equipped==='shotgun')for(const impact of hit.doorHits)if(doorHandleHit(impact.door,impact.point))breaches.add(impact.door);
+ }
+ for(const d of breaches)doorBreach(d,p);
+ const e={type:'gunShot',generation:mapGeneration,shooter:id,seq,weapon:s.equipped,from:origin,end:hits[0].end,
+  rays:hits.map(hit=>({from:origin,end:hit.end})),hit:hits.some(hit=>!!hit.target),walls:Math.max(...hits.map(hit=>hit.walls)),damage,impacts:hits.flatMap(hit=>hit.impacts),gun:gunPack(p)};
  gunEvent(e);if(multiplayer){broadcastHost(e);hostBroadcastWorld();}return e;
 }
 
@@ -14968,7 +15085,7 @@ function gunUpdate(){
 function gunPose(p,animate=true){
  const t=gunNow(),shot=animate?Math.max(0,1-(t-(gunFlashes.get(p.id)||-99))/.14):0;
  const s=gunState(p),w=WEAPONS[s.equipped],reload=animate&&s.reloadEnd?Math.max(0,Math.min(1,1-(s.reloadEnd-t)/w.reload)):0;
- const dip=Math.sin(reload*Math.PI),y=p.yaw||0,pi=(p.pitch||0)+shot*(s.equipped==='ak'?.17:.12)+dip*.32;
+ const dip=Math.sin(reload*Math.PI),y=p.yaw||0,pi=(p.pitch||0)+doorKickLean(p)+shot*(s.equipped==='shotgun'?.30:s.equipped==='ak'?.17:.12)+dip*.32;
  const R=[Math.cos(y),0,Math.sin(y)],U=[-Math.sin(y)*Math.sin(pi),Math.cos(pi),Math.cos(y)*Math.sin(pi)],B=[-Math.sin(y)*Math.cos(pi),-Math.sin(pi),Math.cos(y)*Math.cos(pi)];
  const eye=gunEye(p),aim=gunDirection(y,p.pitch||0),block=physicsWorld.castRay(new RAPIER.Ray(eye,aim),1.5,true,undefined,undefined,undefined,undefined,staticGeometry);
  const reach=block?Math.max(w.muzzle+.12,Math.min(.46,block.timeOfImpact+w.muzzle-.10)):.46;
@@ -15028,7 +15145,7 @@ function gunAKModel(out,p){
  box(-.016,-.045-drop*.25,-.30,.10,.065,.11,[.13,.14,.15]);box(-.055,-.096-drop*.15,-.21,.074,.082,.16,[.42,.27,.18]);
  if(pose.shot>.4){box(0,.025,-.775,.11*pose.shot,.09*pose.shot,.14,[1,.60,.12]);box(0,.025,-.81,.025,.025,.19,[1,.96,.63]);}
 }
-function gunModel(out,p,localFirstPerson=false){const start=out.length;if(gunState(p).equipped==='ak')gunAKModel(out,p);else gunGlockModel(out,p);if(localFirstPerson&&uavLocalTargeted())uavTintHeldGun(out,start);}
+function gunModel(out,p,localFirstPerson=false){const start=out.length;if(gunState(p).equipped==='ak')gunAKModel(out,p);else if(gunState(p).equipped==='shotgun')gunShotgunModel(out,p);else gunGlockModel(out,p);if(localFirstPerson&&uavLocalTargeted())uavTintHeldGun(out,start);}
 // Separate translucent pass keeps the live ghost's item from fading replay guns,
 // bullet tracers or map effects. Draw after all opaque actors and glass.
 const ghostGunBuffer=gl.createBuffer(),ghostGunProg=gl.createProgram();
@@ -15082,9 +15199,9 @@ canvas.addEventListener('mousedown',e=>{if(e.button===0){gunTrigger=true;gunFire
 addEventListener('mouseup',e=>{if(e.button===0)gunTrigger=false;});
 addEventListener('blur',()=>gunTrigger=false);
 document.addEventListener('pointerlockchange',()=>{if(document.pointerLockElement!==canvas)gunTrigger=false;});
-addEventListener('keydown',e=>{if(e.repeat)return;if(e.code==='KeyR')gunReload();if(e.code==='Digit1')gunSwitch('ak');if(e.code==='Digit2')gunSwitch('glock');});
+addEventListener('keydown',e=>{if(e.repeat)return;if(e.code==='KeyR')gunReload();if(e.code==='Digit1')gunSwitch('ak');if(e.code==='Digit2')gunSwitch('glock');if(e.code==='Digit3')gunSwitch('shotgun');if(e.code==='KeyF')doorUse(false);if(e.code==='KeyV')doorUse(true);});
 
-const NET_PROTOCOL='gridlock-ramps-25';
+const NET_PROTOCOL='gridlock-doors-27';
 function netVersionError(){stopClientHandshakeRetry();clientHandshakeComplete=false;try{if(hostConn)hostConn.close();}catch(_){}showMainMenu();showMenuStatus('Game versions differ. Everyone must open the same updated HTML file.');}
 let netMoveSeq=0,netWorldSeq=0,netLastWorldSeq=-1,netCorrectionSeq=-1,netLocalEpoch=0,netMotionTimer=0;
 const netPoseHistory=new Map(),netLocalSamples=[];
@@ -15161,7 +15278,7 @@ function netMakeState(){
 }
 function netPositionClear(x,y,z,height){
  const shape=playerShape(height),pos={x,y:y+height/2,z};let clear=true;
- physicsWorld.intersectionsWithShape(pos,PHYSICS_ROT,shape,c=>{const contact=c.contactShape(shape,pos,PHYSICS_ROT,0);if(contact&&contact.distance<-.002){clear=false;return false;}return true;},undefined,undefined,undefined,undefined,staticGeometry);return clear;
+ physicsWorld.intersectionsWithShape(pos,PHYSICS_ROT,shape,c=>{const contact=c.contactShape(shape,pos,PHYSICS_ROT,0);if(contact&&contact.distance<-.002){clear=false;return false;}return true;},undefined,undefined,undefined,undefined,bodyGeometry);return clear;
 }
 function netCorrect(conn,p,seq,stamp){
  p.motionEpoch=(p.motionEpoch||0)+1;p.motionSamples=[];p.moveSeq=seq;p.motionStamp=undefined;p.motionJoinAt=performance.now();
@@ -15183,6 +15300,8 @@ function netAcceptState(conn,msg){
   const prevStamp=p.motionStamp,seconds=prevStamp===undefined?Math.max(.15,(now-(p.motionJoinAt??now))/1000):(s[1]-prevStamp)/1000;
   if(seconds<0||seconds>15){netCorrect(conn,p,msg.seq,msg.stamp);return false;}
   const q=netUnpack(s),distance=Math.hypot(q.x-p.x,q.z-p.z),height=PLAYER_CAPSULE_HEIGHT+(PLAYER_CROUCH_CAPSULE_HEIGHT-PLAYER_CAPSULE_HEIGHT)*q.crouch;
+  const kick=doorKickStates.get(p.id);
+  if(doorKickRemaining(p)>0&&(Math.hypot(q.x-kick.anchor.x,q.feetY-kick.anchor.y,q.z-kick.anchor.z)>.02||q.crouch>.01)){netCorrect(conn,p,msg.seq,msg.stamp);return false;}
   let valid=distance<=Math.max(.35,seconds*9+.22)&&q.feetY>=outsideGroundY()-.25&&q.feetY<=activePillarTop()+3;
   if(valid){
    // Motion can overtake the reliable glass event. Infer real capsule contact
@@ -15193,7 +15312,7 @@ function netAcceptState(conn,msg){
   if(valid&&seconds<=.16&&Math.abs(q.feetY-networkPlayerFeetY(p))<.16){
    const hit=physicsWorld.castShape({x:p.x,y:networkPlayerFeetY(p)+height/2+.10,z:p.z},PHYSICS_ROT,
     {x:q.x-p.x,y:q.feetY-networkPlayerFeetY(p),z:q.z-p.z},playerShape(Math.max(.7,height-.14)),.001,1,false,
-    undefined,undefined,undefined,undefined,staticGeometry);
+    undefined,undefined,undefined,undefined,bodyGeometry);
    if(hit&&hit.time_of_impact<.995){const pane=glassByHandle.get(hit.collider.handle);if(pane)glassBreakAuthority(pane.id);else valid=false;}
   }
   // When the preceding trajectory is missing for >160 ms, a straight sweep
@@ -15479,9 +15598,10 @@ routeStyle.textContent=`
 `;
 document.head.appendChild(routeStyle);
 const routeChat=document.createElement('div');routeChat.id='routeChat';routeChat.setAttribute('role','dialog');routeChat.setAttribute('aria-label','Single-player command chat');
-routeChat.innerHTML='<div id="routeLog" role="log" aria-live="polite"></div><input id="routeInput" autocomplete="off" spellcheck="false" aria-label="Chat command" placeholder="/record 1"><small>Enter: submit & return to game · Simulation pauses while typing</small>';
+routeChat.innerHTML='<div id="routeLog" role="log" aria-live="polite" aria-label="Chat history"></div><input id="routeInput" autocomplete="off" spellcheck="false" aria-label="Chat command" placeholder="/rec 1"><small>↑ / ↓ scroll chat · Page Up / Down scroll a page<br>Ctrl + ↑ / ↓ recall commands · Enter submit · Esc close<br>Simulation pauses while typing</small>';
 document.body.appendChild(routeChat);
 const routeInput=document.getElementById('routeInput'),routeLog=document.getElementById('routeLog');
+const routeCommandHistory=[];let routeHistoryIndex=0,routeHistoryDraft='/';
 const routeNameLayer=document.createElement('div');routeNameLayer.id='routeNameLayer';routeNameLayer.style.cssText='position:fixed;inset:0;z-index:17;pointer-events:none;overflow:hidden';document.body.appendChild(routeNameLayer);
 const routeStatus=document.createElement('div');routeStatus.id='routeStatus';document.body.appendChild(routeStatus);
 const routeGhostFrame=document.createElement('div');routeGhostFrame.id='routeGhostFrame';document.body.appendChild(routeGhostFrame);
@@ -15497,7 +15617,7 @@ function routeSetChat(open,restore=true){
  routeChat.style.display=routeChatOpen?'block':'none';clearPhysicalGameplayKeys();clearAllGameKeys();gunTrigger=false;
  if(routeChatOpen){
   // Keyboard focus can move to the chat input while canvas pointer lock stays on.
-  routeInput.value='/';routeInput.focus({preventScroll:true});
+  routeInput.value='/';routeHistoryIndex=routeCommandHistory.length;routeHistoryDraft='/';routeInput.focus({preventScroll:true});
   if(routeInput.setSelectionRange)routeInput.setSelectionRange(1,1);
  }else{
   if(document.activeElement===routeInput)routeInput.blur();
@@ -15508,7 +15628,7 @@ function routeSetChat(open,restore=true){
  }
 }
 function routeKey(id){return /^\d+$/.test(id||'')?id.replace(/^0+(?=\d)/,''):null;}
-function routeSnapshot(t){return [t,px,playerFeetY,pz,yaw,pitch,playerCrouchAmount,gunSelf().equipped==='glock'?1:0];}
+function routeSnapshot(t){return [t,px,playerFeetY,pz,yaw,pitch,playerCrouchAmount,gunSelf().equipped==='shotgun'?2:gunSelf().equipped==='glock'?1:0];}
 function routeSample(force=false){
  const r=routeRecording;if(!r)return;
  const n=r.frames.length;
@@ -15523,7 +15643,7 @@ function routeStart(id,name=''){
  routeSeed=seed;routeGhost=false;
  routeRestoreWindows();
  routeResetOrbit();
- routeRecording={id,name:name?safeName(name):'Recording #'+id,seed,time:0,frames:[],actions:[],initialGun:gunPack({gun:gunSelf()}),synced:routeSyncEnabled,ghostAt:null,start:routeSnapshot(0)};
+ routeRecording={id,name:name?safeName(name):'Recording #'+id,seed,time:0,frames:[],actions:[],initialGun:gunPack({gun:gunSelf()}),synced:routeSyncEnabled,graceAtStart:routeGraceAtStart,ghostAt:null,start:routeSnapshot(0)};
  routeShowOthers();
  routeSample(true);
  if(mapOpen)setMapVisible(false);
@@ -15542,7 +15662,7 @@ function routeBecomeGhost(killer){
 function routeEnd(){
  if(!routeRecording){routeSay('No recording is running.');return false;}
  routeSample(true);const r=routeRecording;
- const saved={id:r.id,name:r.name,seed:r.seed,duration:r.time,frames:new Float64Array(r.frames),actions:r.actions,initialGun:r.initialGun,synced:r.synced,ghostAt:r.ghostAt};
+ const saved={id:r.id,name:r.name,seed:r.seed,duration:r.time,frames:new Float64Array(r.frames),actions:r.actions,initialGun:r.initialGun,synced:r.synced,graceAtStart:r.graceAtStart,ghostAt:r.ghostAt};
  routeRecordings.set(r.id,saved);routeRecording=null;routeGhost=false;
  // Return the live player to the route's starting pose without resetting the map,
  // replay squad, glass, decals, UAV orbit or other survivors.
@@ -15576,12 +15696,12 @@ function routeApplyPose(p,t){
  const i=p.cursor,j=Math.min(last,i+ROUTE_STRIDE),span=f[j]-f[i],u=span>0?Math.max(0,Math.min(1,(t-f[i])/span)):0;
  const lerp=k=>f[i+k]+(f[j+k]-f[i+k])*u;
  p.x=lerp(1);p.feetY=lerp(2);p.z=lerp(3);p.yaw=lerp(4);p.pitch=lerp(5);p.crouch=lerp(6);
- p.gun.equipped=f[i+7]===1?'glock':'ak';
+ p.gun.equipped=f[i+7]===2?'shotgun':f[i+7]===1?'glock':'ak';
 }
 function routeSpawn(record){
  routeRemovePlayer(record.id);
  const entityId=routeNextEntity++,color=playerColorForSlot(entityId-1000000);
- const p={id:'route:'+entityId,entityId,name:record.name||'Recording #'+record.id,record,cursor:0,actionCursor:0,shotSeq:0,reloadTimes:{ak:0,glock:0},time:0,alive:true,finished:false,deathT:0,gun:gunCreateState(),color};
+ const p={id:'route:'+entityId,entityId,name:record.name||'Recording #'+record.id,record,cursor:0,actionCursor:0,shotSeq:0,reloadTimes:Object.fromEntries(Object.keys(WEAPONS).map(id=>[id,0])),time:0,alive:true,finished:false,deathT:0,gun:gunCreateState(),color};
  routeApplyPose(p,0);routeReadGun(p,record.initialGun,0);routePlayers.set(record.id,p);routeRegister(p);routeDeprioritizeSelf();
  return p;
 }
@@ -15594,7 +15714,8 @@ function routePlay(id){
  }else{
   // Reset only when starting a fresh timeline, never halfway through other takes.
   if(routeSyncEnabled||routePlayers.size===0||(routePlayers.size===1&&routePlayers.has(id)))routeRestoreWindows();
-  if(routeSyncEnabled){const other=[...routePlayers.values()].filter(p=>p.record.id!==id).map(p=>p.record);routeStopPlayers();routeResetOrbit();for(const record of other)routeSpawn(record);}
+  routeResetOrbit();
+  if(routeSyncEnabled){const other=[...routePlayers.values()].filter(p=>p.record.id!==id).map(p=>p.record);routeStopPlayers();for(const record of other)routeSpawn(record);}
   routeSpawn(r);
  }
  routeSay('Playing #'+id+(routeSyncEnabled?' · shared UAV timing.':'.'));return true;
@@ -15641,7 +15762,7 @@ function routeHud(){
  routeStatus.textContent=routeRecording
   ?(routeGhost?'GHOST · ':'RECORDING · ')+routeRecording.name+' · '+routeRecording.time.toFixed(1)+'s · /endrecording'
   :(singlePlayerObserver?'SPECTATOR · T respawn · ':'/ command chat · ')+routeRecordings.size+' saved · '+alive+'/'+routePlayers.size+' replays alive';
- routeStatus.textContent+=' · SYNC '+(routeSyncEnabled?'ON':'OFF')+' · SHOW '+(routeShowRecordings?'ON':'OFF')+' · LAST '+(routeLastDuringPlay?'ON':'OFF')+' · '+(uavFunMode?'FUNMODE':'REALISM')+' · UAV '+(uavEnabled?'ON':'OFF');
+ routeStatus.textContent+=' · GRACE '+(routeGraceAtStart?'ON':'OFF')+' · SYNC '+(routeSyncEnabled?'ON':'OFF')+' · SHOW '+(routeShowRecordings?'ON':'OFF')+' · LAST '+(routeLastDuringPlay?'ON':'OFF')+' · '+(uavFunMode?'FUNMODE':'REALISM')+' · UAV '+(uavEnabled?'ON':'OFF');
  if(routeGhost){document.getElementById('gunHealthText').textContent='GHOST · Recording continues';document.getElementById('gunHealthFill').style.background='#56dfff';}
 }
 function routeCancelTake(){
@@ -15660,7 +15781,13 @@ function routeDeleteAll(){
 }
 function routeCommand(text){
  if(multiplayer||!gameStarted)return false;
+ const grace=String(text).trim().toLowerCase().match(/^\/?(?:grace\s+at\s+start\??|graceatstart\??)(?:\s+(\S+))?$/);
+ if(grace)return routeGraceCommand(grace[1]);
  const parts=String(text).trim().split(/\s+/),cmd='/'+parts[0].replace(/^\//,'').toLowerCase(),id=routeKey(parts[1]);
+ if(cmd==='/grace'){
+  if(parts.length!==2||!['on','off'].includes(parts[1].toLowerCase())){routeSay('Use /grace on or /grace off.');return false;}
+  return routeGraceCommand(parts[1].toLowerCase());
+ }
  if(cmd==='/ttk'){
   if(parts.length!==3){routeSay('Use /ttk UAV_1 2.5. /uavlist shows names.');return false;}
   const d=uavDrones.find(d=>d.id.toLowerCase()===parts[1].toLowerCase());
@@ -15675,9 +15802,9 @@ function routeCommand(text){
   if(parts.length!==2||id===null){routeSay('Use /deleterec followed by a recording number.');return false;}
   return routeDeleteRecording(id);
  }
- if(cmd==='/record'||cmd==='/playrecord'){
-  if(id===null||(cmd==='/playrecord'&&parts.length!==2)){routeSay('Use /record 1 optional name, or /playrecord 1.');return false;}
-  return cmd==='/record'?routeStart(id,parts.slice(2).join(' ')):routePlay(id);
+ if(cmd==='/record'||cmd==='/rec'||cmd==='/playrecord'){
+  if(id===null||(cmd==='/playrecord'&&parts.length!==2)){routeSay('Use /rec 1 optional name (or /record 1), or /playrecord 1.');return false;}
+  return cmd==='/playrecord'?routePlay(id):routeStart(id,parts.slice(2).join(' '));
  }
  if(parts.length!==1){routeSay('Unknown command. Use /help.');return false;}
  if(cmd==='/spectate')return routeSpectate();
@@ -15688,27 +15815,48 @@ function routeCommand(text){
  if(cmd==='/realism')return uavSetFunMode(false);
  if(cmd==='/uavoff')return uavSetEnabled(false);
  if(cmd==='/uavon')return uavSetEnabled(true);
- if(cmd==='/uavlist'){routeSay(uavDrones.map(d=>d.id+' · '+uavTimeMax(d)+'s'+(d.argus?' · van-mounted ARGUS':d.stationary?' · stationary turret':' · sky UAV')).join('\n')+'\nUAVs '+(uavEnabled?'ON':'OFF'));return true;}
+ if(cmd==='/uavlist'){routeSay(uavDrones.map(d=>uavAttackerName(d.id)+' ('+d.id+') · '+uavTimeMax(d)+'s').join('\n')+'\nUAVs '+(uavEnabled?'ON':'OFF'));return true;}
  if(cmd==='/lastduringplay')return routeToggleLast();
  if(cmd==='/removenpcs')return routeRemoveNpcs();
  if(cmd==='/sync')return routeToggleSync();
  if(cmd==='/recordingshow')return routeToggleShow();
  if(cmd==='/freecammap')return routeToggleFreecamMap();
  if(cmd==='/deleteall')return routeDeleteAll();
- if(cmd==='/endrecording')return routeEnd();
+ if(cmd==='/endrecording'||cmd==='/end')return routeEnd();
  if(cmd==='/playall')return routePlayAll();
  if(cmd==='/stopplayback'||cmd==='/stopplay'){routeStopPlayers();routeSay('Replay NPCs cleared. Saved routes kept.');return true;}
  if(cmd==='/recordings'){
   routeSay(routeRecordings.size?[...routeRecordings.values()].map(r=>'#'+r.id+' · '+(r.name||'Recording #'+r.id)+' · '+r.duration.toFixed(2)+'s · '+(r.actions||[]).filter(a=>a.type==='gunFire').length+' shots · '+(r.synced?'SYNC':'UNSYNC')+(r.ghostAt!==null?' · ghost at '+r.ghostAt.toFixed(2)+'s':'')).join('\n'):'No saved routes for this map.');return false;
  }
  if(cmd==='/help'||cmd==='/'){
-  routeSay('/record # [name] — start a named route\n/retry — restart the current take from its original start\n/endrecording — save and return to start\n/playrecord # — start/restart one replay\n/playall — restart all routes together\n/stopplay — stop replays and clear their bodies\n/recordings — list routes\n/deleterec # — delete one recording\n/deleteall — delete all recordings\n/removenpcs — remove default AI survivors\n/sync — toggle shared UAV start timing\n/recordingshow — toggle other replays during recording\n/spectate — despawn and follow a target (T to respawn)\n/freecam — despawn and fly freely (also press 0)\n/freecammap — toggle flat map style in freecam\n/lastduringplay — toggle live player last during playback\n/funmode — toggle solid cover for all UAV sight\n/realism — return to realism sight rules\n/novan — remove the van and ARGUS for this map\n/uavlist — list UAV names and kill times\n/ttk UAV_1 2.5 — set one UAV kill time in seconds\n/ttkall 2.5 — set all UAV kill times\n/uavoff / /uavon — disable / enable UAV targeting\nReplays repeat movement and gun actions against the current scene. Fresh recordings, retries and playback from the start restore all windows; replay shots and contact break them again. Same-seed resets keep saved routes; a different seed clears them.');return false;
+  routeSay('/rec # [name] / /record # [name] — start a named route\n/retry — restart the current take from its original start\n/end / /endrecording — save and return to start\n/playrecord # — start/restart one replay\n/playall — restart all routes together\n/stopplay — stop replays and clear their bodies\n/recordings — list routes\n/deleterec # — delete one recording\n/deleteall — delete all recordings\n/removenpcs — remove default AI survivors\n/grace on / /grace off — enable or disable 3-second UAV grace (ON by default)\n/sync — toggle shared UAV start timing (ON by default)\n/recordingshow — toggle other replays during recording\n/spectate — despawn and follow a target (T to respawn)\n/freecam — despawn and fly freely (also press 0)\n/freecammap — toggle flat map style in freecam\n/lastduringplay — toggle live player last during playback\n/funmode — toggle solid cover for all UAV sight\n/realism — return to realism sight rules\n/novan — remove the van and ARGUS for this map\n/uavlist — list UAV names and kill times\n/ttk UAV_1 2.5 — set one UAV kill time in seconds\n/ttkall 2.5 — set all UAV kill times\n/uavoff / /uavon — disable / enable UAV targeting\nF opens/closes doors; V kicks from about 1.5 small tiles; 3 equips the shotgun. Kicking requires standing and freezes movement, jumping and crouching for one second. Exterior doors start locked. Green doors: shotgun the handle or kick from either side. Red doors: kick or shotgun the handle from INSIDE only. Bullets penetrate green and interior leaves; red exterior leaves are bulletproof. B spectates. All doors swing in one fixed direction.\nReplays repeat movement, guns and door actions against the current scene. Fresh recordings, retries and playback from the start restore windows and doors; replay actions change them again. Same-seed resets keep saved routes; a different seed clears them.');return false;
  }
  routeSay('Unknown command. Use /help.');return false;
 }
+function routeRememberCommand(value){
+ const command=String(value).trim();if(!command)return;
+ if(routeCommandHistory.at(-1)!==command)routeCommandHistory.push(command);
+ if(routeCommandHistory.length>100)routeCommandHistory.shift();
+ routeHistoryIndex=routeCommandHistory.length;routeHistoryDraft='/';
+}
+function routeRecallCommand(direction){
+ if(routeHistoryIndex===routeCommandHistory.length)routeHistoryDraft=routeInput.value;
+ routeHistoryIndex=Math.max(0,Math.min(routeCommandHistory.length,routeHistoryIndex+direction));
+ routeInput.value=routeHistoryIndex===routeCommandHistory.length?routeHistoryDraft:routeCommandHistory[routeHistoryIndex];
+ if(routeInput.setSelectionRange)routeInput.setSelectionRange(routeInput.value.length,routeInput.value.length);
+}
+function routeScrollChat(amount){
+ routeLog.scrollTop=Math.max(0,Math.min(Math.max(0,routeLog.scrollHeight-routeLog.clientHeight),routeLog.scrollTop+amount));
+}
 function routeInputKeyDown(e){
  e.stopPropagation();
- if(e.code==='Enter'){e.preventDefault();const value=routeInput.value;routeSay('> '+value);routeCommand(value);routeSetChat(false);}
+ if(e.code==='ArrowUp'||e.code==='ArrowDown'){
+  e.preventDefault();const direction=e.code==='ArrowUp'?-1:1;
+  if(e.ctrlKey||e.metaKey)routeRecallCommand(direction);else routeScrollChat(direction*42);
+  return;
+ }
+ if(e.code==='PageUp'||e.code==='PageDown'){e.preventDefault();routeScrollChat((e.code==='PageUp'?-1:1)*Math.max(42,routeLog.clientHeight*.85));return;}
+ if(e.code==='Enter'){e.preventDefault();const value=routeInput.value;routeRememberCommand(value);routeSay('> '+value);routeCommand(value);routeSetChat(false);}
  else if(e.code==='Escape'){e.preventDefault();routeSetChat(false);}
 }
 routeInput.addEventListener('keydown',routeInputKeyDown);
@@ -15719,14 +15867,14 @@ addEventListener('keydown',e=>{
   e.preventDefault();e.stopImmediatePropagation();routeSetChat(true);
  }
 },true);
-routeSay('Press / for commands. Try /record 1, then /endrecording and /playrecord 1. /help lists all commands.');
+routeSay('Press / for commands. Try /rec 1, then /end and /playrecord 1. UAV sync and 3-second grace start ON. /help lists all commands.');
 
 // Replay gun actions use recorded times/aim, but never recorded victims or hits.
-let routeSyncEnabled=false,routeShowRecordings=true,routeFreecamMap=false,routeLastDuringPlay=false;
+let routeSyncEnabled=true,routeShowRecordings=true,routeFreecamMap=false,routeLastDuringPlay=false;
 function routeRecordAction(msg,p){
  if(multiplayer||!routeRecording)return;
  routeSample(true);
- routeRecording.actions.push({time:routeRecording.time,type:msg.type,weapon:msg.weapon,
+ routeRecording.actions.push({time:routeRecording.time,type:msg.type,weapon:msg.weapon,spreadSeed:msg.seq,doorId:msg.doorId,doorAction:msg.doorAction,
   x:p.x,feetY:networkPlayerFeetY(p),z:p.z,yaw:p.yaw||0,pitch:p.pitch||0,crouch:p.crouch||0,
   gun:gunPack(p)});
 }
@@ -15749,12 +15897,16 @@ function routeUpdateGun(p){
 }
 function routeGunAction(p,action,fire=true){
  if(!p.alive)return;
+ if(action.type==='doorAction'){
+  if(fire){Object.assign(p,{x:action.x,feetY:action.feetY,z:action.z,yaw:action.yaw,pitch:action.pitch,crouch:action.crouch});doorAction(p,doorById.get(action.doorId),action.doorAction);}
+  return;
+ }
  routeReadGun(p,action.gun,action.time);
  if(action.type==='gunFire'&&fire){
   // The muzzle uses the exact pose at the original shot, including frames where
   // a quick turn fell between ordinary movement samples.
   Object.assign(p,{x:action.x,feetY:action.feetY,z:action.z,yaw:action.yaw,pitch:action.pitch,crouch:action.crouch});
-  p.gun.equipped=action.weapon;gunShootWorld(p,p.id,++p.shotSeq);
+  p.gun.equipped=action.weapon;gunShootWorld(p,p.id,++p.shotSeq,action.spreadSeed??p.shotSeq);
  }
 }
 function routeSeek(p,time){
@@ -15803,10 +15955,13 @@ function routeTick(dt){
  if(dt>0)for(const p of actors)if(p.alive)routeMoveActor(p,p.stepEnd);
 }
 function routeResetOrbit(){
+ uavSpawnGrace=routeGraceAtStart?UAV_SPAWN_GRACE_SEC:0;
+ if(routeGraceAtStart)for(const d of uavDrones)uavFreshTimers(d);
+ updateUavStatusHud();
  if(!routeSyncEnabled)return;
- uavElapsed=0;uavSpawnGrace=0;
+ uavElapsed=0;
  for(const d of uavDrones){
-  d.timers.clear();d.targetId=null;d.glare=0;
+  uavFreshTimers(d);
   if(d.stationary){d.x=d.cx;d.z=d.cz;}
   else{d.x=d.cx+Math.cos(d.phase)*d.radius;d.z=d.cz+Math.sin(d.phase)*d.radius;d.yaw=d.phase+Math.PI/2;}
  }
@@ -15883,7 +16038,7 @@ function uavInvalidatePlans(){
   if(!a.motion){a.waypoints=[];a.waypointIndex=0;}
  }
 }
-function uavFreshTimers(d){d.timers.clear();d.targetId=null;d.glare=0;}
+function uavFreshTimers(d){d.timers.clear();d.targetId=null;d.glare=0;d.glareFx=null;}
 function uavSetEnabled(enabled){
  uavEnabled=enabled;for(const d of uavDrones)uavFreshTimers(d);
  uavInvalidatePlans();rebuildUavDynamicMeshes();updateUavStatusHud();updateUavAudio(0);
@@ -16010,6 +16165,7 @@ function routeRetry(){
 }
 function routeRestoreWindows(){
  if(multiplayer||!physicsWorld)return;
+ doorRestore();
  let changed=false;
  for(const pane of breakableGlass)changed=glassSetBroken(pane,false)||changed;
  glassBroken.clear();glassPredicted.clear();glassShards.length=0;
@@ -16131,9 +16287,10 @@ function updateUavEyeMarkers(){
    const el=document.createElement('div');el.className='uavEyeMarker';
    el.innerHTML='<svg viewBox="0 0 32 24"><path d="M2 12 Q16 -3 30 12 Q16 27 2 12Z" fill="none" stroke="#ffdf32" stroke-width="2.5"/><circle cx="16" cy="12" r="5" fill="#ffdf32"/><circle cx="17" cy="10.5" r="1.4" fill="#fff8bd"/></svg>';
    const direction=document.createElement('div');direction.className='uavEyeDirection';direction.innerHTML='<span class="uavEyeArrow"></span>';el.appendChild(direction);
-   const name=document.createElement('span');name.className='uavEyeName';name.textContent=d.id;el.appendChild(name);uavEyeLayer.appendChild(el);
-   marker={el,direction};uavEyeMarkers.set(d.id,marker);
+   const name=document.createElement('span');name.className='uavEyeName';el.appendChild(name);uavEyeLayer.appendChild(el);
+   marker={el,direction,name};uavEyeMarkers.set(d.id,marker);
   }
+  const label=uavAttackerName(d.id);if(marker.name.textContent!==label)marker.name.textContent=label;
   marker.el.classList.toggle('ghost',routeGhost);
   const p=uavEyePosition(d),original={...p};
   if(p.offscreen)for(let i=0;i<locks.length*2;i++){
@@ -16151,6 +16308,7 @@ function updateUavEyeMarkers(){
 // Stadium turrets: an anchored armored housing, an independent gun gimbal,
 // and a fixed scanner recessed beneath it. Model dimensions also make the hulls.
 const stadiumTurretCache=new Map();
+const stadiumFixedBuffer=gl.createBuffer();let stadiumFixedVertexCount=0;
 function isStadiumTurret(d){return !!d?.stationary&&!!d.turret&&!d.argus;}
 function stadiumBodyYaw(d){return Number.isFinite(d.bodyYaw)?d.bodyYaw:d.yaw||0;}
 function stadiumPose(d,gun=false){return {x:d.x,y:d.y-ELEVATED_TURRET_ROOT_HEIGHT+(gun?1.38:0),z:d.z,yaw:gun?d.yaw:stadiumBodyYaw(d),pitch:gun?(d.gunPitch||0):0};}
@@ -16305,11 +16463,17 @@ function stadiumSyncGeometry(){
  for(const [id,entry] of stadiumTurretCache)if(!keep.has(id)){stadiumRemoveEntry(entry);stadiumTurretCache.delete(id);changed=true;}
  // Refresh the query index on creation/removal. Ordinary tracking uses the
  // regular physics steps; the fixed shell never depends on gun orientation.
- if(changed)physicsWorld.step();
+ if(changed){
+  const data=new Float32Array([...stadiumTurretCache.values()].reduce((n,e)=>n+e.fixed.length,0));
+  let offset=0;for(const entry of stadiumTurretCache.values()){data.set(entry.fixed,offset);offset+=entry.fixed.length;}
+  stadiumFixedVertexCount=data.length/9;
+  gl.bindBuffer(gl.ARRAY_BUFFER,stadiumFixedBuffer);gl.bufferData(gl.ARRAY_BUFFER,data,gl.STATIC_DRAW);
+  physicsWorld.step();
+ }
 }
 function stadiumDraw(d){
  const entry=stadiumTurretCache.get(d.id);if(!entry)return;
- for(const v of entry.fixed)uavBodyVerts.push(v);for(const v of entry.gun)uavBodyVerts.push(v);
+ for(const v of entry.gun)uavBodyVerts.push(v);
 }
 
 const STADIUM_YAW_LIMIT=Math.PI*50/180;
@@ -16468,6 +16632,305 @@ function bankEmitSolid(a,piece,faces,tier){
 function addModularRamp(a){
  for(const piece of a.pieces){piece.colliderHandles=[];const faces=bankPieceFaces(piece,a.bottomY);bankEmitSolid(a,piece,bankClipSolid(faces,a.splitY,false),'lower');bankEmitSolid(a,piece,bankClipSolid(faces,a.splitY,true),'upper');}
 }
+
+// ---------- interactive, fixed-swing doors ----------
+const DOOR_OPEN_ANGLE=Math.PI/2,DOOR_BREACH_ANGLE=Math.PI/8;
+const DOOR_THICKNESS=.085,DOOR_USE_RANGE=2.5;
+// A map-generation cell is 3 x 3 one-unit floor tiles.
+const DOOR_KICK_MIN=1.25,DOOR_KICK_MAX=1.85;
+const DOOR_KICK_DURATION=1.0,DOOR_KICK_TILT=.14;
+const doorKickStates=new Map();let doorKickClock=0,doorKickSerial=0;
+const doorLeaves=[],doorById=new Map(),doorByHandle=new Map();
+const doorBuffer=gl.createBuffer();
+let doorMeshDirty=true,doorVertexCount=0,doorMessageUntil=0,doorNextUse=0;
+let routeGraceAtStart=true;
+const doorHud=document.createElement('div');doorHud.id='doorHud';
+doorHud.style.cssText='position:fixed;left:50%;top:59%;transform:translateX(-50%);z-index:36;padding:7px 11px;background:#071019df;border:1px solid #ffffff55;color:#fff;font:700 12px/1.6 Consolas,monospace;text-align:center;pointer-events:none;display:none;white-space:pre-line';
+document.body.appendChild(doorHud);
+// Query predicates must stay in JavaScript: re-entering Rapier from a ray/shape
+// filter can retain a borrow of its collider set and break the next world reset.
+const bodyGeometry=c=>staticGeometry(c)&&!doorByHandle.get(c.handle)?.kicked;
+function doorTheta(d){return d.kicked?d.fallenYaw:d.closedYaw+d.swingSign*d.angle;}
+function doorPose(d,angle=d.angle){
+ const theta=d.kicked?d.fallenYaw:d.closedYaw+d.swingSign*angle;
+ const c=Math.cos(theta),s=Math.sin(theta),R=[c,0,-s];
+ const U=d.kicked?[s*d.fallSign,0,c*d.fallSign]:[0,1,0];
+ const N=d.kicked?[0,-d.fallSign,0]:[s,0,c];
+ const center=d.kicked?[d.originX,FLOOR_TOP+DOOR_THICKNESS/2+.012,d.originZ]
+  :[d.hingeX+R[0]*d.leafSign*d.width/2,d.base+d.height/2,d.hingeZ+R[2]*d.leafSign*d.width/2];
+ return {center,R,U,N,point:(x,y,z)=>center.map((v,k)=>v+R[k]*x+U[k]*y+N[k]*z),normal:(x,y,z)=>R.map((v,k)=>v*x+U[k]*y+N[k]*z)};
+}
+function doorRotation(d){
+ const half=doorTheta(d)/2,tilt=d.kicked?d.fallSign*Math.PI/4:0;
+ return {x:Math.cos(half)*Math.sin(tilt),y:Math.sin(half)*Math.cos(tilt),z:-Math.sin(half)*Math.sin(tilt),w:Math.cos(half)*Math.cos(tilt)};
+}
+function doorBulletExit(door,origin,direction){
+ // Trace the actual oriented leaf: closed, swinging, or lying flat after a kick.
+ const pose=doorPose(door),axes=[pose.R,pose.U,pose.N],half=[door.width/2,door.height/2,DOOR_THICKNESS/2];
+ const offset=[origin.x,origin.y,origin.z].map((v,k)=>v-pose.center[k]),ray=[direction.x,direction.y,direction.z];
+ let entry=0,exit=Infinity,normal=null;
+ for(let k=0;k<3;k++){
+  const p=offset.reduce((sum,v,j)=>sum+v*axes[k][j],0),v=ray.reduce((sum,n,j)=>sum+n*axes[k][j],0);
+  if(Math.abs(v)<1e-9){if(Math.abs(p)>half[k]+1e-6)return null;continue;}
+  const a=(-half[k]-p)/v,b=(half[k]-p)/v;
+  entry=Math.max(entry,Math.min(a,b));
+  if(Math.max(a,b)<exit){exit=Math.max(a,b);normal=axes[k].map(n=>n*Math.sign(v));}
+  if(entry>exit+1e-6||exit<0)return null;
+ }
+ return normal&&Number.isFinite(exit)?{distance:exit,normal:{x:normal[0],y:normal[1],z:normal[2]}}:null;
+}
+function doorSyncCollider(d){
+ const pose=doorPose(d);
+ d.collider.setTranslation({x:pose.center[0],y:pose.center[1],z:pose.center[2]});
+ d.collider.setRotation(doorRotation(d));
+ // Sensors remain ray-queryable for UAV sight and gunfire, but never block a body.
+ d.collider.setSensor(d.kicked);doorMeshDirty=true;
+}
+function doorBuild(){
+ doorKickStates.clear();doorKickClock=0;
+ doorLeaves.length=0;doorById.clear();doorByHandle.clear();doorMeshDirty=true;doorNextUse=0;
+ const greenKey=mainExteriorDoorways[0]||externalDoorways[0];
+ for(const [key,kind] of [...doorways.entries()].sort((a,b)=>a[0]<b[0]?-1:a[0]>b[0]?1:0)){
+  if(kind==='open')continue;
+  const [ax,az,bx,bz]=parseEdge(key),{opening,offset}=openingProfile(kind),vertical=ax!==bx;
+  const tx=vertical?0:1,tz=vertical?1:0,closedYaw=-Math.atan2(tz,tx);
+  const frameX=(ax+bx+1)*TILE/2+tx*offset,frameZ=(az+bz+1)*TILE/2+tz*offset;
+  const exterior=externalDoorways.includes(key),type=exterior?(key===greenKey?'green':'red'):'interior';
+  const aInside=isFloor(ax,az),outX=exterior?(aInside?bx-ax:ax-bx):0,outZ=exterior?(aInside?bz-az:az-bz):0;
+  const normalX=Math.sin(closedYaw),normalZ=Math.cos(closedYaw);
+  let hash=seed;for(const ch of key)hash=Math.imul(hash^ch.charCodeAt(0),16777619);
+  const openSide=exterior?Math.sign(outX*normalX+outZ*normalZ):((hash&1)?1:-1);
+  const count=kind==='double'?2:1,clear=opening-DOOR_FRAME_EDGE_INSET*2-.024,width=clear/count-.012;
+  for(let leaf=0;leaf<count;leaf++){
+   const leafSign=count===2?(leaf===0?1:-1):((hash&2)?1:-1);
+   const offsetLeaf=count===2?(leaf===0?-clear/4:clear/4):0;
+   const originX=frameX+tx*offsetLeaf,originZ=frameZ+tz*offsetLeaf;
+   const d={id:key+':'+leaf,key,leaf,type,exterior,frameX,frameZ,originX,originZ,outX,outZ,width,
+    height:DOORWAY_HEIGHT-DOOR_FRAME_HEADER_DROP-.05,base:FLOOR_TOP+.022,
+    closedYaw,leafSign,swingSign:-openSide*leafSign,hingeX:originX-tx*leafSign*width/2,hingeZ:originZ-tz*leafSign*width/2,
+    angle:0,targetAngle:0,broken:false,kicked:false,fallenYaw:closedYaw,fallSign:1,revision:0};
+   d.collider=physicsWorld.createCollider(RAPIER.ColliderDesc.cuboid(width/2,d.height/2,DOOR_THICKNESS/2).setFriction(0));
+   doorLeaves.push(d);doorById.set(d.id,d);doorByHandle.set(d.collider.handle,d);physicsStaticHandles.add(d.collider.handle);doorSyncCollider(d);
+  }
+ }
+ physicsWorld.step();
+}
+function doorState(d){return {id:d.id,angle:d.angle,targetAngle:d.targetAngle,broken:d.broken,kicked:d.kicked,fallenYaw:d.fallenYaw,fallSign:d.fallSign,revision:d.revision};}
+function doorSnapshot(){return doorLeaves.map(doorState);}
+function doorApplySnapshot(states){
+ if(!Array.isArray(states))return;let changed=false;
+ for(const state of states){
+  const d=doorById.get(state?.id);if(!d||!Number.isSafeInteger(state.revision)||state.revision<d.revision)continue;
+  if(![state.angle,state.targetAngle,state.fallenYaw,state.fallSign].every(Number.isFinite))continue;
+  if(state.revision===d.revision&&Math.abs(state.angle-d.angle)<1e-6&&state.targetAngle===d.targetAngle&&!!state.kicked===d.kicked&&!!state.broken===d.broken)continue;
+  Object.assign(d,{angle:netClamp(state.angle,0,DOOR_OPEN_ANGLE),targetAngle:netClamp(state.targetAngle,0,DOOR_OPEN_ANGLE),broken:!!state.broken,kicked:!!state.kicked,fallenYaw:state.fallenYaw,fallSign:state.fallSign<0?-1:1,revision:state.revision});
+  doorSyncCollider(d);changed=true;
+ }
+ if(changed){physicsWorld.step();doorInvalidateNavigation();}
+}
+function doorInvalidateNavigation(){
+ // Invalidate routes while retaining the world's reusable NPC capsule/controller.
+ const probe=nav3Probe,controller=nav3Controller;nav3Reset();nav3Probe=probe;nav3Controller=controller;
+ resetFollowerNavCaches();uavInvalidatePlans();
+}
+function doorPublish(d){
+ d.revision++;doorSyncCollider(d);physicsWorld.step();doorInvalidateNavigation();
+ if(multiplayer&&isHost)broadcastHost({type:'doorState',generation:mapGeneration,doors:[doorState(d)]});
+}
+function doorRestore(){
+ doorKickStates.clear();
+ let changed=false;for(const d of doorLeaves){
+  if(!d.kicked&&!d.broken&&d.angle===0&&d.targetAngle===0)continue;
+  Object.assign(d,{angle:0,targetAngle:0,broken:false,kicked:false,fallenYaw:d.closedYaw,fallSign:1});d.revision++;doorSyncCollider(d);changed=true;
+ }
+ if(changed){physicsWorld.step();doorInvalidateNavigation();}
+}
+function doorInside(d,p){return (p.x-d.frameX)*d.outX+(p.z-d.frameZ)*d.outZ<-.04;}
+function doorPlayer(){return {id:localPeerId,x:px,z:pz,feetY:playerFeetY,yaw,pitch,crouch:playerCrouchAmount,alive:!playerDead&&!singlePlayerObserver,gun:gunSelf()};}
+function doorTarget(p){
+ if(!physicsWorld)return null;
+ const ray=new RAPIER.Ray(gunEye(p),gunDirection(p.yaw||0,p.pitch||0));
+ const hit=physicsWorld.castRay(ray,DOOR_USE_RANGE,true,undefined,undefined,undefined,undefined,bodyGeometry);
+ return hit?doorByHandle.get(hit.collider.handle)||null:null;
+}
+function doorDistance(d,p){
+ const pose=doorPose(d),dx=p.x-pose.center[0],dz=p.z-pose.center[2];
+ const along=dx*pose.R[0]+dz*pose.R[2],across=dx*pose.N[0]+dz*pose.N[2];
+ return Math.hypot(Math.max(0,Math.abs(along)-d.width/2),Math.max(0,Math.abs(across)-DOOR_THICKNESS/2));
+}
+function doorNotice(message){doorHud.textContent=message;doorMessageUntil=performance.now()+1600;doorHud.style.display='block';}
+function doorSound(kick=false){
+ try{
+  const C=window.AudioContext||window.webkitAudioContext;if(!C)return;
+  const ctx=gunSound.ctx||(gunSound.ctx=new C());if(ctx.state==='suspended')ctx.resume();
+  const osc=ctx.createOscillator(),gain=ctx.createGain();osc.type='triangle';osc.frequency.setValueAtTime(kick?130:260,ctx.currentTime);osc.frequency.exponentialRampToValueAtTime(kick?35:100,ctx.currentTime+.13);
+  gain.gain.setValueAtTime(kick?.14:.045,ctx.currentTime);gain.gain.exponentialRampToValueAtTime(.001,ctx.currentTime+.19);osc.connect(gain);gain.connect(ctx.destination);osc.start();osc.stop(ctx.currentTime+.2);
+ }catch(_){}
+}
+function doorKickRemaining(p={id:localPeerId}){
+ const state=doorKickStates.get(p.id);if(!state)return 0;
+ return Math.max(0,state.end-(state.actor?state.actor.time:doorKickClock));
+}
+function doorKickLean(p={id:localPeerId}){
+ const left=doorKickRemaining(p);return left>0?Math.sin(Math.PI*(1-left/DOOR_KICK_DURATION))*DOOR_KICK_TILT:0;
+}
+function doorKickBegin(p){
+ const actor=String(p.id).startsWith('route:')?p:null;
+ doorKickStates.set(p.id,{token:++doorKickSerial,actor,end:(actor?actor.time:doorKickClock)+DOOR_KICK_DURATION,anchor:{x:p.x,y:networkPlayerFeetY(p),z:p.z}});
+ if(p.id===localPeerId){playerJumpQueued=false;playerVerticalVelocity=0;}
+ if(multiplayer&&isHost)broadcastHost({type:'doorKick',generation:mapGeneration,peerId:p.id,kick:doorKickPack(p)});
+}
+function doorKickPack(p){
+ const state=doorKickStates.get(p.id),remaining=doorKickRemaining(p);
+ return state&&remaining>0?{token:state.token,remaining,anchor:state.anchor}:null;
+}
+function doorKickRead(p,pack){
+ if(isHost)return;
+ if(!pack){doorKickStates.delete(p.id);return;}
+ if(!Number.isSafeInteger(pack.token)||![pack.remaining,pack.anchor?.x,pack.anchor?.y,pack.anchor?.z].every(Number.isFinite))return;
+ if(doorKickStates.get(p.id)?.token===pack.token)return;
+ doorKickStates.set(p.id,{token:pack.token,actor:null,end:doorKickClock+netClamp(pack.remaining,0,DOOR_KICK_DURATION),anchor:{...pack.anchor}});
+ if(p.id===localPeerId){playerJumpQueued=false;playerVerticalVelocity=0;}
+}
+function doorKickTick(dt){
+ doorKickClock+=Math.max(0,dt);
+ for(const [id,state] of doorKickStates)if(state.end-(state.actor?state.actor.time:doorKickClock)<1e-7)doorKickStates.delete(id);
+}
+function doorAction(p,d,action,feedback=false,record=false){
+ const fail=message=>{if(feedback)doorNotice(message);return false;};
+ if(!p||p.alive===false||!d||d.kicked)return fail('Aim at an intact door.');
+ if(doorTarget(p)!==d)return fail('Move closer and aim at the door.');
+ if(action==='kick'){
+  if(doorKickRemaining(p)>0)return fail('Finish the kick first.');
+  if((p.crouch||0)>.01||(p.id===localPeerId&&keys.KeyC))return fail('Stand up before kicking.');
+  if(d.type==='red'&&!doorInside(d,p))return fail('Red doors can only be kicked from inside.');
+  const distance=doorDistance(d,p);
+  if(distance<DOOR_KICK_MIN)return fail('Square up — back away to about 1.5 tiles.');
+  if(distance>DOOR_KICK_MAX)return fail('Move closer — kick from about 1.5 tiles.');
+  d.fallenYaw=doorTheta(d);const n=[Math.sin(d.fallenYaw),Math.cos(d.fallenYaw)];
+  d.fallSign=Math.sign((d.originX-p.x)*n[0]+(d.originZ-p.z)*n[1])||1;
+  d.kicked=true;d.targetAngle=d.angle;
+  doorKickBegin(p);
+ }else if(action==='open'||action==='close'){
+  if(d.exterior&&!d.broken)return fail(d.type==='red'?'Locked red door — shotgun the handle from inside.':'Locked green door — shotgun the handle from either side, or kick it.');
+  d.targetAngle=action==='open'?DOOR_OPEN_ANGLE:0;
+ }else return false;
+ doorPublish(d);doorSound(action==='kick');
+ if(record)routeRecordAction({type:'doorAction',doorId:d.id,doorAction:action},p);
+ return true;
+}
+function doorUse(kick=false){
+ if(!gameStarted||!locked||playerDead||singlePlayerObserver||spectatorActive||mapOpen||isMenuOrTextInputActive()||gunNow()<doorNextUse)return;
+ doorNextUse=gunNow()+.18;
+ const p=doorPlayer(),d=doorTarget(p);if(!d){doorNotice('Aim at an intact door.');return;}
+ const action=kick?'kick':d.targetAngle>=DOOR_OPEN_ANGLE-.001?'close':'open';
+ if(multiplayer&&!isHost){sendConn(hostConn,{type:'doorAction',generation:mapGeneration,doorId:d.id,doorAction:action,motion:netMakeState()});}
+ else doorAction(p,d,action,true,true);
+}
+function doorHostAction(conn,msg){
+ if(msg.generation!==mapGeneration)return;
+ if(msg.motion)netAcceptState(conn,msg.motion);
+ const p=netPlayers.get(conn.peer);if(!p||gunNow()<(p.doorNextUse||0))return;p.doorNextUse=gunNow()+.16;
+ // Surface useful rejection text on the requesting player's own screen.
+ const previous=doorHud.textContent,until=doorMessageUntil,display=doorHud.style.display;
+ const ok=doorAction(p,doorById.get(msg.doorId),msg.doorAction,true);
+ if(!ok){sendConn(conn,{type:'doorNotice',generation:mapGeneration,message:doorHud.textContent});doorHud.textContent=previous;doorMessageUntil=until;doorHud.style.display=display;}
+}
+function doorHandleHit(d,point){
+ if(d.kicked||d.broken)return false;
+ const pose=doorPose(d),p=[point.x,point.y,point.z].map((v,k)=>v-pose.center[k]);
+ const u=p.reduce((s,v,k)=>s+v*pose.R[k],0),v=p.reduce((s,x,k)=>s+x*pose.U[k],0);
+ return Math.abs(u-d.leafSign*(d.width/2-.17))<=.14&&Math.abs(v-(1.03-d.height/2))<=.14;
+}
+function doorBreach(d,p){
+ if(!d||d.kicked||d.broken||d.type==='red'&&!doorInside(d,p))return false;
+ d.broken=true;d.angle=DOOR_BREACH_ANGLE;d.targetAngle=DOOR_BREACH_ANGLE;doorPublish(d);doorSound(true);return true;
+}
+function doorBlocksActor(d,angle){
+ if(d.kicked)return false;
+ const pose=doorPose(d,angle),h=(doorTheta(d)+(angle-d.angle)*d.swingSign)/2,rotation={x:0,y:Math.sin(h),z:0,w:Math.cos(h)};
+ const pos={x:pose.center[0],y:pose.center[1],z:pose.center[2]},shape=new RAPIER.Cuboid(d.width/2,d.height/2,DOOR_THICKNESS/2);
+ const players=multiplayer?[...netPlayers.values()].filter(p=>p.alive!==false):(!playerDead&&!singlePlayerObserver?[doorPlayer()]:[]);
+ for(const p of players){
+  const height=PLAYER_CAPSULE_HEIGHT+(PLAYER_CROUCH_CAPSULE_HEIGHT-PLAYER_CAPSULE_HEIGHT)*(p.crouch||0);
+  if(Math.hypot(p.x-pos.x,p.z-pos.z)>d.width+PLAYER_RADIUS)continue;
+  const contact=shape.contactShape(pos,rotation,playerShape(height),{x:p.x,y:networkPlayerFeetY(p)+height/2,z:p.z},PHYSICS_ROT,0);
+  if(contact&&contact.distance<-.005)return true;
+ }
+ return false;
+}
+function doorTick(dt){
+ let moved=false,finished=false;
+ for(const d of doorLeaves){
+  if(d.kicked||d.angle===d.targetAngle||dt<=0)continue;
+  const amount=Math.sign(d.targetAngle-d.angle)*Math.min(Math.abs(d.targetAngle-d.angle),dt*5.8);
+  // Small angular steps prevent a closing leaf sweeping through a player's body.
+  const steps=Math.max(1,Math.ceil(Math.abs(amount)/.035));
+  for(let i=0;i<steps;i++){
+   const next=d.angle+amount/steps;if(doorBlocksActor(d,next))break;
+   d.angle=next;doorSyncCollider(d);moved=true;
+  }
+  if(Math.abs(d.angle-d.targetAngle)<1e-7){d.angle=d.targetAngle;finished=true;}
+ }
+ if(moved){physicsWorld.step();if(finished)doorInvalidateNavigation();}
+ const visible=gameStarted&&!mapOpen&&!spectatorActive&&!playerDead&&!singlePlayerObserver&&!isMenuOrTextInputActive();
+ if(!visible){doorHud.style.display='none';return;}
+ if(doorKickRemaining()>0){doorHud.textContent='KICKING · '+doorKickRemaining().toFixed(1)+'s';doorHud.style.display='block';return;}
+ if(performance.now()<doorMessageUntil){doorHud.style.display='block';return;}
+ const p=doorPlayer(),d=doorTarget(p);doorHud.style.display=d?'block':'none';if(!d)return;
+ const name=d.type==='interior'?'INTERIOR DOOR':d.type.toUpperCase()+' ENTRANCE';
+ const f=d.exterior&&!d.broken?(d.type==='red'?'LOCKED · SHOTGUN HANDLE FROM INSIDE':'LOCKED · SHOTGUN HANDLE FROM EITHER SIDE'):d.targetAngle>=DOOR_OPEN_ANGLE-.001?'F CLOSE':'F OPEN';
+ const k=d.type==='red'&&!doorInside(d,p)?'KICK FROM INSIDE':doorDistance(d,p)<DOOR_KICK_MIN?'V KICK · SQUARE UP':doorDistance(d,p)>DOOR_KICK_MAX?'V KICK · MOVE CLOSER':'V KICK';
+ doorHud.textContent=name+(d.broken?' · BROKEN LOCK':'')+'\n'+f+' · '+k;
+}
+function doorRender(){
+ if(!doorLeaves.length)return;
+ if(doorMeshDirty){
+  const out=[];
+  for(const d of doorLeaves){
+   const pose=doorPose(d),box=(x,y,z,w,h,t,color)=>gunBox(out,pose,x,y,z,w,h,t,color);
+   const color=d.type==='red'?[.65,.045,.035]:d.type==='green'?[.035,.48,.16]:[.42,.27,.14];
+   box(0,0,0,d.width,d.height,DOOR_THICKNESS,color);
+   for(const side of [-1,1]){
+    box(0,.24,side*(DOOR_THICKNESS/2+.004),d.width-.12,d.height-.68,.008,color.map(v=>v*.8));
+    box(0,-d.height/2+.13,side*(DOOR_THICKNESS/2+.009),d.width-.09,.20,.012,[.28,.30,.32]);
+    const x=d.leafSign*(d.width/2-.17),y=1.03-d.height/2;
+    box(x,y,side*.055,.095,.24,.02,d.broken?[.035,.028,.022]:[.56,.59,.60]);
+    if(!d.broken){box(x-d.leafSign*.035,y,side*.098,.16,.035,.038,[.82,.80,.63]);box(x,y-.068,side*.07,.029,.04,.015,[.025,.025,.027]);}
+    else box(x,y+.016,side*.071,.055,.058,.008,[.009,.009,.009]);
+    for(const y of [-.74,.72])box(-d.leafSign*(d.width/2-.035),y,side*.051,.048,.15,.045,[.42,.44,.46]);
+   }
+  }
+  doorVertexCount=out.length/9;gl.bindBuffer(gl.ARRAY_BUFFER,doorBuffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(out),gl.DYNAMIC_DRAW);doorMeshDirty=false;
+ }
+ gl.useProgram(uavProg);gl.uniformMatrix4fv(uavProjLoc,false,proj);gl.uniformMatrix4fv(uavViewLoc,false,view);bindUavBuffer(doorBuffer);
+ gl.enable(gl.DEPTH_TEST);gl.depthMask(true);gl.enable(gl.CULL_FACE);gl.disable(gl.BLEND);gl.drawArrays(gl.TRIANGLES,0,doorVertexCount);
+}
+function routeGraceCommand(value){
+ if(value&&!['on','off','true','false','1','0'].includes(value)){routeSay('Use /grace on or /grace off.');return false;}
+ routeGraceAtStart=value?['on','true','1'].includes(value):!routeGraceAtStart;
+ routeSay('Grace at start '+(routeGraceAtStart?'ON — recordings, retries and playback begin with 3 seconds of UAV grace.':'OFF — recordings and playback begin without UAV grace.'));return true;
+}
+function gunShotgunModel(out,p){
+ const pose=gunPose(p),box=(x,y,z,w,h,d,c)=>gunBox(out,pose,x,y,z,w,h,d,c),steel=[.22,.24,.26],dark=[.055,.065,.075],wood=[.32,.16,.065];
+ box(0,.015,-.08,.08,.095,.30,steel);box(0,-.035,.18,.07,.08,.22,wood);box(0,-.07,.33,.085,.17,.05,dark);box(0,-.08,.055,.065,.16,.065,wood);
+ gunCylinder(out,pose,0,.035,-.47,.025,.58,steel);gunCylinder(out,pose,0,-.022,-.42,.026,.48,dark);
+ const pump=pose.shot*.065;box(0,-.015,-.36+pump,.095,.085,.19,wood);
+ for(let i=0;i<6;i++)box(0,-.015,-.29-i*.025+pump,.10,.089,.006,dark);
+ gunCylinder(out,pose,0,.035,-.766,.018,.004,[.004,.004,.005]);box(0,.075,-.69,.012,.025,.021,steel);
+ box(0,-.10,-.016,.072,.013,.077,dark);box(-.03,-.074,-.016,.013,.065,.077,dark);box(.03,-.074,-.016,.013,.065,.077,dark);
+ box(.01,-.09,.106,.082,.073,.10,[.13,.14,.15]);box(.02,-.14,.17,.08,.085,.17,[.42,.27,.18]);box(-.018,-.07,-.36+pump,.11,.065,.10,[.13,.14,.15]);
+ if(pose.reload)box(.055,-.1-Math.sin(pose.reload*Math.PI)*.15,-.08,.025,.025,.065,[.67,.09,.04]);
+ if(pose.shot>.45){box(0,.035,-.84,.14*pose.shot,.13*pose.shot,.18,[1,.66,.14]);box(0,.035,-.90,.05,.05,.22,[1,.94,.6]);}
+}
+function shotgunDirections(direction,seq){
+ const R=Math.abs(direction.y)>.95?[1,0,0]:[-direction.z,0,direction.x],len=Math.hypot(...R);for(let k=0;k<3;k++)R[k]/=len;
+ const D=[direction.x,direction.y,direction.z],U=[D[1]*R[2]-D[2]*R[1],D[2]*R[0]-D[0]*R[2],D[0]*R[1]-D[1]*R[0]],out=[direction];
+ for(let i=1;i<8;i++){
+  const a=i*2.3999632297+(seq%31)*.27,r=.043*Math.sqrt(i/7),v=D.map((x,k)=>x+R[k]*Math.cos(a)*r+U[k]*Math.sin(a)*r),n=Math.hypot(...v);out.push({x:v[0]/n,y:v[1]/n,z:v[2]/n});
+ }return out;
+}
+
 
 document.body.classList.add('menu-open');
 showMainMenu();
