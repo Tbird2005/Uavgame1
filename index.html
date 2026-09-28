@@ -3483,8 +3483,8 @@ function survivorBodyTransform(agent,lx,ly,lz){
   const dead=agent.alive===false;
   const fall=dead
     ? -Math.PI*.5*smooth01(Number.isFinite(agent.deathT)?agent.deathT:1)
-    : 0;
-  const yaw=dead?(Number(agent.deathYaw)||0):0;
+    : doorKickLean(agent);
+  const yaw=dead?(Number(agent.deathYaw)||0):(agent.doorFacing||0);
 
   // Same fall-over idea as player capsules: rotate vertical cylinder backward,
   // then yaw the fallen body into its chosen death direction.
@@ -3510,8 +3510,8 @@ function survivorBodyNormal(agent,lx,ly,lz){
   const dead=agent.alive===false;
   const fall=dead
     ? -Math.PI*.5*smooth01(Number.isFinite(agent.deathT)?agent.deathT:1)
-    : 0;
-  const yaw=dead?(Number(agent.deathYaw)||0):0;
+    : doorKickLean(agent);
+  const yaw=dead?(Number(agent.deathYaw)||0):(agent.doorFacing||0);
 
   const cf=Math.cos(fall),sf=Math.sin(fall);
   const y2=ly*cf-lz*sf;
@@ -7648,7 +7648,7 @@ function applyRemoteDeath(msg){
   if(String(msg.peerId)===localPeerId)beginPlayerDeath(msg.killer);
   rebuildNetPlayerMesh();
 }
-function serializeWorldState(){return{type:'world',generation:mapGeneration,seq:++netWorldSeq,glass:glassSnapshot(),doors:doorSnapshot(),players:serializePlayers(),uav:{elapsed:uavElapsed,grace:uavSpawnGrace,drones:serializeUavs(),rules:uavRulesSnapshot()}};}
+function serializeWorldState(){return{type:'world',generation:mapGeneration,seq:++netWorldSeq,glass:glassSnapshot(),doors:doorSnapshot(),smoke:smokeSnapshot(),players:serializePlayers(),uav:{elapsed:uavElapsed,grace:uavSpawnGrace,drones:serializeUavs(),rules:uavRulesSnapshot()}};}
 function hostBroadcastWorld(){broadcastHost(serializeWorldState());}
 function hostRemovePlayer(peerId){
   peerConnections.delete(peerId);
@@ -7684,6 +7684,7 @@ function makeStateSync(){
     decals:gunDecals.slice(),
     glass:glassSnapshot(),
     doors:doorSnapshot(),
+    smoke:smokeSnapshot(),
     drawings:serializeDrawings(),
     deaths:deathMarkers,
     uav:{elapsed:uavElapsed,grace:uavSpawnGrace,drones:serializeUavs(),rules:uavRulesSnapshot()}
@@ -7886,6 +7887,7 @@ function applyStateSync(msg){
   if(Number(msg.generation)!==mapGeneration)return;
 
   glassApplySnapshot(msg.glass);doorApplySnapshot(msg.doors);
+  smokeApplySnapshot(msg.smoke);
   gunDecals.length=0;gunAddImpacts(msg.decals,false);
   applyDrawSnapshot(msg.drawings||[]);
   deathMarkers=(msg.deaths||[]).map(x=>({...x}));
@@ -7905,6 +7907,7 @@ function handleClientMessage(msg){
     if(msg.type==='glassReject'){if(msg.generation===mapGeneration&&!glassBroken.has(msg.id)){glassPredicted.delete(msg.id);glassSetBroken(breakableGlass[msg.id],false);}return;}
     if(msg.type==='positionCorrection'){netApplyCorrection(msg);return;}
     if(msg.type==='gunShot'){gunEvent(msg);return;}
+    if(msg.type==='smokeThrow'){smokeReceiveThrow(msg);return;}
     if(msg.type==='gunStateUpdate'){if(msg.generation===mapGeneration){const p=netPlayers.get(msg.shooter);if(p)gunRead(p,msg.gun);}return;}
     if(msg.type==='scorePing'){sendConn(hostConn,{type:'scorePong',token:msg.token});return;}
     if(msg.type==='heartbeatPing'){
@@ -7951,6 +7954,7 @@ function handleClientMessage(msg){
 
       if(!Number.isSafeInteger(msg.seq)||msg.seq<=netLastWorldSeq)return;
       netLastWorldSeq=msg.seq;glassApplySnapshot(msg.glass);doorApplySnapshot(msg.doors);
+      smokeApplySnapshot(msg.smoke);
       applyPlayerSnapshot(msg.players||[],true);
       applyUavSnapshot(msg.uav);
       return;
@@ -8299,6 +8303,7 @@ let physicsRemotePlayers=new Map();
 let physicsUavColliders=[],physicsUavIndex=0;
 
 function physicsBeginWorld(){
+  smokeReset();
   stadiumTurretCache.clear();
   stadiumFixedVertexCount=0;
   uavSightRules.clear();uavSightContext=null;swatVan=null;swatVanHandles=[];swatVanVerts=[];
@@ -9156,8 +9161,9 @@ function pathCellsToFollowerWaypoints(cells){
 }
 
 function makeSurvivorBrain(id,label,color,primary=false){
+  const gun=gunCreateState();gunEquip(gun,'shotgun');
   return {
-    hp:100,
+    hp:100,gun,gunSeq:0,weaponYaw:0,weaponPitch:0,smokeCheckAt:0,
     id,label,color,primary,
     alive:true,
     x:0,z:0,baseY:FLOOR_TOP,
@@ -9769,6 +9775,7 @@ function uavRayBlockedByExteriorAccess(from,target){
 
 function staticWorldLosFromTo(from,target){
   if(!physicsWorld)return false;
+  if(smokeBlocksSight(from,target,false))return false;
   const delta={x:target.x-from.x,y:target.y-from.y,z:target.z-from.z};
   if(Math.hypot(delta.x,delta.y,delta.z)<1e-7)return true;
   const hit=physicsWorld.castRay(new RAPIER.Ray(from,delta),.9999,true,
@@ -9776,12 +9783,14 @@ function staticWorldLosFromTo(from,target){
   return !hit;
 }
 
-function staticUavLosFromTo(from,target){
+function staticUavLosFromTo(from,target,future=0){
   if(!physicsWorld)return false;
+  if(smokeBlocksSight(from,target,true,future))return false;
   const delta={x:target.x-from.x,y:target.y-from.y,z:target.z-from.z};
   if(Math.hypot(delta.x,delta.y,delta.z)<1e-7)return true;
+  if(nav3PlannedDoorOccludes(from,delta))return false;
   return !physicsWorld.castRay(new RAPIER.Ray(from,delta),.9999,true,
-    undefined,undefined,undefined,undefined,c=>uavSightAllowed(c,from,delta));
+    undefined,undefined,undefined,undefined,c=>!nav3OpenDoorSight?.has(doorByHandle.get(c.handle)?.id)&&uavSightAllowed(c,from,delta));
 }
 function survivorSpotVisibleToDrone(drone,spot,futureSec=0){
   if(!uavEnabled)return false;
@@ -9795,7 +9804,7 @@ function survivorSpotVisibleToDrone(drone,spot,futureSec=0){
     z:spot.z
   };
 
-  return uavTrackPoint(drone,target,from);
+  return uavTrackPoint(drone,target,from,futureSec);
 }
 
 function survivorEstimateDroneHandoffSeconds(agent,drone){
@@ -12726,39 +12735,40 @@ function legacy_updateFollower(){/* Superseded by unified 3D navigation. */}
 // ---------- shared 3D navigation / cover / physical NPC locomotion ----------
 // Nodes retain world height. Walking, ramp ascent/descent, pit jumps and
 // one-way drops are different graph edges; none can be smoothed into a walk.
-let nav3Columns=new Map(),nav3Edges=new Map(),nav3Portals=new Map();
+let nav3Columns=new Map(),nav3Edges=new Map(),nav3Portals=new Map(),nav3DoorLinks=new Map();
+let nav3OpenDoorSight=null;
 let nav3WalkCache=new Map();
-let nav3PortalList=[],nav3Ready=false,nav3Probe=null,nav3Controller=null;
+let nav3PortalList=[],nav3Ready=false,nav3PortalBuild=null,nav3Probe=null,nav3Controller=null;
 let nav3Pending=new Map(),nav3SearchDeadline=Infinity,nav3WaveSerial=0;
 let physicsStaticHandles=new Set();
 const NPC_DT=1/120,NPC_SKIN=.008,NPC_JUMP_V=PLAYER_JUMP_SPEED;
 const NPC_SHAPE=new RAPIER.Capsule(FOLLOWER_HEIGHT/2-FOLLOWER_RADIUS,FOLLOWER_RADIUS);
 const staticGeometry=c=>physicsStaticHandles.has(c.handle);
 function nav3Reset(){
-  nav3Columns.clear();nav3Edges.clear();nav3Portals.clear();nav3WalkCache.clear();nav3PortalList=[];nav3Ready=false;
+  nav3Columns.clear();nav3Edges.clear();nav3Portals.clear();nav3DoorLinks.clear();nav3WalkCache.clear();nav3PortalList=[];nav3Ready=false;nav3PortalBuild=null;
   nav3Probe=null;nav3Controller=null;nav3Pending.clear();nav3WaveSerial=0;
 }
-function npcClear(x,y,z){
+function npcClear(x,y,z,geometry=bodyGeometry){
   let clear=true;
   const p={x,y:y+FOLLOWER_HEIGHT/2,z};
   physicsWorld.intersectionsWithShape(p,PHYSICS_ROT,NPC_SHAPE,c=>{
     const contact=c.contactShape(NPC_SHAPE,p,PHYSICS_ROT,0);
     if(contact&&contact.distance<-.001){clear=false;return false;}return true;
-  },undefined,undefined,undefined,undefined,bodyGeometry);
+  },undefined,undefined,undefined,undefined,geometry);
   return clear;
 }
-function npcSweep(a,b){
+function npcSweep(a,b,geometry=bodyGeometry){
   return physicsWorld.castShape({x:a.x,y:a.y+FOLLOWER_HEIGHT/2,z:a.z},PHYSICS_ROT,
     {x:b.x-a.x,y:b.y-a.y,z:b.z-a.z},NPC_SHAPE,.001,1,false,
-    undefined,undefined,undefined,undefined,bodyGeometry);
+    undefined,undefined,undefined,undefined,geometry);
 }
-function nav3Stand(x,z,y){
+function nav3Stand(x,z,y,geometry=bodyGeometry){
   if(lavaZoneAtWorld(x,z)&&y<FLOOR_TOP-.3)return null;
   const from=y+.30;
-  if(!npcClear(x,from,z))return null;
+  if(!npcClear(x,from,z,geometry))return null;
   const hit=physicsWorld.castShape({x,y:from+FOLLOWER_HEIGHT/2,z},PHYSICS_ROT,
     {x:0,y:-1,z:0},NPC_SHAPE,NPC_SKIN,.62,true,
-    undefined,undefined,undefined,undefined,bodyGeometry);
+    undefined,undefined,undefined,undefined,geometry);
   if(!hit||hit.normal1.y<.60)return null;
   const feet=from-hit.time_of_impact;
   if(Math.abs(feet-y)>.29)return null;
@@ -12795,24 +12805,24 @@ function nav3Walk(a,b){
   if(key)nav3WalkCache.set(key,result);
   return result;
 }
-function nav3WalkUncached(a,b){
+function nav3WalkUncached(a,b,geometry=bodyGeometry){
   const dist=Math.hypot(b.x-a.x,b.z-a.z),dy=b.y-a.y;
   if(Math.abs(dy)>Math.max(.17,dist*1.18))return false;
   const steps=Math.max(1,Math.ceil(dist/.24));
   let prev=a;
   for(let i=0;i<=steps;i++){
     const t=i/steps,x=a.x+(b.x-a.x)*t,z=a.z+(b.z-a.z)*t,y=a.y+dy*t;
-    const p=nav3Stand(x,z,y);
-    if(!p||Math.abs(p.y-y)>.21||!npcClear(x,p.y,z))return false;
+    const p=nav3Stand(x,z,y,geometry);
+    if(!p||Math.abs(p.y-y)>.21||!npcClear(x,p.y,z,geometry))return false;
     // A raised sweep catches thin walls between samples. The floor/slope itself
     // is below it; standing-clearance queries still check the full-height body.
-    if(i){const hit=npcSweep({...prev,y:prev.y+.10},{...p,y:p.y+.10});
+    if(i){const hit=npcSweep({...prev,y:prev.y+.10},{...p,y:p.y+.10},geometry);
       if(hit&&hit.time_of_impact<.999)return false;}
     prev=p;
   }
   return true;
 }
-function nav3Nearest(p,connect=true){
+function nav3Nearest(p,connect=true,accept=null){
   const cell=navCellAtWorld(p.x,p.z),candidates=[];
   for(let dz=-2;dz<=2;dz++)for(let dx=-2;dx<=2;dx++)for(const n of nav3Nodes(cell.x+dx,cell.z+dz)){
     const d=Math.hypot(n.x-p.x,n.z-p.z);
@@ -12820,17 +12830,17 @@ function nav3Nearest(p,connect=true){
     candidates.push({n,d:d+Math.abs(n.y-p.y)*2});
   }
   candidates.sort((a,b)=>a.d-b.d);
-  for(const c of candidates)if(!connect||nav3Walk(p,c.n))return c.n;
+  for(const c of candidates)if((!connect||nav3Walk(p,c.n))&&(!accept||accept(c.n)))return c.n;
   return null;
 }
-function nav3Arc(from,to,kind){
+function nav3Arc(from,to,kind,geometry=bodyGeometry){
   for(const vy of kind==='drop'?[2.0,3.65,NPC_JUMP_V]:[NPC_JUMP_V]){
-    const motion=nav3ArcWithVelocity(from,to,kind,vy);
+    const motion=nav3ArcWithVelocity(from,to,kind,vy,geometry);
     if(motion)return motion;
   }
   return null;
 }
-function nav3ArcWithVelocity(from,to,kind,vy){
+function nav3ArcWithVelocity(from,to,kind,vy,geometry=bodyGeometry){
   const discriminant=vy*vy+2*PLAYER_GRAVITY*(from.y-to.y);
   if(discriminant<0)return null;
   const duration=(vy+Math.sqrt(discriminant))/PLAYER_GRAVITY;
@@ -12841,9 +12851,9 @@ function nav3ArcWithVelocity(from,to,kind,vy){
   for(let i=1,n=Math.ceil(duration/.035);i<=n;i++){
     const t=duration*i/n;
     const p={x:from.x+vx*t,y:from.y+vy*t-.5*PLAYER_GRAVITY*t*t,z:from.z+vz*t};
-    const hit=npcSweep(previous,p);
+    const hit=npcSweep(previous,p,geometry);
     if(hit&&hit.time_of_impact<.998&&!(i===n&&hit.normal1.y>.6))return null;
-    if(!npcClear(p.x,p.y,p.z))return null;
+    if(!npcClear(p.x,p.y,p.z,geometry))return null;
     previous=p;
   }
   return motion;
@@ -12858,9 +12868,138 @@ function nav3AddPortal(fromHint,toHint,kind){
   const portal={id,a,b,from,to,motion,kind};nav3PortalList.push(portal);
   let list=nav3Portals.get(a.key);if(!list){list=[];nav3Portals.set(a.key,list);}list.push(portal);
 }
+function nav3FutureDoor(d,mode){
+  return d.kicked?d:mode==='kick'?{...d,kicked:true,fallenYaw:doorTheta(d),fallSign:1}:{...d,angle:DOOR_OPEN_ANGLE};
+}
+function nav3DoorWalk(d,mode,a,b,geometry){
+  if(!nav3WalkUncached(a,b,geometry))return false;
+  if(mode==='kick'||d.kicked)return true;
+  const pose=doorPose(d,DOOR_OPEN_ANGLE),steps=Math.max(1,Math.ceil(Math.hypot(b.x-a.x,b.z-a.z)/.12));
+  for(let i=0;i<=steps;i++){
+    const t=i/steps,y=a.y+(b.y-a.y)*t;
+    if(y+FOLLOWER_HEIGHT<d.base||y>d.base+d.height)continue;
+    const dx=a.x+(b.x-a.x)*t-pose.center[0],dz=a.z+(b.z-a.z)*t-pose.center[2];
+    const u=Math.max(0,Math.abs(dx*pose.R[0]+dz*pose.R[2])-d.width/2);
+    const v=Math.max(0,Math.abs(dx*pose.N[0]+dz*pose.N[2])-DOOR_THICKNESS/2);
+    if(Math.hypot(u,v)<FOLLOWER_RADIUS+NPC_SKIN)return false;
+  }
+  return true;
+}
+function nav3DoorCoverPaths(d,middle,geometry){
+  if(!d.exterior||d.kicked)return [];
+  const pose=doorPose(d,DOOR_OPEN_ANGLE),paths=[];
+  const stand=(x,z)=>nav3SurfaceHints(x,z).map(y=>nav3Stand(x,z,y,geometry)).find(p=>p&&Math.abs(p.y-middle.y)<.3);
+  for(const side of [-1,1])for(const along of [.42,.68]){
+    const x=d.hingeX+pose.R[0]*d.leafSign*d.width*along+pose.N[0]*side*(FOLLOWER_RADIUS+.09);
+    const z=d.hingeZ+pose.R[2]*d.leafSign*d.width*along+pose.N[2]*side*(FOLLOWER_RADIUS+.09);
+    const p=stand(x,z);if(!p||(p.x-d.frameX)*d.outX+(p.z-d.frameZ)*d.outZ<FOLLOWER_RADIUS+.02)continue;
+    let path=[p];
+    if(!nav3DoorWalk(d,'open',middle,p,geometry)){
+      const tipX=d.hingeX+pose.R[0]*d.leafSign*(d.width+FOLLOWER_RADIUS+.18);
+      const tipZ=d.hingeZ+pose.R[2]*d.leafSign*(d.width+FOLLOWER_RADIUS+.18);
+      const nearSide=Math.sign((middle.x-pose.center[0])*pose.N[0]+(middle.z-pose.center[2])*pose.N[2])||1;
+      const a=stand(tipX+pose.N[0]*nearSide*.42,tipZ+pose.N[2]*nearSide*.42);
+      const b=stand(tipX+pose.N[0]*side*.42,tipZ+pose.N[2]*side*.42);
+      if(!a||!b||!nav3DoorWalk(d,'open',middle,a,geometry)||!nav3DoorWalk(d,'open',a,b,geometry)||!nav3DoorWalk(d,'open',b,p,geometry))continue;
+      path=[a,b,p];
+    }
+    const cell=navCellAtWorld(p.x,p.z);
+    Object.assign(p,{gx:cell.x,gz:cell.z,key:'door-cover:'+d.id+':'+side+':'+along,doorCover:d.id});
+    paths.push(path.map(w=>({...w,doorwayPortal:true})));
+  }
+  return paths;
+}
+function* nav3BuildDoorLinks(){
+  for(const d of doorLeaves){
+    yield;
+    const needsAction=!d.kicked&&d.angle<DOOR_OPEN_ANGLE-.01;
+    // Raised drops remain usable by the rest of the squad after the first NPC
+    // removes the door. Ordinary open doorways already have walking edges.
+    if(!needsAction&&(!d.exterior||d.kicked&&!usingElevatedTurretTileset()))continue;
+    const nx=Math.sin(d.closedYaw),nz=Math.cos(d.closedYaw);
+    // Only this leaf is removed for the hypothetical crossing. Frames, walls,
+    // furniture and the other half of a double door retain full collision.
+    const geometry=needsAction?c=>bodyGeometry(c)&&c.handle!==d.collider.handle:bodyGeometry;
+    const middle=nav3Stand(d.originX,d.originZ,FLOOR_TOP,geometry);
+    if(!middle)continue;
+    const kick=needsAction&&d.exterior&&!d.broken;
+    const modes=kick?['breach','kick']:[needsAction?'open':null];
+    const coverPaths=nav3DoorCoverPaths(d,middle,geometry);
+    // Include the sheltered sides of the frame when lining up a kick. A one
+    // second pause in the middle of a turret's sightline may be unsurvivable.
+    const offsets=kick?[0,-(d.width/2+.20),d.width/2+.20]:[0];
+    for(const side of [-1,1])for(const offset of offsets){
+      yield;
+      // Wide interior leaves swing toward the opener on one side. Leave room
+      // for the whole sweep; kicks retain the same 1.5-tile range as players.
+      const reachIn=kick?1.60:Math.max(1.60,d.width+.50);
+      const from=nav3Stand(d.originX+nx*side*reachIn+Math.cos(d.closedYaw)*offset,
+        d.originZ+nz*side*reachIn-Math.sin(d.closedYaw)*offset,FLOOR_TOP);
+      if(!from)continue;
+      if(kick&&d.type==='red'&&!doorInside(d,from))continue;
+      if(kick&&(doorDistance(d,from)<DOOR_KICK_MIN||doorDistance(d,from)>DOOR_KICK_MAX))continue;
+      const a=nav3Nearest(from);if(!a||!nav3WalkUncached(from,middle,geometry))continue;
+      let linked=false;
+      const id='door:'+d.id+':'+side+(offset?':'+offset.toFixed(3):'');
+      const add=(b,path,cover=false)=>{
+        for(const mode of modes){
+          if(cover&&mode==='kick')continue;
+          const last=path.at(-1)||from;
+          const end=cover?b:nav3Nearest(last,true,n=>nav3DoorWalk(d,mode,last,n,geometry));
+          if(!end||end.key===a.key)continue;
+          const crossing=[from,...path,end];
+          if(crossing.some((p,i)=>i&&!p.motion&&!nav3DoorWalk(d,mode,crossing[i-1],p,geometry)))continue;
+          const linkId=id+(mode?':'+mode:'')+(cover?':'+b.key:'');
+          const approach=[{...from,doorwayPortal:true}];
+          if(needsAction)approach.push({...from,doorId:d.id,doorMode:mode,wait:mode==='kick'?DOOR_KICK_DURATION:mode==='breach'?.55:.35,doorwayPortal:true,linkId});
+          const list=nav3DoorLinks.get(a.key)||[];
+          list.push({to:end,id:linkId,path:[...approach,...path.map(p=>({...p,linkId})),end]});nav3DoorLinks.set(a.key,list);
+          if(!cover)linked=true;
+        }
+      };
+      for(const path of coverPaths)add(path.at(-1),[{...middle,doorwayPortal:true},...path.slice(0,-1)],true);
+      // Rejoin the walking graph just beyond the frame, so runners can turn
+      // toward cover immediately instead of being forced far into open sight.
+      for(const reach of [.65,.95,1.60]){
+        const x=d.originX-nx*side*reach,z=d.originZ-nz*side*reach;
+        const hints=nav3SurfaceHints(x,z).sort((a,b)=>Math.abs(a-FLOOR_TOP)-Math.abs(b-FLOOR_TOP));
+        for(const y of hints){
+          const to=nav3Stand(x,z,y);if(!to||!nav3WalkUncached(middle,to,geometry))continue;
+          const b=nav3Nearest(to);if(!b||b.key===a.key)continue;
+          add(b,[{...middle,doorwayPortal:true,linkId:id},{...to,doorwayPortal:true,linkId:id}]);break;
+        }
+        if(linked)break;
+      }
+      // A raised exit may have no landing directly outside. Kick/open first,
+      // then use a physically validated outward drop through the same leaf.
+      if(!linked&&d.exterior&&usingElevatedTurretTileset()&&doorInside(d,from)){
+        // Reach the threshold before jumping, so the capsule clears the deck
+        // edge while rising instead of landing back on its rounded lip.
+        const takeoff=middle;
+        for(const reach of [1.6,2.4,3.2]){
+          yield;
+          const to=nav3Stand(d.originX-nx*side*reach,d.originZ-nz*side*reach,outsideGroundY());
+          if(!to)continue;
+          const motion=nav3Arc(takeoff,to,'drop',geometry),b=motion&&nav3Nearest(to);
+          if(!motion||!b||b.key===a.key)continue;
+          add(b,[{...takeoff,takeoff:true,doorwayPortal:true},{...to,action:'drop',motion,linkId:id}]);break;
+        }
+      }
+    }
+  }
+}
 function nav3BuildPortals(){
-  if(nav3Ready)return;nav3Ready=true;
+  if(nav3Ready)return true;
+  if(!nav3PortalBuild)nav3PortalBuild=nav3PortalSteps();
+  while(performance.now()<nav3SearchDeadline){
+    if(nav3PortalBuild.next().done){nav3Ready=true;nav3PortalBuild=null;return true;}
+  }
+  return false;
+}
+function* nav3PortalSteps(){
+  yield* nav3BuildDoorLinks();
   for(const j of lavaJumpLinks){
+    yield;
     const d=Math.hypot(j.bx-j.ax,j.bz-j.az),dx=(j.bx-j.ax)/d,dz=(j.bz-j.az)/d;
     const a={x:j.ax-dx*.30,z:j.az-dz*.30,y:FLOOR_TOP},b={x:j.bx+dx*.30,z:j.bz+dz*.30,y:FLOOR_TOP};
     // Some walkway intersections already bridge an authored gap. They stay walk
@@ -12873,11 +13012,13 @@ function nav3BuildPortals(){
   for(const access of exteriorRamps){
     const L=access.landing;
     for(const [dx,dz] of [[1,0],[-1,0],[0,1],[0,-1]])for(const reach of [1.0,2.4,3.6]){
+      yield;
       const half=L.width*.5;
       nav3AddPortal({x:L.x+dx*(half-.40),z:L.z+dz*(half-.40),y:FLOOR_TOP},
         {x:L.x+dx*(half+reach),z:L.z+dz*(half+reach),y:outsideGroundY()},'drop');
     }
     for(const r of access.ramps)for(const t of [.28,.55])for(const sign of [-1,1])for(const reach of [.9,2.2,3.2]){
+      yield;
       const sideX=-r.dz*sign,sideZ=r.dx*sign,half=(r.widthTop+(r.widthBottom-r.widthTop)*t)*.5;
       const x=r.x+r.dx*r.run*t,z=r.z+r.dz*r.run*t,y=r.topY+(r.bottomY-r.topY)*t;
       nav3AddPortal({x:x+sideX*(half-.40),z:z+sideZ*(half-.40),y},
@@ -12887,6 +13028,7 @@ function nav3BuildPortals(){
   for(const p of junglePlatforms){
     const cx=(p.x0+p.x1)/2,cz=(p.z0+p.z1)/2;
     for(const [dx,dz] of [[1,0],[-1,0],[0,1],[0,-1]]){
+      yield;
       const half=dx?(p.x1-p.x0)/2:(p.z1-p.z0)/2;
       if(half<.42)continue;
       nav3AddPortal({x:cx+dx*(half-.36),z:cz+dz*(half-.36),y:p.y},
@@ -12921,6 +13063,7 @@ function nav3Neighbors(n){
     edges.push({to:portal.b,id:portal.id,path:[{...portal.from,takeoff:true},
       {...portal.to,action:portal.kind,motion:portal.motion,linkId:portal.id},portal.b]});
   }
+  edges.push(...(nav3DoorLinks.get(n.key)||[]));
   nav3Edges.set(n.key,edges);return edges;
 }
 class Nav3Heap{
@@ -12942,16 +13085,36 @@ function nav3TimedSamples(from,path){
       const t=i/count,elapsed=duration*t;
       samples.push({x:p.x+(wp.x-p.x)*t,z:p.z+(wp.z-p.z)*t,
         y:motion?motion.from.y+motion.vy*elapsed-.5*PLAYER_GRAVITY*elapsed*elapsed:p.y+(wp.y-p.y)*t,
-        time:time+elapsed,dt:duration/count,distance:distance+dist*t});
+        time:time+elapsed,dt:duration/count,distance:distance+dist*t,doorId:wp.doorId,doorMode:wp.doorMode});
     }
     time+=duration;distance+=dist;p=wp;
   }
   return samples;
 }
-function nav3Exposure(from,path,states,startTime=0,startTimers=null,margin=.16){
+function nav3WithOpenDoors(doors,fn){
+  const before=nav3OpenDoorSight;nav3OpenDoorSight=doors;
+  try{return fn();}finally{nav3OpenDoorSight=before;}
+}
+function nav3PlannedDoorOccludes(from,delta){
+  if(!nav3OpenDoorSight?.size)return false;
+  for(const entry of nav3OpenDoorSight){
+    const [id,mode]=Array.isArray(entry)?entry:[entry,null];
+    const d=doorById.get(id);if(!d)continue;
+    // Forecast the real resulting slab, including UAV cover beneath a kicked
+    // door on a raised map. The live collider is never moved by planning.
+    const future=nav3FutureDoor(d,mode||(d.exterior&&!d.broken?'kick':'open'));
+    const hit=doorBulletExit(future,from,delta);
+    if(hit&&hit.entry<.9999&&hit.distance>.0001)return true;
+  }
+  return false;
+}
+function nav3Exposure(from,path,states,startTime=0,startTimers=null,margin=.16,startDoors=null){
   const timers=startTimers?startTimers.slice():states.map(s=>s.timer),samples=nav3TimedSamples(from,path);
+  const openedDoors=new Map([...(startDoors||[])].map(e=>Array.isArray(e)?e:[e,null]));
   let exposure=0,min=Infinity,lethal=false;
-  for(const p of samples)for(let i=0;i<states.length;i++){
+  nav3WithOpenDoors(openedDoors,()=>{for(const p of samples){
+    if(p.doorId)openedDoors.set(p.doorId,p.doorMode);
+    for(let i=0;i<states.length;i++){
     // Assume a visible turret may acquire this NPC immediately. Another NPC's
     // current lock is never treated as guaranteed free exposure time.
     const visible=nav3Sight(states[i].drone,p,startTime+p.time);
@@ -12959,8 +13122,9 @@ function nav3Exposure(from,path,states,startTime=0,startTimers=null,margin=.16){
     timers[i]=Math.min(uavTimeMax(states[i].drone),timers[i]+(locked?-UAV_DRAIN_RATE:UAV_REGAIN_RATE)*p.dt);
     if(visible)exposure+=p.dt;
     min=Math.min(min,timers[i]);if(timers[i]<margin)lethal=true;
-  }
-  return {timers,exposure,min,lethal,time:samples.at(-1)?.time||0};
+    }
+  }});
+  return {timers,exposure,min,lethal,openedDoors,time:samples.at(-1)?.time||0};
 }
 function nav3Cover(p,arrival=0,deep=true,drones=uavDrones){
   let visible=0;
@@ -12978,6 +13142,9 @@ function nav3Cover(p,arrival=0,deep=true,drones=uavDrones){
 }
 function nav3EscapeGoal(p,agent,emergency){
   if(emergency)return Math.hypot(p.x-survivorX(agent),p.z-survivorZ(agent))>.12;
+  const pocket=p.doorCover||(agent.targetSpot?.doorCover&&Math.hypot(p.x-agent.targetSpot.x,p.z-agent.targetSpot.z)<.65?agent.targetSpot.doorCover:null);
+  const coverDoor=doorById.get(pocket);
+  if(coverDoor&&!coverDoor.kicked&&(p.x-coverDoor.frameX)*coverDoor.outX+(p.z-coverDoor.frameZ)*coverDoor.outZ>FOLLOWER_RADIUS)return true;
   const gx=Math.floor(p.x/TILE),gz=Math.floor(p.z/TILE);
   if(usingElevatedTurretTileset()){
     // Ground beneath the deck is a legitimate destination, including columns
@@ -13013,18 +13180,18 @@ function nav3GoalHeuristic(p,target){
   return Number.isFinite(distance)?distance/FOLLOWER_SPRINT_SPEED*2.5:0;
 }
 function* nav3Search(agent,target=null,emergency=false){
-  nav3BuildPortals();
+  while(!nav3BuildPortals())yield null;
   const from={x:survivorX(agent),y:survivorBaseYOf(agent),z:survivorZ(agent)};
   const start=nav3Nearest(from);if(!start)return null;
   const end=target?nav3Nearest(target):null;if(target&&!end)return null;
   const states=nav3States(agent,true),heap=new Nav3Heap(),best=new Map();
-  const first={n:start,parent:null,edge:null,time:0,timers:states.map(s=>s.timer),cost:0,priority:0};
+  const first={n:start,parent:null,edge:null,time:0,timers:states.map(s=>s.timer),openedDoors:new Map(),cost:0,priority:0};
   // Include the off-lattice start segment in both collision and exposure.
   const entry=nav3Exposure(from,[start],states,0,null,emergency?.04:.16);
   if(!target&&entry.lethal)return null;
   first.time=entry.time;first.timers=entry.timers;first.cost=entry.time+entry.exposure*7;
   heap.push(first);best.set(start.key,first.cost);
-  let expanded=0;
+  let expanded=0,reservedPlan=null;
   // Multi-floor escapes may cross an entire upper room before reaching an
   // exterior descent. Keep that search available within the same frame slices.
   const budget=emergency?1800:9000;
@@ -13039,32 +13206,38 @@ function* nav3Search(agent,target=null,emergency=false){
       if(nav3Walk(end,target))path.push(target);
       return {path:nav3Smooth(from,path),spot:target,cost:cur.cost,expanded};
     }
-    if(!target&&nav3EscapeGoal(n,agent,emergency)&&cur.time>.02&&nav3Cover(n,cur.time,true,states.map(s=>s.drone))){
+    if(!target&&nav3EscapeGoal(n,agent,emergency)&&cur.time>.02&&nav3WithOpenDoors(cur.openedDoors,()=>nav3Cover(n,cur.time,true,states.map(s=>s.drone)))){
       const occupied=allSurvivorAgents().some(a=>a!==agent&&a.targetSpot&&
         Math.hypot(a.targetSpot.x-n.x,a.targetSpot.z-n.z)<.85&&Math.abs((a.targetSpot.y||0)-n.y)<.5);
-      if(!occupied||emergency){
+      if(!occupied||emergency||!reservedPlan||cur.cost<reservedPlan.cost){
         const raw=[start,...nav3RecoverPath(cur)],smoothed=nav3Smooth(from,raw);
         // Smoothing changes arrival timing; validate the actual selected route.
         const risk=nav3Exposure(from,smoothed,states,0,null,emergency?.04:.16);
         const path=risk.lethal?raw:smoothed;
-        return {path,spot:{...n},cost:cur.cost,expanded,kind:n.y<FLOOR_TOP-1?'under-deck-cover':'cover-runout'};
+        const plan={path,spot:{...n},cost:cur.cost,expanded,kind:n.doorCover?'DOOR-COVER':n.y<FLOOR_TOP-1?'under-deck-cover':'cover-runout'};
+        if(!occupied||emergency)return plan;
+        reservedPlan=plan;
       }
     }
     for(const edge of nav3Neighbors(n)){
       if(edge.id&&(agent.failedLinks?.get(edge.id)||0)>survivorAiClock)continue;
+      const breach=edge.path.find(p=>p.doorMode==='breach');
+      if(breach&&!doorById.get(breach.doorId)?.broken&&[...cur.openedDoors.values()].filter(v=>v==='breach').length>=(agent.gun?.slots.shotgun.ammo||0))continue;
       // Following can traverse visible space; tactical escapes must remain
       // survivable at every sample along the entire route.
-      const risk=nav3Exposure(n,edge.path,states,cur.time,cur.timers,emergency?.04:.16);
+      const risk=nav3Exposure(n,edge.path,states,cur.time,cur.timers,emergency?.04:.16,cur.openedDoors);
       if(!target&&risk.lethal)continue;
       const cost=cur.cost+risk.time+risk.exposure*(target?1.5:7)+
         (edge.id?.startsWith('drop')?.08:0);
       if(cost>=(best.get(edge.to.key)??Infinity)-1e-6)continue;
       best.set(edge.to.key,cost);
       const heuristic=emergency?0:nav3GoalHeuristic(edge.to,end);
-      heap.push({n:edge.to,edge,parent:cur,cost,time:cur.time+risk.time,timers:risk.timers,priority:cost+heuristic});
+      heap.push({n:edge.to,edge,parent:cur,cost,time:cur.time+risk.time,timers:risk.timers,openedDoors:risk.openedDoors,priority:cost+heuristic});
     }
   }
-  return null;
+  // Prefer separate cover, but let the next runner reuse a safe exit/cover
+  // pocket when a teammate already occupies the only reachable destination.
+  return reservedPlan;
 }
 function nav3Plan(agent,target=null,emergency=false){
   const search=nav3Search(agent,target,emergency);let r;
@@ -13078,19 +13251,111 @@ function npcEnsureController(){
   nav3Controller.setSlideEnabled(true);nav3Controller.setMaxSlopeClimbAngle(50*Math.PI/180);
   nav3Controller.setMinSlopeSlideAngle(51*Math.PI/180);
 }
+function npcActor(a){
+  return {id:a.id,npc:a,name:a.label,x:survivorX(a),z:survivorZ(a),feetY:survivorBaseYOf(a),
+    yaw:a.weaponYaw||0,pitch:a.weaponPitch||0,crouch:0,alive:survivorIsAlive(a),gun:a.gun};
+}
+function npcAim(a,point){
+  const p=npcActor(a),eye=gunEye(p),dx=point.x-p.x,dz=point.z-p.z;
+  a.weaponYaw=Math.atan2(dx,-dz);a.weaponPitch=Math.atan2(point.y-eye.y,Math.hypot(dx,dz));
+  a.doorFacing=a.weaponYaw;return npcActor(a);
+}
+function npcShotgunDoor(a,d){
+  if(d.kicked||d.broken||d.type==='red'&&!doorInside(d,npcActor(a)))return false;
+  const s=a.gun,slot=s.slots.shotgun;
+  if(slot.ammo<=0||survivorAiClock<(a.nextBreachAt||0))return false;
+  const handle=doorPose(d).point(d.leafSign*(d.width/2-.17),1.03-d.height/2,0);
+  const p=npcAim(a,{x:handle[0],y:handle[1],z:handle[2]});gunEquip(s,'shotgun');
+  const hit=gunTrace(gunEye(p),gunDirection(p.yaw,p.pitch),a.id,'shotgun');
+  if(hit.doorHits[0]?.door!==d||hit.target)return false;
+  slot.ammo--;s.lastSeq=++a.gunSeq;a.nextBreachAt=survivorAiClock+WEAPONS.shotgun.interval;
+  gunShootWorld(p,a.id,s.lastSeq);return d.broken;
+}
+function npcGearTick(a){
+  const s=a.gun;
+  if(a.npcReloadUntil&&survivorAiClock>=a.npcReloadUntil){s.slots.shotgun.ammo=WEAPONS.shotgun.mag;s.slots.shotgun.reloadEnd=0;a.npcReloadUntil=0;}
+  if(s.slots.shotgun.ammo===0&&!a.npcReloadUntil){a.npcReloadUntil=survivorAiClock+WEAPONS.shotgun.reload;s.slots.shotgun.reloadEnd=gunNow()+WEAPONS.shotgun.reload;}
+  if(a.smokePlan){
+    const plan=a.smokePlan;
+    if(!plan.thrown&&survivorAiClock>=plan.throwAt){
+      smokeThrowWorld(npcActor(a),a.id,++a.gunSeq);plan.thrown=true;
+    }
+    if(survivorAiClock>=plan.readyAt){a.smokePlan=null;a.planTimer=0;a.doorWait=null;}
+  }
+}
+function npcTrySmoke(a,states,path){
+  if(!uavEnabled||a.gun.slots.smoke.ammo<=0||a.smokePlan||a.motion||a.grounded===false||survivorAiClock<a.smokeCheckAt)return false;
+  a.smokeCheckAt=survivorAiClock+.75;
+  const here=nav3Here(a),samples=nav3TimedSamples(here,path);
+  const threat=samples.find(p=>p.time<3.5&&Math.hypot(p.x-here.x,p.z-here.z)<5&&states.some(s=>nav3Sight(s.drone,p,p.time)));
+  if(!threat)return false;
+  const wait=SMOKE_FUSE+.30,hold=nav3Exposure(here,[{...here,wait}],states);
+  if(hold.lethal)return false;
+  const baseline=nav3Exposure(here,path,states,wait,hold.timers);
+  if(baseline.exposure<.25)return false;
+  const p=npcActor(a);p.yaw=Math.atan2(threat.x-here.x,-(threat.z-here.z));
+  let best=null;
+  for(const pitch of [-.55,-.85,-1.15]){
+    p.pitch=pitch;const preview=smokePredict(p),cloud={...preview.landing,age:-wait};
+    smokeClouds.push(cloud);let risk;
+    try{risk=nav3Exposure(here,path,states,wait,hold.timers);}finally{smokeClouds.pop();}
+    const gain=baseline.exposure-risk.exposure;
+    if(gain>.30&&(!best||gain>best.gain))best={pitch,gain};
+  }
+  if(!best)return false;
+  a.weaponYaw=p.yaw;a.doorFacing=p.yaw;a.weaponPitch=best.pitch;gunEquip(a.gun,'smoke');
+  a.smokePlan={throwAt:survivorAiClock+.25,readyAt:survivorAiClock+wait,anchor:here,thrown:false};
+  a.sprinting=false;nav3Pending.delete(a.id);return true;
+}
+function npcDoorWaypoint(agent,wp){
+  const d=doorById.get(wp.doorId);
+  if(!d||d.kicked||d.angle>=DOOR_OPEN_ANGLE-.01){
+    agent.doorWait=null;
+    if(d&&!d.kicked&&npcTrySmoke(agent,nav3LiveStates(agent),agent.waypoints.slice(agent.waypointIndex+1)))return false;
+    return true;
+  }
+  if(agent.doorWait?.id!==d.id)agent.doorWait={id:d.id,since:doorKickClock};
+  if(wp.doorMode==='breach'&&!d.broken){
+    if(!npcShotgunDoor(agent,d)){npcFailRoute(agent,wp.linkId);return false;}
+    agent.doorWait.openAt=doorKickClock+.20;agent.sprinting=false;return false;
+  }
+  if(doorKickClock<(agent.doorWait.openAt||0))return false;
+  const center=doorPose(d).center,p=npcAim(agent,{x:center[0],y:center[1],z:center[2]});
+  const action=d.exterior&&!d.broken?'kick':'open';
+  if(action==='kick'||d.targetAngle<DOOR_OPEN_ANGLE-.01){
+    if(!doorAction(p,d,action)){npcFailRoute(agent,wp.linkId);return false;}
+  }
+  agent.sprinting=false;agent.stuckTime=0;
+  if(doorKickClock-agent.doorWait.since>2){npcFailRoute(agent,wp.linkId);return false;}
+  return false;
+}
 function npcStep(agent,dt,speed){
   npcEnsureController();
+  if(agent.smokePlan){
+    const p=agent.smokePlan.anchor;setSurvivorPosition(agent,p.x,p.z);setSurvivorBaseY(agent,p.y);
+    agent.vy=0;agent.sprinting=false;return;
+  }
+  if(doorKickRemaining(agent)>0){
+    const p=doorKickStates.get(agent.id).anchor;
+    setSurvivorPosition(agent,p.x,p.z);setSurvivorBaseY(agent,p.y);
+    agent.vy=0;agent.sprinting=false;agent.stuckTime=0;return;
+  }
   let x=survivorX(agent),y=survivorBaseYOf(agent),z=survivorZ(agent);
   let wp=agent.waypoints[agent.waypointIndex];
+  if(agent.doorWait&&wp?.doorId!==agent.doorWait.id)agent.doorWait=null;
   // A waypoint is reached in 3D, and an active ballistic action cannot be
   // cancelled by follow, emergency, grouping, or a floor classification change.
   while(wp&&!agent.motion&&Math.hypot(wp.x-x,wp.z-z)<(wp.takeoff?.025:agent.waypointIndex===agent.waypoints.length-1?.015:.075)&&Math.abs(wp.y-y)<.22){
+    if(wp.doorId){
+      if(agent.grounded===false)break;
+      if(!npcDoorWaypoint(agent,wp))return;
+    }
     agent.waypointIndex++;wp=agent.waypoints[agent.waypointIndex];
   }
   if(wp?.action&&!agent.motion&&agent.grounded!==false){
     const expected=wp.motion.from;
     if(Math.hypot(expected.x-x,expected.z-z)<.12&&Math.abs(expected.y-y)<.23){
-      const motion=nav3Arc({x,y,z},{x:wp.x,y:wp.y,z:wp.z},wp.action);
+      const motion=nav3ArcWithVelocity({x,y,z},{x:wp.x,y:wp.y,z:wp.z},wp.action,wp.motion.vy);
       if(motion){agent.motion={...motion,t:0,linkId:wp.linkId};agent.vy=motion.vy;agent.grounded=false;}
       else{npcFailRoute(agent,wp.linkId);wp=null;}
     }else{npcFailRoute(agent,wp.linkId);wp=null;}
@@ -13100,6 +13365,7 @@ function npcStep(agent,dt,speed){
   else if(wp){
     const dx=wp.x-x,dz=wp.z-z,d=Math.hypot(dx,dz),v=Math.min(speed,d/dt);
     if(d>1e-7){vx=dx/d*v;vz=dz/d*v;}
+    if(d>.08){agent.weaponYaw=Math.atan2(dx,-dz);agent.weaponPitch=-.10;agent.doorFacing=agent.weaponYaw;}
   }
   const vy=Number.isFinite(agent.vy)?agent.vy:0;
   const vertical=vy*dt-.5*PLAYER_GRAVITY*dt*dt;
@@ -13140,6 +13406,7 @@ function npcFailRoute(agent,linkId){
   if(linkId){if(!agent.failedLinks)agent.failedLinks=new Map();agent.failedLinks.set(linkId,survivorAiClock+7);}
   agent.waypoints=[];agent.waypointIndex=0;agent.runoutCommitted=false;agent.tacticalCommitted=false;
   agent.planTimer=.35;agent.followRepathTimer=0;agent.stuckTime=0;
+  agent.doorWait=null;
 }
 function survivorMoveRoute(agent,dt,speed){
   agent.physicsAccumulator=(agent.physicsAccumulator||0)+Math.min(.1,dt);
@@ -13159,7 +13426,7 @@ function nav3Sight(d,p,t=0){
   if(d.navClock==null)return survivorSpotVisibleToDrone(d,p,t);
   const angle=d.phase+((d.navClock+t)/UAV_ORBIT_PERIOD_SEC)*Math.PI*2;
   const from=d.stationary?uavScannerOrigin(d):{x:d.cx+Math.cos(angle)*d.radius,y:d.y,z:d.cz+Math.sin(angle)*d.radius};
-  return uavTrackPoint(d,{x:p.x,y:p.y+FOLLOWER_HEIGHT*.62,z:p.z},from);
+  return uavTrackPoint(d,{x:p.x,y:p.y+FOLLOWER_HEIGHT*.62,z:p.z},from,t);
 }
 function nav3States(a,snapshot=false){
   const p=nav3Here(a);
@@ -13170,7 +13437,7 @@ function nav3States(a,snapshot=false){
 function nav3Trajectory(from,path){
   const legs=[];let p=from,time=0;
   for(const wp of path){
-    const duration=wp.motion?wp.motion.duration:Math.hypot(wp.x-p.x,wp.z-p.z)/FOLLOWER_SPRINT_SPEED;
+    const duration=wp.wait??(wp.motion?wp.motion.duration:Math.hypot(wp.x-p.x,wp.z-p.z)/FOLLOWER_SPRINT_SPEED);
     legs.push({from:p,to:wp,start:time,duration});time+=duration;p=wp;
   }
   return {from,legs,duration:time,end:p};
@@ -13300,7 +13567,7 @@ function nav3AcceptSearch(work,plan){
   if(Math.hypot(here.x-work.from.x,here.y-work.from.y,here.z-work.from.z)>.12){
     let join=-1;
     for(let i=0;i<Math.min(8,plan.path.length);i++){
-      if(plan.path[i].action)break;
+      if(plan.path[i].action||plan.path[i].doorId)break;
       if(nav3Walk(here,plan.path[i]))join=i;
       if(plan.path[i].takeoff)break;
     }
@@ -13341,15 +13608,21 @@ function nav3AdvanceSearch(){
 function nav3WaveRisk(entries,cache=new Map()){
   const rows=entries.map(e=>{
     let memo=cache.get(e.agent);
-    if(!memo||memo.plan!==e.plan){memo={plan:e.plan,route:nav3Trajectory(nav3Here(e.agent),e.plan.path),seen:[]};cache.set(e.agent,memo);}
+    if(!memo||memo.plan!==e.plan){memo={plan:e.plan,route:nav3Trajectory(nav3Here(e.agent),e.plan.path),seen:[],doorKeys:[]};cache.set(e.agent,memo);}
     return {a:e.agent,...memo,timers:uavDrones.map(d=>d.timers.get(e.agent.id)??uavTimeMax(d))};
   }).sort((a,b)=>a.a.id-b.a.id);
   const targets=uavDrones.map(d=>rows.findIndex(r=>r.a.id===d.targetId));
   const duration=Math.max(...rows.map(r=>r.route.duration))+.8;
   let min=Infinity;
+  const openedDoors=new Map();
+  const doorEvents=rows.flatMap(r=>r.route.legs.filter(l=>l.to.doorId).map(l=>({time:l.start,id:l.to.doorId,mode:l.to.doorMode}))).sort((a,b)=>a.time-b.time);
+  let nextDoor=0,doorKey='';
   for(let k=0;k<Math.ceil(duration/.05);k++){
     const step=.05,t=(k+1)*step;
-    for(const r of rows)if(!r.seen[k]){const p=nav3At(r.route,t);r.seen[k]=uavDrones.map(d=>nav3Sight(d,p,t));}
+    while(nextDoor<doorEvents.length&&doorEvents[nextDoor].time<=t){const e=doorEvents[nextDoor++];openedDoors.set(e.id,e.mode);doorKey=[...openedDoors].sort().join('|');}
+    nav3WithOpenDoors(openedDoors,()=>{
+      for(const r of rows)if(!r.seen[k]||r.doorKeys[k]!==doorKey){const p=nav3At(r.route,t);r.seen[k]=uavDrones.map(d=>nav3Sight(d,p,t));r.doorKeys[k]=doorKey;}
+    });
     for(let d=0;d<uavDrones.length;d++){
       const seen=rows.map(r=>r.seen[k][d]);
       if(targets[d]<0||!seen[targets[d]])targets[d]=seen.findIndex(Boolean);
@@ -13364,7 +13637,7 @@ function nav3WaveRisk(entries,cache=new Map()){
 function nav3ShareRoute(a,plan){
   const here=nav3Here(a);let join=-1;
   for(let i=0;i<Math.min(7,plan.path.length);i++){
-    const p=plan.path[i];if(p.action)break;
+    const p=plan.path[i];if(p.action||p.doorId)break;
     if(Math.hypot(p.x-here.x,p.z-here.z)<9&&Math.abs(p.y-here.y)<1.4&&nav3Walk(here,p))join=i;
     if(p.takeoff)break;
   }
@@ -13418,9 +13691,13 @@ function nav3Commit(agent,plan,type){
   agent.lastPlanAt=survivorAiClock;agent.departedAt=survivorAiClock;
 }
 function nav3AgentTick(agent,dt){
+  npcGearTick(agent);
+  if(agent.smokePlan)return;
   agent.planTimer=(agent.planTimer||0)-dt;agent.followRepathTimer=(agent.followRepathTimer||0)-dt;
   agent.routeRiskCheck=(agent.routeRiskCheck||0)-dt;
+  if(doorKickRemaining(agent)>0||agent.doorWait&&doorKickClock-agent.doorWait.since<2){agent.sprinting=false;return;}
   const states=nav3LiveStates(agent),here=nav3Here(agent);
+  if(agent.waypointIndex<agent.waypoints.length&&npcTrySmoke(agent,states,agent.waypoints.slice(agent.waypointIndex)))return;
   nav3Reflex(agent,states);
   const finished=agent.waypointIndex>=agent.waypoints.length;
   if(agent.tacticalCommitted&&finished&&!agent.motion){
@@ -14109,7 +14386,7 @@ function updateGeneratorHud(){
   tipEl.textContent=usingElevatedTurretTileset()
     ? 'ELEVATED TURRET TILESET · irregular industrial rooms · lava parkour · 4 stationary corner turrets · targeting audio only'
     : 'WASD move · Shift sprint · C crouch · Space jump · M map';
-  tipEl.textContent+=' · F door · V kick (1.5 tiles) · 3 shotgun · R reload · B spectate';
+  tipEl.textContent+=' · F door · V kick (1.5 tiles) · 3 shotgun · 4 smoke · R reload · B spectate';
 }
 function* buildingSeedStages(forcedSeed,allowFollower){
   routeMapChanging(Number(forcedSeed)>>>0);
@@ -14162,7 +14439,8 @@ function* buildingSeedStages(forcedSeed,allowFollower){
   yield 'Preparing UAVs…';
   resetUavSystemForMap();
   yield 'Finishing map…';
-  nav3BuildPortals();updateGeneratorHud();resetTacticalMapCamera();rebuildMapOverlayMesh();rebuildRoomMapLabels();updateMapHud();updateRoomMapLabels();
+  // Door tactics and navigation build in the shared AI frame budget on demand.
+  updateGeneratorHud();resetTacticalMapCamera();rebuildMapOverlayMesh();rebuildRoomMapLabels();updateMapHud();updateRoomMapLabels();
 }
 function loadBuildingSeed(forcedSeed,allowFollower){
   // Network snapshots still build atomically before applying their world state.
@@ -14366,6 +14644,7 @@ function renderWorldWithCamera(mapCamera,mapVisual){
   renderExtraSurvivors();
   routeRender();
   renderGhostHeldGun();
+  renderSmoke(mapCamera);
 
   if(mapCamera&&mapOverlayVertexCount){
     gl.useProgram(prog);
@@ -14408,6 +14687,7 @@ function frame(now){
   doorTick(dt);
   updatePlayerPhysics(dt);
   routeTick(dt);
+  if(multiplayer)smokeTick(dt);
   doorKickTick(dt);
   updateLavaHazard();
   if(!playerDead&&!singlePlayerObserver&&playerFeetY<outsideGroundY()-12)beginPlayerDeath("FALL");
@@ -14825,7 +15105,8 @@ const BULLETS={pistol9:{label:'9mm',penetration:65},rifle762:{label:'7.62',penet
 const WEAPONS={
  ak:{name:'AK',bullet:'rifle762',damage:34,mag:30,reload:2.25,interval:.10,range:140,automatic:true,muzzle:-.70,visualSpeed:900},
  glock:{name:'GLOCK',bullet:'pistol9',damage:25,mag:17,reload:1.65,interval:.18,range:90,automatic:false,muzzle:-.19,visualSpeed:520},
- shotgun:{name:'SHOTGUN',bullet:'buckshot',damage:15,mag:6,reload:2.8,interval:.8,range:42,automatic:false,muzzle:-.79,visualSpeed:420}
+ shotgun:{name:'SHOTGUN',bullet:'buckshot',damage:15,mag:6,reload:2.8,interval:.8,range:42,automatic:false,muzzle:-.79,visualSpeed:420},
+ smoke:{name:'SMOKE GRENADE',throwable:true,mag:1,reload:0,interval:.6,automatic:false,muzzle:-.12}
 };
 const WALL_ABSORPTION=40,DOOR_ABSORPTION=8;
 let gunWallContext=null;
@@ -14841,6 +15122,7 @@ function gunTrace(o,d,shooter,weapon='glock'){
  for(const p of netPlayers.values())if(p.id!==shooter&&p.alive!==false){const t=gunCapsuleHit(o,d,p);if(t<victimDistance){victim=p;victimDistance=t;}}
  // NPCs share the same nearest-hit and penetration trace as players.
  for(const a of allSurvivorAgents()){
+  if(a.id===shooter)continue;
   const p={npc:a,x:survivorX(a),z:survivorZ(a),feetY:survivorBaseYOf(a)};
   const t=gunCapsuleHit(o,d,p,FOLLOWER_HEIGHT,FOLLOWER_RADIUS);
   if(t<victimDistance){victim=p;victimDistance=t;}
@@ -14928,34 +15210,36 @@ const gunBuffer=gl.createBuffer(),gunTraces=[],gunFlashes=new Map(),gunSeenEvent
 let gunSeq=0,gunReloadVisual=0,gunHitUntil=0,gunTrigger=false;
 const gunNow=()=>performance.now()/1000;
 function gunCreateState(hp=100){
- const s={hp,equipped:'ak',slots:Object.fromEntries(Object.entries(WEAPONS).map(([id,w])=>[id,{ammo:w.mag,reloadEnd:0}])),nextShot:0,lastSeq:0,serverAck:-1,pending:[]};
+ const s={hp,equipped:'ak',lastGun:'ak',slots:Object.fromEntries(Object.entries(WEAPONS).map(([id,w])=>[id,{ammo:w.mag,reloadEnd:0}])),nextShot:0,lastSeq:0,serverAck:-1,pending:[]};
  Object.defineProperties(s,{ammo:{get(){return this.slots[this.equipped].ammo;},set(v){this.slots[this.equipped].ammo=v;}},reloadEnd:{get(){return this.slots[this.equipped].reloadEnd;},set(v){this.slots[this.equipped].reloadEnd=v;}}});return s;
 }
 let gunLocal=gunCreateState();
 const gunHud=document.createElement('div');gunHud.id='gunHud';
-gunHud.innerHTML='<div id="gunHealthText">100 / 100 HP</div><div id="gunHealthTrack"><div id="gunHealthFill"></div></div><div id="gunWeapon" style="font-size:13px;color:#78e7c5"></div><div id="gunAmmo">30 / 30</div><div class="gunHint">1 AK · 2 GLOCK · 3 SHOTGUN · R RELOAD</div>';
+gunHud.innerHTML='<div id="gunHealthText">100 / 100 HP</div><div id="gunHealthTrack"><div id="gunHealthFill"></div></div><div id="gunWeapon" style="font-size:13px;color:#78e7c5"></div><div id="gunAmmo">30 / 30</div><div class="gunHint">1 AK · 2 GLOCK · 3 SHOTGUN<br>4 SMOKE · LMB THROW · R RELOAD</div>';
 document.body.appendChild(gunHud);
 const gunCross=document.createElement('div');gunCross.id='gunCross';gunCross.textContent='+';document.body.appendChild(gunCross);
 function gunState(p){if(!p.gun?.slots)p.gun=gunCreateState(p.alive===false?0:(p.gun?.hp??100));return p.gun;}
-function gunFinishReload(s){for(const [id,slot] of Object.entries(s.slots))if(slot.reloadEnd&&gunNow()>=slot.reloadEnd){slot.ammo=WEAPONS[id].mag;slot.reloadEnd=0;}}
+function gunFinishReload(s){for(const [id,slot] of Object.entries(s.slots))if(!WEAPONS[id].throwable&&slot.reloadEnd&&gunNow()>=slot.reloadEnd){slot.ammo=WEAPONS[id].mag;slot.reloadEnd=0;}}
+function gunEquip(s,weapon){s.equipped=weapon;if(!WEAPONS[weapon].throwable)s.lastGun=weapon;}
+function gunReturnFromSmoke(s){gunEquip(s,WEAPONS[s.lastGun]&&!WEAPONS[s.lastGun].throwable?s.lastGun:'ak');}
 function gunSelf(){return multiplayer&&netPlayers.get(localPeerId)?gunState(netPlayers.get(localPeerId)):gunLocal;}
 function gunReset(){gunLocal=gunCreateState();gunSeenEvents.clear();gunTraces.length=0;gunFlashes.clear();gunDecals.length=0;gunImpactBursts.length=0;gunDecalsDirty=true;gunSeq=0;gunTrigger=false;gunReloadVisual=0;}
-function gunPack(p){const s=gunState(p);gunFinishReload(s);return {hp:s.hp,equipped:s.equipped,lastSeq:s.lastSeq,pitch:p.pitch||0,slots:Object.fromEntries(Object.entries(s.slots).map(([id,v])=>[id,{ammo:v.ammo,reloadLeft:Math.max(0,v.reloadEnd-gunNow())}]))};}
+function gunPack(p){const s=gunState(p);gunFinishReload(s);return {hp:s.hp,equipped:s.equipped,lastGun:s.lastGun,lastSeq:s.lastSeq,pitch:p.pitch||0,slots:Object.fromEntries(Object.entries(s.slots).map(([id,v])=>[id,{ammo:v.ammo,reloadLeft:Math.max(0,v.reloadEnd-gunNow())}]))};}
 function gunRead(p,d){
  if(!d?.slots||!WEAPONS[d.equipped])return;const s=gunState(p);s.hp=netClamp(Number(d.hp)||0,0,100);
- if((d.lastSeq||0)<s.serverAck)return;s.serverAck=d.lastSeq||0;s.lastSeq=s.serverAck;s.equipped=d.equipped;
+ if((d.lastSeq||0)<s.serverAck)return;s.serverAck=d.lastSeq||0;s.lastSeq=s.serverAck;s.lastGun=WEAPONS[d.lastGun]&&!WEAPONS[d.lastGun].throwable?d.lastGun:s.lastGun;gunEquip(s,d.equipped);
  for(const id of Object.keys(WEAPONS)){const v=d.slots[id];if(v){s.slots[id].ammo=netClamp(Number(v.ammo)||0,0,WEAPONS[id].mag);s.slots[id].reloadEnd=v.reloadLeft>0?gunNow()+Math.min(WEAPONS[id].reload,v.reloadLeft):0;}}
  s.pending=s.pending.filter(a=>a.seq>s.serverAck);
  for(const a of s.pending){
-  if(a.type==='gunFire')s.slots[a.weapon].ammo=Math.max(0,s.slots[a.weapon].ammo-1);
-  if(a.type==='gunSwitch'){s.slots[s.equipped].reloadEnd=0;s.equipped=a.weapon;}
+  if(a.type==='gunFire'){s.slots[a.weapon].ammo=Math.max(0,s.slots[a.weapon].ammo-1);if(a.weapon==='smoke')gunReturnFromSmoke(s);}
+  if(a.type==='gunSwitch'){s.slots[s.equipped].reloadEnd=0;gunEquip(s,a.weapon);}
   if(a.type==='gunReload')s.slots[a.weapon].reloadEnd=a.reloadEnd;
  }
  p.pitch=netClamp(Number(d.pitch)||0,-1.5,1.5);
 }
 function gunPredict(msg){const s=gunSelf();s.pending.push({...msg,reloadEnd:gunNow()+WEAPONS[msg.weapon].reload});if(s.pending.length>80)s.pending.shift();
- if(msg.type==='gunFire')s.ammo=Math.max(0,s.ammo-1);
- else if(msg.type==='gunSwitch'){s.reloadEnd=0;s.equipped=msg.weapon;}
+ if(msg.type==='gunFire'){s.ammo=Math.max(0,s.ammo-1);if(msg.weapon==='smoke')gunReturnFromSmoke(s);}
+ else if(msg.type==='gunSwitch'){s.reloadEnd=0;gunEquip(s,msg.weapon);}
  else if(msg.type==='gunReload')s.reloadEnd=gunNow()+WEAPONS[msg.weapon].reload;
 }
 function gunEye(p){const c=Math.max(0,Math.min(1,p.crouch||0));return {x:p.x,y:networkPlayerFeetY(p)+PLAYER_EYE+(PLAYER_CROUCH_EYE-PLAYER_EYE)*c,z:p.z};}
@@ -15012,6 +15296,7 @@ function gunDamageHit(p,hit){
 }
 function gunShootWorld(p,id,seq,spreadSeed=seq){
  const s=gunState(p),w=WEAPONS[s.equipped];
+ if(w.throwable)return smokeThrowWorld(p,id,seq);
  const eye=gunEye(p),direction=gunDirection(p.yaw,p.pitch+doorKickLean(p)),aim=gunTrace(eye,direction,id,s.equipped);
  const muzzle=gunPose(p,false).point(0,.025,w.muzzle);let origin={x:muzzle[0],y:muzzle[1],z:muzzle[2]};
  const mount={x:origin.x-eye.x,y:origin.y-eye.y,z:origin.z-eye.z};
@@ -15042,10 +15327,12 @@ function gunAuthority(id,msg){
  if(!Number.isSafeInteger(msg.seq)||msg.seq<=s.lastSeq)return false;s.lastSeq=msg.seq;
  const ack=()=>{if(multiplayer)broadcastHost({type:'gunStateUpdate',generation:mapGeneration,shooter:id,gun:gunPack(p)});};
  if(msg.type==='gunSwitch'){
-  s.reloadEnd=0;s.equipped=msg.weapon;s.nextShot=Math.max(s.nextShot,gunNow()+.20);routeRecordAction(msg,p);ack();return true;
+  if(WEAPONS[msg.weapon].throwable&&s.slots[msg.weapon].ammo<=0){ack();return false;}
+  s.reloadEnd=0;gunEquip(s,msg.weapon);s.nextShot=Math.max(s.nextShot,gunNow()+.20);routeRecordAction(msg,p);ack();return true;
  }
  if(msg.weapon!==s.equipped){ack();return false;}const w=WEAPONS[s.equipped];
  if(msg.type==='gunReload'){
+  if(w.throwable){ack();return false;}
   if(!s.reloadEnd&&s.ammo<w.mag){s.reloadEnd=gunNow()+w.reload;routeRecordAction(msg,p);}ack();return true;
  }
  if(!Number.isFinite(msg.yaw)||!Number.isFinite(msg.pitch)||Math.abs(msg.pitch)>1.5||s.reloadEnd||s.ammo<=0||gunNow()+.004<s.nextShot){ack();return false;}
@@ -15058,17 +15345,19 @@ function gunFire(){
  s.localNext=gunNow()+w.interval;
  const msg={type:'gunFire',generation:mapGeneration,seq:++gunSeq,weapon:s.equipped,yaw,pitch,motion:multiplayer&&!isHost?netMakeState():undefined};
  if(multiplayer&&!isHost){gunPredict(msg);sendConn(hostConn,msg);}else if(!gunAuthority(localPeerId,msg))return;
- gunFlashes.set(localPeerId,gunNow());gunSound(false,msg.weapon);
+ if(msg.weapon==='smoke')gunTrigger=false;
+ else{gunFlashes.set(localPeerId,gunNow());gunSound(false,msg.weapon);}
 }
 function gunSwitch(weapon){
  if(!WEAPONS[weapon]||!gameStarted||playerDead||singlePlayerObserver||spectatorActive||isMenuOrTextInputActive())return;
  const s=gunSelf();if(s.equipped===weapon)return;
+ if(WEAPONS[weapon].throwable&&s.slots[weapon].ammo<=0){doorNotice('No smoke grenades left.');return;}
  const msg={type:'gunSwitch',generation:mapGeneration,seq:++gunSeq,weapon};s.localNext=gunNow()+.20;
  if(multiplayer&&!isHost){gunPredict(msg);sendConn(hostConn,msg);}else gunAuthority(localPeerId,msg);
 }
 function gunReload(){
  if(!gameStarted||playerDead||singlePlayerObserver||mapOpen||spectatorActive||isMenuOrTextInputActive())return;
- const s=gunSelf(),w=WEAPONS[s.equipped];if(s.reloadEnd||s.ammo===w.mag)return;
+ const s=gunSelf(),w=WEAPONS[s.equipped];if(w.throwable||s.reloadEnd||s.ammo===w.mag)return;
  const msg={type:'gunReload',generation:mapGeneration,seq:++gunSeq,weapon:s.equipped};
  if(multiplayer&&!isHost){gunPredict(msg);sendConn(hostConn,msg);}else gunAuthority(localPeerId,msg);gunReloadVisual=gunNow();
 }
@@ -15078,7 +15367,7 @@ function gunUpdate(){
  if(gunTrigger&&w.automatic)gunFire();
  const show=gameStarted&&!singlePlayerObserver&&!isMenuOrTextInputActive();gunHud.style.display=show?'block':'none';gunCross.style.display=show&&!mapOpen&&!playerDead&&!spectatorActive?'block':'none';
  document.getElementById('gunHealthText').textContent=Math.ceil(s.hp)+' / 100 HP';document.getElementById('gunHealthFill').style.width=s.hp+'%';document.getElementById('gunHealthFill').style.background=s.hp<=25?'#ff4e43':'#51e0ad';
- document.getElementById('gunWeapon').textContent=w.name+' · '+BULLETS[w.bullet].label+' · PEN '+BULLETS[w.bullet].penetration;
+ document.getElementById('gunWeapon').textContent=w.throwable?'SMOKE GRENADE · LMB THROW · YELLOW LINE PREVIEW':w.name+' · '+BULLETS[w.bullet].label+' · PEN '+BULLETS[w.bullet].penetration;
  document.getElementById('gunAmmo').textContent=s.reloadEnd?'RELOADING…':s.ammo+' / '+w.mag;
  gunCross.style.color=gunNow()<gunHitUntil?'#ff7155':'#fff';
 }
@@ -15145,7 +15434,7 @@ function gunAKModel(out,p){
  box(-.016,-.045-drop*.25,-.30,.10,.065,.11,[.13,.14,.15]);box(-.055,-.096-drop*.15,-.21,.074,.082,.16,[.42,.27,.18]);
  if(pose.shot>.4){box(0,.025,-.775,.11*pose.shot,.09*pose.shot,.14,[1,.60,.12]);box(0,.025,-.81,.025,.025,.19,[1,.96,.63]);}
 }
-function gunModel(out,p,localFirstPerson=false){const start=out.length;if(gunState(p).equipped==='ak')gunAKModel(out,p);else if(gunState(p).equipped==='shotgun')gunShotgunModel(out,p);else gunGlockModel(out,p);if(localFirstPerson&&uavLocalTargeted())uavTintHeldGun(out,start);}
+function gunModel(out,p,localFirstPerson=false){const start=out.length;if(gunState(p).equipped==='smoke')gunSmokeModel(out,p);else if(gunState(p).equipped==='ak')gunAKModel(out,p);else if(gunState(p).equipped==='shotgun')gunShotgunModel(out,p);else gunGlockModel(out,p);if(localFirstPerson&&uavLocalTargeted())uavTintHeldGun(out,start);}
 // Separate translucent pass keeps the live ghost's item from fading replay guns,
 // bullet tracers or map effects. Draw after all opaque actors and glass.
 const ghostGunBuffer=gl.createBuffer(),ghostGunProg=gl.createProgram();
@@ -15181,6 +15470,7 @@ function renderGuns(mapCamera){
   const local=p.id===localPeerId;if(local&&!mapCamera&&(playerDead||spectatorActive))continue;
   gunModel(out,local?{...p,x:px,z:pz,feetY:playerFeetY,yaw,pitch,crouch:playerCrouchAmount}:netRenderPlayer(p),local&&!mapCamera);
  }}else if(!playerDead&&!singlePlayerObserver&&!spectatorActive&&!routeGhost)gunModel(out,{id:localPeerId,x:px,z:pz,feetY:playerFeetY,yaw,pitch,crouch:playerCrouchAmount,gun:gunLocal},!mapCamera);
+ if(!multiplayer)for(const a of allSurvivorAgents())gunModel(out,npcActor(a));
  const now=gunNow();
  for(let i=gunTraces.length-1;i>=0;i--){const e=gunTraces[i],age=now-e.at;if(age>Math.max(.22,Math.hypot(e.end.x-e.from.x,e.end.y-e.from.y,e.end.z-e.from.z)/(WEAPONS[e.weapon]?.visualSpeed||520)+.06)){gunTraces.splice(i,1);continue;}
   const a=e.from,b=e.end,dx=b.x-a.x,dy=b.y-a.y,dz=b.z-a.z,len=Math.hypot(dx,dy,dz)||1;
@@ -15199,9 +15489,9 @@ canvas.addEventListener('mousedown',e=>{if(e.button===0){gunTrigger=true;gunFire
 addEventListener('mouseup',e=>{if(e.button===0)gunTrigger=false;});
 addEventListener('blur',()=>gunTrigger=false);
 document.addEventListener('pointerlockchange',()=>{if(document.pointerLockElement!==canvas)gunTrigger=false;});
-addEventListener('keydown',e=>{if(e.repeat)return;if(e.code==='KeyR')gunReload();if(e.code==='Digit1')gunSwitch('ak');if(e.code==='Digit2')gunSwitch('glock');if(e.code==='Digit3')gunSwitch('shotgun');if(e.code==='KeyF')doorUse(false);if(e.code==='KeyV')doorUse(true);});
+addEventListener('keydown',e=>{if(e.repeat)return;if(e.code==='KeyR')gunReload();if(e.code==='Digit1')gunSwitch('ak');if(e.code==='Digit2')gunSwitch('glock');if(e.code==='Digit3')gunSwitch('shotgun');if(e.code==='Digit4')gunSwitch('smoke');if(e.code==='KeyF')doorUse(false);if(e.code==='KeyV')doorUse(true);});
 
-const NET_PROTOCOL='gridlock-doors-27';
+const NET_PROTOCOL='gridlock-smoke-size-30';
 function netVersionError(){stopClientHandshakeRetry();clientHandshakeComplete=false;try{if(hostConn)hostConn.close();}catch(_){}showMainMenu();showMenuStatus('Game versions differ. Everyone must open the same updated HTML file.');}
 let netMoveSeq=0,netWorldSeq=0,netLastWorldSeq=-1,netCorrectionSeq=-1,netLocalEpoch=0,netMotionTimer=0;
 const netPoseHistory=new Map(),netLocalSamples=[];
@@ -15584,6 +15874,7 @@ addEventListener('keydown',e=>{
 // and are never submitted to the autonomous survivor planner.
 const routeRecordings=new Map(),routePlayers=new Map();
 let routeSeed=null,routeRecording=null,routeGhost=false,routeChatOpen=false,routeNextEntity=1000000;
+let routeSameStart=true,routeCustomStart=null;
 const ROUTE_STRIDE=8,routeBuffer=gl.createBuffer();
 const routeStyle=document.createElement('style');
 routeStyle.textContent=`
@@ -15628,7 +15919,31 @@ function routeSetChat(open,restore=true){
  }
 }
 function routeKey(id){return /^\d+$/.test(id||'')?id.replace(/^0+(?=\d)/,''):null;}
-function routeSnapshot(t){return [t,px,playerFeetY,pz,yaw,pitch,playerCrouchAmount,gunSelf().equipped==='shotgun'?2:gunSelf().equipped==='glock'?1:0];}
+function routeSnapshot(t){return [t,px,playerFeetY,pz,yaw,pitch,playerCrouchAmount,gunSelf().equipped==='smoke'?3:gunSelf().equipped==='shotgun'?2:gunSelf().equipped==='glock'?1:0];}
+function routeSharedStart(){
+ if(routeCustomStart?.seed===seed)return routeCustomStart.pose;
+ const first=routeRecordings.get('1');
+ return first?.seed===seed&&first.frames.length>=ROUTE_STRIDE?first.frames.slice(0,7):null;
+}
+function routeRestoreStart(pose){
+ px=pose[1];pz=pose[3];yaw=pose[4];pitch=pose[5];playerCrouchAmount=pose[6];
+ doorKickStates.delete(localPeerId);clearPhysicalGameplayKeys();clearAllGameKeys();gunTrigger=false;
+ resetPlayerPhysics(pose[2]);
+}
+function routeSameStartCommand(value){
+ routeSameStart=value==='on';
+ const source=routeCustomStart?.seed===seed?'your /startpos':routeRecordings.has('1')?'recording #1\'s start':'recording #1\'s start once it is saved, or a /startpos you set';
+ routeSay(routeSameStart?'Same start ON. New recordings use '+source+'.':'Same start OFF. New recordings start where you are standing and looking.');
+ return true;
+}
+function routeStartPos(clear=false){
+ if(clear){routeCustomStart=null;routeSay('Custom start cleared. Same start '+(routeSameStart?'ON: new recordings use recording #1\'s start when available.':'OFF.'));return true;}
+ if(playerDead||routeGhost||singlePlayerObserver||spectatorActive){routeSay('Respawn with T before setting /startpos.');return false;}
+ if(doorKickRemaining()>0){routeSay('Finish the kick before setting /startpos.');return false;}
+ routeCustomStart={seed,pose:routeSnapshot(0).slice(0,7)};
+ routeSay('Shared start saved for this map: position, height, facing, look angle and crouch stance. '+(routeSameStart?'New recordings will start here.':'Use /samestart on to use it.')+' /startpos clear returns to recording #1.');
+ return true;
+}
 function routeSample(force=false){
  const r=routeRecording;if(!r)return;
  const n=r.frames.length;
@@ -15637,11 +15952,14 @@ function routeSample(force=false){
  if(n&&Math.abs(r.frames[n-ROUTE_STRIDE]-r.time)<1e-8)r.frames.splice(n-ROUTE_STRIDE,ROUTE_STRIDE,...sample);
  else r.frames.push(...sample);
 }
-function routeStart(id,name=''){
+function routeStart(id,name='',originalStart=null){
  if(routeRecording){routeSay('Finish the current route with /endrecording first.');return false;}
  if(playerDead||singlePlayerObserver||spectatorActive){routeSay('Press T to respawn before starting a recording.');return false;}
  routeSeed=seed;routeGhost=false;
  routeRestoreWindows();
+ const start=originalStart||(routeSameStart?routeSharedStart():null);
+ if(start)routeRestoreStart(start);
+ gunSelf().slots.smoke.ammo=1;
  routeResetOrbit();
  routeRecording={id,name:name?safeName(name):'Recording #'+id,seed,time:0,frames:[],actions:[],initialGun:gunPack({gun:gunSelf()}),synced:routeSyncEnabled,graceAtStart:routeGraceAtStart,ghostAt:null,start:routeSnapshot(0)};
  routeShowOthers();
@@ -15666,7 +15984,7 @@ function routeEnd(){
  routeRecordings.set(r.id,saved);routeRecording=null;routeGhost=false;
  // Return the live player to the route's starting pose without resetting the map,
  // replay squad, glass, decals, UAV orbit or other survivors.
- const s=r.start;px=s[1];pz=s[3];yaw=s[4];pitch=s[5];playerCrouchAmount=s[6];resetPlayerPhysics(s[2]);gunSelf().hp=100;
+ routeRestoreStart(r.start);gunSelf().hp=100;
  for(const d of uavDrones){d.timers.set(1,uavTimeMax(d));if(d.targetId===1){d.targetId=null;d.glare=0;}}
  routeSay('Saved #'+r.id+' · '+r.time.toFixed(2)+'s. Returned to start. Use /playrecord '+r.id+' or /playall.');return true;
 }
@@ -15696,7 +16014,7 @@ function routeApplyPose(p,t){
  const i=p.cursor,j=Math.min(last,i+ROUTE_STRIDE),span=f[j]-f[i],u=span>0?Math.max(0,Math.min(1,(t-f[i])/span)):0;
  const lerp=k=>f[i+k]+(f[j+k]-f[i+k])*u;
  p.x=lerp(1);p.feetY=lerp(2);p.z=lerp(3);p.yaw=lerp(4);p.pitch=lerp(5);p.crouch=lerp(6);
- p.gun.equipped=f[i+7]===2?'shotgun':f[i+7]===1?'glock':'ak';
+ gunEquip(p.gun,f[i+7]===3?'smoke':f[i+7]===2?'shotgun':f[i+7]===1?'glock':'ak');
 }
 function routeSpawn(record){
  routeRemovePlayer(record.id);
@@ -15732,6 +16050,7 @@ function routeMapChanging(nextSeed){
  const changed=routeSeed!==null&&routeSeed!==nextSeed;
  routeRecording=null;routeGhost=false;routeStopPlayers();routeSetChat(false,false);
  if(changed){routeRecordings.clear();routeSay('New map seed: prior recordings cleared.');}
+ if(routeCustomStart&&routeCustomStart.seed!==nextSeed)routeCustomStart=null;
  routeSeed=nextSeed;
 }
 function routeRender(){
@@ -15762,13 +16081,13 @@ function routeHud(){
  routeStatus.textContent=routeRecording
   ?(routeGhost?'GHOST · ':'RECORDING · ')+routeRecording.name+' · '+routeRecording.time.toFixed(1)+'s · /endrecording'
   :(singlePlayerObserver?'SPECTATOR · T respawn · ':'/ command chat · ')+routeRecordings.size+' saved · '+alive+'/'+routePlayers.size+' replays alive';
- routeStatus.textContent+=' · GRACE '+(routeGraceAtStart?'ON':'OFF')+' · SYNC '+(routeSyncEnabled?'ON':'OFF')+' · SHOW '+(routeShowRecordings?'ON':'OFF')+' · LAST '+(routeLastDuringPlay?'ON':'OFF')+' · '+(uavFunMode?'FUNMODE':'REALISM')+' · UAV '+(uavEnabled?'ON':'OFF');
+ routeStatus.textContent+=' · GRACE '+(routeGraceAtStart?'ON':'OFF')+' · SYNC '+(routeSyncEnabled?'ON':'OFF')+' · SAME START '+(routeSameStart?'ON':'OFF')+' · SHOW '+(routeShowRecordings?'ON':'OFF')+' · LAST '+(routeLastDuringPlay?'ON':'OFF')+' · '+(uavFunMode?'FUNMODE':'REALISM')+' · UAV '+(uavEnabled?'ON':'OFF');
  if(routeGhost){document.getElementById('gunHealthText').textContent='GHOST · Recording continues';document.getElementById('gunHealthFill').style.background='#56dfff';}
 }
 function routeCancelTake(){
  const r=routeRecording;if(!r)return;
  routeRecording=null;routeGhost=false;
- const s=r.start;px=s[1];pz=s[3];yaw=s[4];pitch=s[5];playerCrouchAmount=s[6];resetPlayerPhysics(s[2]);gunSelf().hp=100;
+ routeRestoreStart(r.start);gunSelf().hp=100;
  for(const d of uavDrones){d.timers.set(1,uavTimeMax(d));if(d.targetId===1){d.targetId=null;d.glare=0;}}
 }
 function routeDeleteRecording(id){
@@ -15784,6 +16103,15 @@ function routeCommand(text){
  const grace=String(text).trim().toLowerCase().match(/^\/?(?:grace\s+at\s+start\??|graceatstart\??)(?:\s+(\S+))?$/);
  if(grace)return routeGraceCommand(grace[1]);
  const parts=String(text).trim().split(/\s+/),cmd='/'+parts[0].replace(/^\//,'').toLowerCase(),id=routeKey(parts[1]);
+ if(cmd==='/samestart'){
+  if(parts.length!==2||!['on','off'].includes(parts[1].toLowerCase())){routeSay('Use /samestart on or /samestart off.');return false;}
+  return routeSameStartCommand(parts[1].toLowerCase());
+ }
+ if(cmd==='/startpos'){
+  if(parts.length===1)return routeStartPos();
+  if(parts.length===2&&parts[1].toLowerCase()==='clear')return routeStartPos(true);
+  routeSay('Use /startpos to save your current start, or /startpos clear to use recording #1.');return false;
+ }
  if(cmd==='/grace'){
   if(parts.length!==2||!['on','off'].includes(parts[1].toLowerCase())){routeSay('Use /grace on or /grace off.');return false;}
   return routeGraceCommand(parts[1].toLowerCase());
@@ -15829,7 +16157,7 @@ function routeCommand(text){
   routeSay(routeRecordings.size?[...routeRecordings.values()].map(r=>'#'+r.id+' · '+(r.name||'Recording #'+r.id)+' · '+r.duration.toFixed(2)+'s · '+(r.actions||[]).filter(a=>a.type==='gunFire').length+' shots · '+(r.synced?'SYNC':'UNSYNC')+(r.ghostAt!==null?' · ghost at '+r.ghostAt.toFixed(2)+'s':'')).join('\n'):'No saved routes for this map.');return false;
  }
  if(cmd==='/help'||cmd==='/'){
-  routeSay('/rec # [name] / /record # [name] — start a named route\n/retry — restart the current take from its original start\n/end / /endrecording — save and return to start\n/playrecord # — start/restart one replay\n/playall — restart all routes together\n/stopplay — stop replays and clear their bodies\n/recordings — list routes\n/deleterec # — delete one recording\n/deleteall — delete all recordings\n/removenpcs — remove default AI survivors\n/grace on / /grace off — enable or disable 3-second UAV grace (ON by default)\n/sync — toggle shared UAV start timing (ON by default)\n/recordingshow — toggle other replays during recording\n/spectate — despawn and follow a target (T to respawn)\n/freecam — despawn and fly freely (also press 0)\n/freecammap — toggle flat map style in freecam\n/lastduringplay — toggle live player last during playback\n/funmode — toggle solid cover for all UAV sight\n/realism — return to realism sight rules\n/novan — remove the van and ARGUS for this map\n/uavlist — list UAV names and kill times\n/ttk UAV_1 2.5 — set one UAV kill time in seconds\n/ttkall 2.5 — set all UAV kill times\n/uavoff / /uavon — disable / enable UAV targeting\nF opens/closes doors; V kicks from about 1.5 small tiles; 3 equips the shotgun. Kicking requires standing and freezes movement, jumping and crouching for one second. Exterior doors start locked. Green doors: shotgun the handle or kick from either side. Red doors: kick or shotgun the handle from INSIDE only. Bullets penetrate green and interior leaves; red exterior leaves are bulletproof. B spectates. All doors swing in one fixed direction.\nReplays repeat movement, guns and door actions against the current scene. Fresh recordings, retries and playback from the start restore windows and doors; replay actions change them again. Same-seed resets keep saved routes; a different seed clears them.');return false;
+  routeSay('/rec # [name] / /record # [name] — start a named route\n/retry — restart the current take from its original start\n/end / /endrecording — save and return to start\n/playrecord # — start/restart one replay\n/playall — restart all routes together\n/stopplay — stop replays and clear their bodies\n/recordings — list routes\n/deleterec # — delete one recording\n/deleteall — delete all recordings\n/removenpcs — remove default AI survivors\n/grace on / /grace off — enable or disable 3-second UAV grace (ON by default)\n/sync — toggle shared UAV start timing (ON by default)\n/samestart on / /samestart off — new takes use recording #1’s starting position, height, facing, look angle and crouch (ON by default)\n/startpos — use your current pose as the shared start for this map\n/startpos clear — clear the custom start and use recording #1 again\nWith no shared start yet, a take starts at your current pose. Same start OFF always uses your current pose. /retry keeps the take’s original start. Your equipped weapon is kept when starting a new take. A new map clears the custom start.\n/recordingshow — toggle other replays during recording\n/spectate — despawn and follow a target (T to respawn)\n/freecam — despawn and fly freely (also press 0)\n/freecammap — toggle flat map style in freecam\n/lastduringplay — toggle live player last during playback\n/funmode — toggle solid cover for all UAV sight\n/realism — return to realism sight rules\n/novan — remove the van and ARGUS for this map\n/uavlist — list UAV names and kill times\n/ttk UAV_1 2.5 — set one UAV kill time in seconds\n/ttkall 2.5 — set all UAV kill times\n/uavoff / /uavon — disable / enable UAV targeting\nF opens/closes doors; V kicks from about 1.5 small tiles; 3 equips the shotgun. 4 equips a smoke grenade; left-click throws it. The yellow line previews the throw and bounces locally. One grenade per life or new recording take, then you switch back to your last gun. Smoke has a 2-second fuse and lasts 15 seconds, covering a 5-small-tile-wide sphere centered on the ground. Smoke blocks UAV sight through it and obscures your view inside. A UAV inside a cloud can see outward through that cloud. Kicking requires standing and freezes movement, jumping and crouching for one second. Exterior doors start locked. Green doors: shotgun the handle or kick from either side. Red doors: kick or shotgun the handle from INSIDE only. Bullets penetrate green and interior leaves; red exterior leaves are bulletproof. B spectates. All doors swing in one fixed direction.\nReplays repeat movement, guns and door actions against the current scene. Fresh recordings, retries and playback from the start restore windows and doors; replay actions change them again. Same-seed resets keep saved routes; a different seed clears them.');return false;
  }
  routeSay('Unknown command. Use /help.');return false;
 }
@@ -15867,7 +16195,7 @@ addEventListener('keydown',e=>{
   e.preventDefault();e.stopImmediatePropagation();routeSetChat(true);
  }
 },true);
-routeSay('Press / for commands. Try /rec 1, then /end and /playrecord 1. UAV sync and 3-second grace start ON. /help lists all commands.');
+routeSay('Press / for commands. Try /rec 1, then /end and /playrecord 1. UAV sync, 3-second grace and /samestart start ON. /startpos sets a custom shared start. /help lists all commands.');
 
 // Replay gun actions use recorded times/aim, but never recorded victims or hits.
 let routeSyncEnabled=true,routeShowRecordings=true,routeFreecamMap=false,routeLastDuringPlay=false;
@@ -15880,7 +16208,8 @@ function routeRecordAction(msg,p){
 }
 function routeReadGun(p,pack,time){
  if(!pack)return;
- p.gun.equipped=pack.equipped;
+ if(WEAPONS[pack.lastGun]&&!WEAPONS[pack.lastGun].throwable)p.gun.lastGun=pack.lastGun;
+ gunEquip(p.gun,pack.equipped);
  for(const id of Object.keys(WEAPONS)){
   const s=pack.slots[id];if(!s)continue;
   p.gun.slots[id].ammo=s.ammo;
@@ -15891,7 +16220,7 @@ function routeReadGun(p,pack,time){
 function routeUpdateGun(p){
  for(const id of Object.keys(WEAPONS)){
   const until=p.reloadTimes[id];
-  if(until&&p.time>=until){p.gun.slots[id].ammo=WEAPONS[id].mag;p.reloadTimes[id]=0;}
+  if(until&&p.time>=until){if(!WEAPONS[id].throwable)p.gun.slots[id].ammo=WEAPONS[id].mag;p.reloadTimes[id]=0;}
   p.gun.slots[id].reloadEnd=p.reloadTimes[id]?gunNow()+Math.max(0,p.reloadTimes[id]-p.time):0;
  }
 }
@@ -15948,11 +16277,14 @@ function routeTick(dt){
  // Advance all actors to each shot's time before finding its victim. This makes
  // a moving replay's hitbox independent of frame rate and iteration order.
  events.sort((a,b)=>a.offset-b.offset||routeCompareKeys(a.p.record.id,b.p.record.id));
+ let smokeAdvanced=0;
  for(const e of events){
+  smokeTick(e.offset-smokeAdvanced);smokeAdvanced=e.offset;
   for(const p of actors)if(p.alive)routeMoveActor(p,p.stepStart+e.offset);
   if(e.p.alive)routeGunAction(e.p,e.action);
  }
  if(dt>0)for(const p of actors)if(p.alive)routeMoveActor(p,p.stepEnd);
+ smokeTick(dt-smokeAdvanced);
 }
 function routeResetOrbit(){
  uavSpawnGrace=routeGraceAtStart?UAV_SPAWN_GRACE_SEC:0;
@@ -16160,11 +16492,12 @@ function routeRetry(){
  routeCancelTake();routeGhostDiedUntil=0;
  gunLocal=gunCreateState();gunRead({gun:gunLocal},r.initialGun);gunLocal.hp=100;gunLocal.nextShot=0;gunTrigger=false;
  for(const d of uavDrones)uavFreshTimers(d);
- routeStart(r.id,r.name);
+ routeStart(r.id,r.name,r.start);
  routeSay('Retrying #'+r.id+' · '+r.name+'. Returned to its original start; this take begins at 0s.');return true;
 }
 function routeRestoreWindows(){
  if(multiplayer||!physicsWorld)return;
+ smokeReset();
  doorRestore();
  let changed=false;
  for(const pane of breakableGlass)changed=glassSetBroken(pane,false)||changed;
@@ -16491,10 +16824,10 @@ function stadiumCanAim(d,point){
  const angle=stadiumAngle(Math.atan2(dz,dx)-stadiumBodyYaw(d)),pitch=Math.atan2(point.y-pivot.y,h);
  return Math.abs(angle)<=STADIUM_YAW_LIMIT+1e-8&&pitch>=STADIUM_PITCH_MIN-1e-8&&pitch<=STADIUM_PITCH_MAX+1e-8;
 }
-function uavTrackPoint(d,point,origin=uavScannerOrigin(d)){
+function uavTrackPoint(d,point,origin=uavScannerOrigin(d),future=0){
  // The invisible scanner works independently of the decorative gun mount.
  // Mechanical animation stops must not impose an artificial sight cone.
- return staticUavLosFromTo(origin,point);
+ return staticUavLosFromTo(origin,point,future);
 }
 
 // Modular exterior banks. The same planar tile pieces drive rendering,
@@ -16677,7 +17010,7 @@ function doorBulletExit(door,origin,direction){
   if(Math.max(a,b)<exit){exit=Math.max(a,b);normal=axes[k].map(n=>n*Math.sign(v));}
   if(entry>exit+1e-6||exit<0)return null;
  }
- return normal&&Number.isFinite(exit)?{distance:exit,normal:{x:normal[0],y:normal[1],z:normal[2]}}:null;
+ return normal&&Number.isFinite(exit)?{entry,distance:exit,normal:{x:normal[0],y:normal[1],z:normal[2]}}:null;
 }
 function doorSyncCollider(d){
  const pose=doorPose(d);
@@ -16700,13 +17033,14 @@ function doorBuild(){
   const normalX=Math.sin(closedYaw),normalZ=Math.cos(closedYaw);
   let hash=seed;for(const ch of key)hash=Math.imul(hash^ch.charCodeAt(0),16777619);
   const openSide=exterior?Math.sign(outX*normalX+outZ*normalZ):((hash&1)?1:-1);
-  const count=kind==='double'?2:1,clear=opening-DOOR_FRAME_EDGE_INSET*2-.024,width=clear/count-.012;
+  // The visible panels and real colliders overlap the jambs and center seam.
+  const count=kind==='double'?2:1,clear=opening-DOOR_FRAME_EDGE_INSET*2,width=clear/count+.006;
   for(let leaf=0;leaf<count;leaf++){
    const leafSign=count===2?(leaf===0?1:-1):((hash&2)?1:-1);
    const offsetLeaf=count===2?(leaf===0?-clear/4:clear/4):0;
    const originX=frameX+tx*offsetLeaf,originZ=frameZ+tz*offsetLeaf;
    const d={id:key+':'+leaf,key,leaf,type,exterior,frameX,frameZ,originX,originZ,outX,outZ,width,
-    height:DOORWAY_HEIGHT-DOOR_FRAME_HEADER_DROP-.05,base:FLOOR_TOP+.022,
+    height:DOORWAY_HEIGHT-DOOR_FRAME_HEADER_DROP-FLOOR_TOP+.010,base:FLOOR_TOP-.005,
     closedYaw,leafSign,swingSign:-openSide*leafSign,hingeX:originX-tx*leafSign*width/2,hingeZ:originZ-tz*leafSign*width/2,
     angle:0,targetAngle:0,broken:false,kicked:false,fallenYaw:closedYaw,fallSign:1,revision:0};
    d.collider=physicsWorld.createCollider(RAPIER.ColliderDesc.cuboid(width/2,d.height/2,DOOR_THICKNESS/2).setFriction(0));
@@ -16729,9 +17063,11 @@ function doorApplySnapshot(states){
  if(changed){physicsWorld.step();doorInvalidateNavigation();}
 }
 function doorInvalidateNavigation(){
- // Invalidate routes while retaining the world's reusable NPC capsule/controller.
+ // Rebuild physical queries and unfinished searches, but keep committed routes:
+ // opening/kicking is itself a step in a survivor's current escape route.
  const probe=nav3Probe,controller=nav3Controller;nav3Reset();nav3Probe=probe;nav3Controller=controller;
- resetFollowerNavCaches();uavInvalidatePlans();
+ resetFollowerNavCaches();survivorGroupPlan=null;
+ for(const a of allSurvivorAgents()){a.readyPlan=null;a.planTimer=0;a.routeRiskCheck=0;}
 }
 function doorPublish(d){
  d.revision++;doorSyncCollider(d);physicsWorld.step();doorInvalidateNavigation();
@@ -16857,6 +17193,12 @@ function doorBlocksActor(d,angle){
   const contact=shape.contactShape(pos,rotation,playerShape(height),{x:p.x,y:networkPlayerFeetY(p)+height/2,z:p.z},PHYSICS_ROT,0);
   if(contact&&contact.distance<-.005)return true;
  }
+ for(const a of allSurvivorAgents()){
+  const x=survivorX(a),z=survivorZ(a);
+  if(Math.hypot(x-pos.x,z-pos.z)>d.width+FOLLOWER_RADIUS)continue;
+  const contact=shape.contactShape(pos,rotation,NPC_SHAPE,{x,y:survivorBaseYOf(a)+FOLLOWER_HEIGHT/2,z},PHYSICS_ROT,0);
+  if(contact&&contact.distance<-.005)return true;
+ }
  return false;
 }
 function doorTick(dt){
@@ -16931,6 +17273,178 @@ function shotgunDirections(direction,seq){
  }return out;
 }
 
+
+// Smoke is an optical sphere, never a body/bullet collider. Preview and flight
+// share the same swept-ball integrator; preview results never leave this client.
+const SMOKE_RADIUS=3.5,SMOKE_FUSE=2,SMOKE_LIFE=60,SMOKE_STEP=1/60,SMOKE_GRAVITY=12;
+const smokeBall=new RAPIER.Ball(.09),smokeGrenades=[],smokeClouds=[];
+const smokePreviewBuffer=gl.createBuffer(),smokeItemBuffer=gl.createBuffer();
+let smokePreviewCount=0,smokePreviewNext=0;
+const smokeHaze=document.createElement('div');smokeHaze.id='smokeHaze';
+smokeHaze.style.cssText='position:fixed;inset:0;z-index:19;pointer-events:none;background:#939a98;opacity:0';document.body.appendChild(smokeHaze);
+function smokeReset(){
+ const changed=smokeClouds.length>0;smokeGrenades.length=0;smokeClouds.length=0;
+ smokePreviewCount=0;smokePreviewNext=0;smokeHaze.style.opacity='0';
+ if(changed&&worldGeometryReady)uavInvalidatePlans();
+}
+function smokeRadius(cloud,future=0){return cloud.age+future<SMOKE_LIFE-1e-9?SMOKE_RADIUS:0;}
+function smokeCloudBlocks(c,from,target,radius,ignoreContainingCloud=true){
+ const dx=target.x-from.x,dy=target.y-from.y,dz=target.z-from.z,len2=dx*dx+dy*dy+dz*dz;
+ const x=from.x-c.x,y=from.y-c.y,z=from.z-c.z;
+ if(radius<=0||ignoreContainingCloud&&x*x+y*y+z*z<=radius*radius+1e-7)return false;
+ const t=len2>1e-10?Math.max(0,Math.min(1,-(x*dx+y*dy+z*dz)/len2)):0;
+ return (x+dx*t)**2+(y+dy*t)**2+(z+dz*t)**2<radius*radius;
+}
+function smokeBlocksSight(from,target,ignoreContainingCloud=true,future=0){
+ return smokeClouds.some(c=>smokeCloudBlocks(c,from,target,smokeRadius(c,future),ignoreContainingCloud));
+}
+function smokeRetargetAfterExpiry(expired){
+ if(!expired.length||!uavEnabled)return;
+ const entities=currentUavEntities();
+ for(const d of uavDrones){
+  const from=uavScannerOrigin(d);
+  // Reselect newly exposed groups together, in normal kill-ID order.
+  if(entities.some(e=>{const p=e.getPoint();return p&&expired.some(c=>smokeCloudBlocks(c,from,p,SMOKE_RADIUS))&&uavTrackPoint(d,p,from);}))d.targetId=null;
+ }
+}
+function smokeHazeAt(eye){
+ let amount=0;for(const c of smokeClouds){const inside=smokeRadius(c)-Math.hypot(eye.x-c.x,eye.y-c.y,eye.z-c.z);amount=Math.max(amount,.84*Math.max(0,Math.min(1,inside/.55)));}return amount;
+}
+function smokeLaunch(p){
+ const eye=gunEye(p),d=gunDirection(p.yaw||0,(p.pitch||0)+doorKickLean(p));
+ const move={x:d.x*.28,y:d.y*.28,z:d.z*.28};
+ const hit=physicsWorld.castShape(eye,PHYSICS_ROT,move,smokeBall,0,1,true,undefined,undefined,undefined,undefined,staticGeometry);
+ const t=hit?Math.max(0,hit.time_of_impact-.02):1;
+ return {x:eye.x+move.x*t,y:eye.y+move.y*t,z:eye.z+move.z*t,vx:d.x*8.5,vy:d.y*8.5+2.2,vz:d.z*8.5,age:0,accumulator:0,resting:false,bounces:0};
+}
+function smokeStep(g,dt=SMOKE_STEP,points=null){
+ if(g.resting)return;
+ g.vy-=SMOKE_GRAVITY*dt;
+ let remaining=dt;
+ for(let bounce=0;bounce<4&&remaining>1e-6;bounce++){
+  const move={x:g.vx*remaining,y:g.vy*remaining,z:g.vz*remaining};
+  const hit=physicsWorld.castShape({x:g.x,y:g.y,z:g.z},PHYSICS_ROT,move,smokeBall,0,1,true,undefined,undefined,undefined,undefined,staticGeometry);
+  if(!hit){g.x+=move.x;g.y+=move.y;g.z+=move.z;break;}
+  const t=Math.max(0,Math.min(1,hit.time_of_impact));g.x+=move.x*t;g.y+=move.y*t;g.z+=move.z*t;
+  let n=hit.normal1||{x:0,y:1,z:0};const length=Math.hypot(n.x,n.y,n.z)||1;
+  n={x:n.x/length,y:n.y/length,z:n.z/length};
+  let speed=g.vx*n.x+g.vy*n.y+g.vz*n.z;
+  if(speed>0){n={x:-n.x,y:-n.y,z:-n.z};speed=-speed;}
+  g.x+=n.x*.003;g.y+=n.y*.003;g.z+=n.z*.003;
+  g.vx=(g.vx-speed*n.x)*.72-speed*n.x*.42;
+  g.vy=(g.vy-speed*n.y)*.72-speed*n.y*.42;
+  g.vz=(g.vz-speed*n.z)*.72-speed*n.z*.42;g.bounces++;
+  if(points)points.push({x:g.x,y:g.y,z:g.z});
+  if(n.y>.55&&Math.hypot(g.vx,g.vy,g.vz)<.65){g.resting=true;g.vx=g.vy=g.vz=0;break;}
+  remaining*=1-t;
+ }
+}
+function smokeLanding(g){
+ const origin={x:g.x,y:g.y+.02,z:g.z};
+ const hit=physicsWorld.castRay(new RAPIER.Ray(origin,{x:0,y:-1,z:0}),100,true,undefined,undefined,undefined,undefined,staticGeometry);
+ return {x:g.x,y:hit?origin.y-hit.timeOfImpact:mapSurfaceYAt(g.x,g.z),z:g.z};
+}
+function smokePredict(p){
+ const g=smokeLaunch(p),points=[{x:g.x,y:g.y,z:g.z}];
+ for(let i=0;i<Math.round(SMOKE_FUSE/SMOKE_STEP);i++){
+  smokeStep(g,SMOKE_STEP,points);g.age+=SMOKE_STEP;
+  const last=points[points.length-1];if(Math.hypot(g.x-last.x,g.y-last.y,g.z-last.z)>1e-5)points.push({x:g.x,y:g.y,z:g.z});
+ }
+ return {points,landing:smokeLanding(g),flight:g};
+}
+function smokeTick(dt){
+ if(dt<=0)return;let changed=false;const expired=[];
+ for(let i=smokeClouds.length-1;i>=0;i--){smokeClouds[i].age+=dt;if(smokeClouds[i].age>=SMOKE_LIFE-1e-9){expired.push(...smokeClouds.splice(i,1));changed=true;}}
+ for(let i=smokeGrenades.length-1;i>=0;i--){
+  const g=smokeGrenades[i];g.accumulator+=dt;
+  while(g.accumulator+1e-9>=SMOKE_STEP&&g.age+1e-9<SMOKE_FUSE){smokeStep(g);g.age+=SMOKE_STEP;g.accumulator=Math.max(0,g.accumulator-SMOKE_STEP);}
+  if(g.age+1e-9>=SMOKE_FUSE){smokeClouds.push({id:g.id,owner:g.owner,...smokeLanding(g),age:g.accumulator});smokeGrenades.splice(i,1);changed=true;}
+ }
+ smokeRetargetAfterExpiry(expired);
+ if(changed)uavInvalidatePlans();
+}
+function smokeThrowWorld(p,owner,seq){
+ const grenade={id:mapGeneration+':'+owner+':'+seq,owner,...smokeLaunch(p)};
+ if(!smokeGrenades.some(g=>g.id===grenade.id)&&!smokeClouds.some(c=>c.id===grenade.id))smokeGrenades.push(grenade);
+ const s=gunState(p);s.slots.smoke.ammo=0;gunReturnFromSmoke(s);
+ if(owner===localPeerId){gunTrigger=false;smokePreviewCount=0;}
+ const event={type:'smokeThrow',generation:mapGeneration,shooter:owner,grenade:{...grenade},gun:gunPack(p)};
+ if(multiplayer&&isHost){broadcastHost(event);hostBroadcastWorld();}return event;
+}
+function smokeSnapshot(){return {grenades:smokeGrenades.map(g=>({...g})),clouds:smokeClouds.map(c=>({...c}))};}
+function smokeValid(value,flight=false){
+ return value&&typeof value.id==='string'&&['x','y','z','age',...(flight?['vx','vy','vz','accumulator']:[])].every(k=>Number.isFinite(value[k]))&&value.age>=0&&value.age<(flight?SMOKE_FUSE:SMOKE_LIFE)&&(!flight||value.accumulator>=0&&value.accumulator<SMOKE_STEP+1e-6);
+}
+function smokeApplySnapshot(state){
+ if(!state)return;
+ smokeGrenades.length=0;smokeClouds.length=0;
+ for(const g of (state.grenades||[]).slice(0,256))if(smokeValid(g,true))smokeGrenades.push({...g});
+ for(const c of (state.clouds||[]).slice(0,256))if(smokeValid(c))smokeClouds.push({...c});
+}
+function smokeReceiveThrow(event){
+ if(event.generation!==mapGeneration||!smokeValid(event.grenade,true))return;
+ const g=event.grenade;
+ if(!smokeGrenades.some(x=>x.id===g.id)&&!smokeClouds.some(x=>x.id===g.id))smokeGrenades.push({...g});
+ const p=netPlayers.get(event.shooter);if(p&&event.gun)gunRead(p,event.gun);
+}
+function smokeGrenadeModel(out,pose){
+ const upright={point:(x,y,z)=>pose.point(x,z,-y),normal:(x,y,z)=>pose.normal(x,z,-y)};
+ gunCylinder(out,upright,0,0,0,.057,.16,[.25,.31,.22]);
+ gunCylinder(out,upright,0,0,.025,.059,.035,[.88,.73,.22]);
+ gunBox(out,pose,0,.095,0,.045,.04,.045,[.22,.24,.25]);
+ gunBox(out,pose,.027,.112,0,.092,.018,.025,[.58,.60,.58]);
+ gunBox(out,pose,.065,.055,0,.016,.10,.025,[.43,.45,.42]);
+}
+function gunSmokeModel(out,p){
+ const pose=gunPose(p);smokeGrenadeModel(out,pose);
+ gunBox(out,pose,.022,-.062,.032,.085,.08,.08,[.13,.14,.15]);gunBox(out,pose,.025,-.115,.12,.075,.09,.16,[.42,.27,.18]);
+}
+const smokeVs=`attribute vec3 aPos;uniform mat4 uProj,uView;uniform vec3 uCenter;uniform float uRadius;varying vec3 vPoint;
+void main(){vPoint=aPos;gl_Position=uProj*uView*vec4(uCenter+aPos*uRadius,1.0);}`;
+const smokeFs=`precision mediump float;uniform float uAge;varying vec3 vPoint;
+void main(){float billow=sin(vPoint.x*18.0+sin(vPoint.z*13.0)+uAge*.65)*sin(vPoint.y*16.0-vPoint.z*8.0-uAge*.4);
+float shade=.53+vPoint.y*.10+billow*.045;gl_FragColor=vec4(shade*.96,shade,shade*.98,.965+billow*.02);}`;
+const smokeProg=gl.createProgram();gl.attachShader(smokeProg,shader(gl.VERTEX_SHADER,smokeVs));gl.attachShader(smokeProg,shader(gl.FRAGMENT_SHADER,smokeFs));gl.linkProgram(smokeProg);
+if(!gl.getProgramParameter(smokeProg,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(smokeProg));
+const smokePosLoc=gl.getAttribLocation(smokeProg,'aPos'),smokeProjLoc=gl.getUniformLocation(smokeProg,'uProj'),smokeViewLoc=gl.getUniformLocation(smokeProg,'uView'),smokeCenterLoc=gl.getUniformLocation(smokeProg,'uCenter'),smokeRadiusLoc=gl.getUniformLocation(smokeProg,'uRadius'),smokeAgeLoc=gl.getUniformLocation(smokeProg,'uAge');
+const smokeSphereBuffer=gl.createBuffer(),smokeSphere=[];
+for(let y=0;y<16;y++)for(let x=0;x<32;x++){
+ const point=(u,v)=>{const a=u*Math.PI*2/32,b=v*Math.PI/16;return [Math.sin(b)*Math.cos(a),Math.cos(b),Math.sin(b)*Math.sin(a)];};
+ const a=point(x,y),b=point(x+1,y),c=point(x+1,y+1),d=point(x,y+1);
+ smokeSphere.push(...a,...b,...c,...a,...c,...d);
+}
+gl.bindBuffer(gl.ARRAY_BUFFER,smokeSphereBuffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(smokeSphere),gl.STATIC_DRAW);
+function smokeDrawPreview(){
+ if(gunSelf().equipped!=='smoke'||gunSelf().ammo<=0||playerDead||singlePlayerObserver||spectatorActive||isMenuOrTextInputActive())return;
+ if(gunNow()>=smokePreviewNext||!smokePreviewCount){
+  smokePreviewNext=gunNow()+.05;
+  const preview=smokePredict(doorPlayer()),lines=[];
+  for(let i=1;i<preview.points.length;i++)for(const p of [preview.points[i-1],preview.points[i]])lines.push(p.x,p.y,p.z);
+  // A yellow circle also shows the eventual seven-small-tile footprint.
+  const c=preview.landing;for(let i=0;i<32;i++)for(const a of [i*Math.PI/16,(i+1)*Math.PI/16])lines.push(c.x+Math.cos(a)*SMOKE_RADIUS,c.y+.035,c.z+Math.sin(a)*SMOKE_RADIUS);
+  gl.bindBuffer(gl.ARRAY_BUFFER,smokePreviewBuffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(lines),gl.DYNAMIC_DRAW);smokePreviewCount=lines.length/3;
+ }
+ gl.useProgram(uavFxProg);gl.uniformMatrix4fv(uavFxProjLoc,false,proj);gl.uniformMatrix4fv(uavFxViewLoc,false,view);gl.uniform4f(uavFxColorLoc,1,.85,.04,1);
+ bindUavFxBuffer(smokePreviewBuffer);gl.enable(gl.DEPTH_TEST);gl.depthMask(false);gl.disable(gl.BLEND);gl.lineWidth(2);gl.drawArrays(gl.LINES,0,smokePreviewCount);gl.depthMask(true);
+}
+function renderSmoke(mapCamera){
+ const eye={x:-(view[0]*view[12]+view[1]*view[13]+view[2]*view[14]),y:-(view[4]*view[12]+view[5]*view[13]+view[6]*view[14]),z:-(view[8]*view[12]+view[9]*view[13]+view[10]*view[14])};
+ smokeHaze.style.opacity=String(mapCamera?0:smokeHazeAt(eye));
+ if(smokeGrenades.length){
+  const out=[];for(const g of smokeGrenades)smokeGrenadeModel(out,{point:(x,y,z)=>[g.x+x,g.y+y,g.z+z],normal:(x,y,z)=>[x,y,z]});
+  gl.useProgram(uavProg);gl.uniformMatrix4fv(uavProjLoc,false,proj);gl.uniformMatrix4fv(uavViewLoc,false,view);
+  gl.bindBuffer(gl.ARRAY_BUFFER,smokeItemBuffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(out),gl.DYNAMIC_DRAW);bindUavBuffer(smokeItemBuffer);
+  gl.enable(gl.DEPTH_TEST);gl.depthMask(true);gl.disable(gl.BLEND);gl.enable(gl.CULL_FACE);gl.drawArrays(gl.TRIANGLES,0,out.length/9);
+ }
+ if(!mapCamera)smokeDrawPreview();
+ if(!smokeClouds.length)return;
+ gl.useProgram(smokeProg);gl.uniformMatrix4fv(smokeProjLoc,false,proj);gl.uniformMatrix4fv(smokeViewLoc,false,view);
+ gl.bindBuffer(gl.ARRAY_BUFFER,smokeSphereBuffer);gl.enableVertexAttribArray(smokePosLoc);gl.vertexAttribPointer(smokePosLoc,3,gl.FLOAT,false,3*4,0);
+ gl.enable(gl.DEPTH_TEST);gl.depthMask(false);gl.disable(gl.CULL_FACE);gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
+ const dist=c=>(c.x-eye.x)**2+(c.y-eye.y)**2+(c.z-eye.z)**2;
+ for(const c of [...smokeClouds].sort((a,b)=>dist(b)-dist(a))){gl.uniform3f(smokeCenterLoc,c.x,c.y,c.z);gl.uniform1f(smokeRadiusLoc,smokeRadius(c));gl.uniform1f(smokeAgeLoc,c.age);gl.drawArrays(gl.TRIANGLES,0,smokeSphere.length/3);}
+ gl.depthMask(true);gl.disable(gl.BLEND);gl.enable(gl.CULL_FACE);
+}
 
 document.body.classList.add('menu-open');
 showMainMenu();
